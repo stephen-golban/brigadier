@@ -1,5 +1,52 @@
+/**
+ * FROZEN SHARED CORE (WO-000e).
+ *
+ * This contract is shared by WO-001, WO-002, and WO-003. Amend it only through
+ * a deliberate decision agreed by all three units, never as a side effect of
+ * one unit's implementation. It owns the vendor, effort, and failure
+ * vocabulary; token usage; worker spec and environment types; the event and
+ * outcome unions; spawn and worker types; and the adapter registry.
+ */
+
+/**
+ * Completion taxonomy defined by the action required from the supervisor:
+ *
+ * - `self-exits`: the supervisor must wait for the process to exit on its own
+ *   and use OS exit as the completion signal.
+ * - `signals-then-must-be-killed`: the process emits a detectable terminal
+ *   marker in its stream, then keeps running; the supervisor must detect that
+ *   marker and kill the process group.
+ */
+export type ProcessCompletionBehavior =
+  | "self-exits"
+  | "signals-then-must-be-killed";
+
+/** Runtime metadata used to enumerate and probe installed worker adapters. */
+export interface AdapterDeclaration<V extends string> {
+  readonly vendor: V;
+  readonly executable: string;
+  readonly processCompletion: ProcessCompletionBehavior;
+}
+
+/**
+ * The installed-adapter probe iterates this table. Adding a vendor extends the
+ * table and derived union without reshaping the shared worker contract.
+ */
+export const ADAPTER_DECLARATIONS = [
+  {
+    vendor: "claude",
+    executable: "claude",
+    processCompletion: "signals-then-must-be-killed",
+  },
+  {
+    vendor: "codex",
+    executable: "codex",
+    processCompletion: "self-exits",
+  },
+] as const satisfies readonly AdapterDeclaration<string>[];
+
 /** Vendors with supported worker adapters. */
-export type Vendor = "claude" | "codex";
+export type Vendor = (typeof ADAPTER_DECLARATIONS)[number]["vendor"];
 
 /** Deliberately narrower than the effort values accepted by vendor CLIs. */
 export type Effort = "medium" | "high" | "xhigh";
@@ -79,17 +126,56 @@ export interface InstructionFilePolicy {
   readonly project: "include" | "exclude";
 }
 
+/** Environment values required for every non-TTY worker launch. */
+export type WorkerEnvironment = Readonly<Record<string, string>> & {
+  readonly SHELL: "/bin/sh";
+};
+
+/** Claude-specific environment guarantees derived directly from the map. */
+export type ClaudeWorkerEnvironment = WorkerEnvironment & {
+  readonly CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1";
+};
+
+/** An idle timeout validated to be strictly above Claude's 600-second stall boundary. */
+declare const idleTimeoutMsBrand: unique symbol;
+export type IdleTimeoutMs = number & {
+  readonly [idleTimeoutMsBrand]: "IdleTimeoutMs";
+};
+
+export const IDLE_TIMEOUT_BOUNDARY_MS = 600_000;
+
+/**
+ * Default idle timeout for worker specs. Keep this strictly above 600 seconds
+ * so a healthy silent Claude run is not mistaken for completion or a stall.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = createIdleTimeoutMs(900_000);
+
+/**
+ * The only sanctioned constructor for an idle timeout used in a worker spec.
+ * Because a cast can smuggle a sub-boundary value past the brand, WO-001
+ * adapters must re-validate this value at the spawn boundary.
+ */
+export function createIdleTimeoutMs(value: number): IdleTimeoutMs {
+  if (!Number.isSafeInteger(value) || value <= IDLE_TIMEOUT_BOUNDARY_MS) {
+    throw new RangeError(
+      `idle timeout must be a whole number above ${IDLE_TIMEOUT_BOUNDARY_MS} ms`,
+    );
+  }
+  return value as IdleTimeoutMs;
+}
+
 interface WorkerSpecBase {
   readonly id: string;
-  readonly executable: string;
   readonly model: string;
   readonly effort: Effort;
   /** Adapters must send the prompt through stdin, never as positional argv. */
   readonly prompt: string;
   readonly cwd: string;
-  readonly environment: Readonly<Record<string, string>>;
+  readonly environment: WorkerEnvironment;
   readonly sandbox: EnforcedSandbox;
   readonly instructionFiles: InstructionFilePolicy;
+  /** Idle timeout, distinct from the total runtime limit in `timeoutMs`. */
+  readonly idleTimeoutMs: IdleTimeoutMs;
   readonly timeoutMs: number | null;
   readonly maxTurns: number | null;
 }
@@ -101,10 +187,9 @@ interface WorkerSpecBase {
  */
 export interface ClaudeWorkerSpec extends WorkerSpecBase {
   readonly vendor: "claude";
+  readonly environment: ClaudeWorkerEnvironment;
   readonly maxBudgetUsd: number | null;
   readonly excludeDynamicSystemPromptSections: true;
-  /** The adapter maps this to `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. */
-  readonly autoMemory: "disabled";
   readonly tools: readonly string[];
   readonly extraDirectories: readonly string[];
   readonly mcp: {
@@ -219,17 +304,30 @@ interface WorkerOutcomeBase {
   readonly signal: string | null;
 }
 
-export type WorkerOutcome = WorkerOutcomeBase &
-  (
-    | {
-        readonly ok: true;
-        readonly failure?: never;
-      }
-    | {
-        readonly ok: false;
-        readonly failure: WorkerFailure;
-      }
-  );
+export type SuccessfulWorkerOutcome = WorkerOutcomeBase & {
+  readonly ok: true;
+  readonly failure?: never;
+};
+
+export type FailedLaunchedWorkerOutcome = WorkerOutcomeBase & {
+  readonly ok: false;
+  readonly failure: WorkerFailure & {
+    readonly kind: Exclude<FailureKind, "LAUNCH_FAILURE">;
+  };
+};
+
+export type LaunchFailureWorkerOutcome = WorkerOutcomeBase & {
+  readonly ok: false;
+  readonly exitCode: null;
+  readonly signal: null;
+  readonly failure: WorkerFailure & { readonly kind: "LAUNCH_FAILURE" };
+};
+
+export type LaunchedWorkerOutcome =
+  | SuccessfulWorkerOutcome
+  | FailedLaunchedWorkerOutcome;
+
+export type WorkerOutcome = LaunchedWorkerOutcome | LaunchFailureWorkerOutcome;
 
 export type CancelReason =
   | { readonly kind: "requested"; readonly message: string | null }
@@ -237,22 +335,29 @@ export type CancelReason =
   | { readonly kind: "shutdown"; readonly message: string | null }
   | { readonly kind: "dependency_failed"; readonly message: string | null };
 
-/** Observable process termination behavior, declared by each adapter. */
-export type ProcessCompletionBehavior =
-  | "self-exits"
-  | "signals-then-must-be-killed"
-  | "does-neither";
-
-/** The three independent channels produced by one worker spawn. */
-export interface SpawnedWorker {
-  readonly pid: number;
+interface SpawnedWorkerBase {
   /** Session/thread identity, if any, arrives through this stream. */
   readonly events: AsyncIterable<WorkerEvent>;
-  /** Resolves from adapter completion logic, not necessarily process exit. */
-  readonly completion: Promise<WorkerOutcome>;
   /** Must terminate the entire process group, including descendants. */
   cancel(reason: CancelReason): Promise<void>;
 }
+
+/**
+ * The three channels produced by one worker spawn, coupled so launch state and
+ * completion outcome cannot contradict one another.
+ */
+export type SpawnedWorker = SpawnedWorkerBase &
+  (
+    | {
+        readonly pid: number;
+        /** Resolves from adapter completion logic, not necessarily process exit. */
+        readonly completion: Promise<LaunchedWorkerOutcome>;
+      }
+    | {
+        readonly pid: null;
+        readonly completion: Promise<LaunchFailureWorkerOutcome>;
+      }
+  );
 
 /**
  * Shared worker abstraction. Steering and Claude's bidirectional control
@@ -260,39 +365,18 @@ export interface SpawnedWorker {
  */
 export interface Worker<V extends Vendor = Vendor> {
   readonly vendor: V;
-  /** Claude does not signal completion or self-exit; Codex exec self-exits. */
-  readonly processCompletion: V extends "claude"
-    ? "does-neither"
-    : "self-exits";
+  readonly processCompletion: Extract<
+    (typeof ADAPTER_DECLARATIONS)[number],
+    { readonly vendor: V }
+  >["processCompletion"];
+  /** Launch failures resolve through `completion` with a null `pid`. */
   spawn(
     spec: Extract<WorkerSpec, { readonly vendor: V }>,
   ): Promise<SpawnedWorker>;
 }
 
-/** A vendor quota source whose process or connection may be long-lived. */
-export interface QuotaOracle<V extends Vendor = Vendor> {
-  readonly vendor: V;
-  snapshot(): Promise<QuotaSnapshot & { readonly vendor: V }>;
-  /** Closes open pipes and waits for owned resources to terminate. */
-  dispose(): Promise<void>;
-}
-
-export interface WorktreeSpec {
-  readonly repositoryPath: string;
-  readonly baseRef: string;
-  readonly branch: string;
-}
-
-export interface CreatedWorktree {
-  readonly path: string;
-  readonly branch: string;
-}
-
-/** Creates and removes isolated working directories for worker cwd values. */
-export interface WorktreeEngine {
-  create(spec: WorktreeSpec): Promise<CreatedWorktree>;
-  remove(worktree: CreatedWorktree): Promise<void>;
-}
+/** A heterogeneous worker union that preserves vendor/behavior correlation. */
+export type AnyWorker = { [V in Vendor]: Worker<V> }[Vendor];
 
 /** One independently executable unit with exclusive ownership of its file set. */
 export interface Slice {

@@ -3,11 +3,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
-const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const platformPackage =
   {
     "darwin-arm64": "@stephen-golban/brigadier-darwin-arm64",
@@ -18,11 +15,7 @@ const platformPackage =
   }[`${process.platform}-${process.arch}`] ?? null;
 
 const optionalBinary = resolveOptionalBinary(platformPackage);
-const bundledBinary =
-  process.platform === "darwin" && process.arch === "arm64"
-    ? resolve(packageRoot, "brigadier")
-    : null;
-const binary = optionalBinary ?? bundledBinary;
+const binary = optionalBinary;
 
 if (binary !== null && existsSync(binary)) {
   const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });

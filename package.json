@@ -8,20 +8,26 @@
     "brigadier": "./bin/brigadier.js"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./contracts": "./src/contracts.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js",
+      "default": "./dist/contracts.js"
+    }
   },
   "files": [
     "bin",
-    "brigadier",
-    "dist",
-    "src"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "bun build ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier && codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
+    "build": "bun build ./src/index.ts ./src/contracts.ts ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && tsc --project ./tsconfig.build.json && bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier && codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
     "check": "biome check .",
     "format": "biome format --write .",
     "prepack": "bun run build",

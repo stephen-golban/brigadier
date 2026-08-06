@@ -48,6 +48,57 @@ export async function readPrompt(): Promise<string> {
   return new Response(Bun.stdin.stream()).text();
 }
 
+export type ClaudeStdinLifecycle = "write-then-close" | "keep-open";
+
+export interface ClaudeStdin {
+  readonly prompt: string;
+  /** Resolves immediately for one-shot stdin, or at EOF for control stdin. */
+  readonly waitForEof: () => Promise<void>;
+}
+
+export async function readClaudeStdin(): Promise<ClaudeStdin> {
+  const lifecycle = process.env.BRIGADIER_FAKE_STDIN_LIFECYCLE;
+  if (lifecycle === "write-then-close") {
+    return {
+      prompt: await readPrompt(),
+      waitForEof: async () => {},
+    };
+  }
+  if (lifecycle !== "keep-open") {
+    fail(
+      "BRIGADIER_FAKE_STDIN_LIFECYCLE must be write-then-close or keep-open",
+      64,
+    );
+  }
+
+  const reader = Bun.stdin.stream().getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  while (!buffered.includes("\n")) {
+    const chunk = await reader.read();
+    if (chunk.done) {
+      fail("keep-open Claude stdin ended before the prompt newline", 1);
+    }
+    buffered += decoder.decode(chunk.value, { stream: true });
+  }
+
+  const newline = buffered.indexOf("\n");
+  const prompt = buffered.slice(0, newline + 1);
+  return {
+    prompt,
+    waitForEof: async () => {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          decoder.decode();
+          return;
+        }
+        decoder.decode(chunk.value, { stream: true });
+      }
+    },
+  };
+}
+
 export function assertPrompt(actual: string, errorExitCode: number): void {
   const expected = process.env.BRIGADIER_FAKE_EXPECTED_STDIN;
   if (expected === undefined) {

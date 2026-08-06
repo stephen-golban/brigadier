@@ -5,7 +5,7 @@ import {
   assertPrompt,
   fail,
   fixtureText,
-  readPrompt,
+  readClaudeStdin,
   scenario,
   writeFixture,
 } from "./harness.ts";
@@ -23,33 +23,8 @@ const fixtures: Readonly<Record<string, string>> = {
 
 const selectedScenario = scenario();
 assertArgv(Bun.argv.slice(2), 1);
-
-if (selectedScenario === "never-exits") {
-  const reader = Bun.stdin.stream().getReader();
-  const decoder = new TextDecoder();
-  let prompt = "";
-
-  while (!prompt.includes("\n")) {
-    const chunk = await reader.read();
-    if (chunk.done) {
-      break;
-    }
-    prompt += decoder.decode(chunk.value, { stream: true });
-  }
-
-  assertPrompt(prompt, 1);
-  await writeFixture("claude-success.jsonl");
-
-  // A real Claude stream-json process remains alive while stdin is open so it
-  // can receive control responses. Keep a pending read rather than a timer.
-  while (!(await reader.read()).done) {
-    // Control messages are intentionally ignored by this harness mode.
-  }
-  process.exit(0);
-}
-
-const prompt = await readPrompt();
-assertPrompt(prompt, 1);
+const stdin = await readClaudeStdin();
+assertPrompt(stdin.prompt, 1);
 
 if (selectedScenario === "long-silence") {
   const lines = (await fixtureText("claude-long-silence.jsonl"))
@@ -69,6 +44,7 @@ if (selectedScenario === "long-silence") {
   }
   await Bun.sleep(delayMs);
   process.stdout.write(`${lines.join("\n")}\n`);
+  await stdin.waitForEof();
   process.exit(0);
 }
 
@@ -83,6 +59,7 @@ if (selectedScenario === "grandchild-pipe") {
   );
   grandchild.unref();
   process.stdout.write('{"type":"system","subtype":"grandchild_pipe_open"}\n');
+  await stdin.waitForEof();
   process.exit(0);
 }
 
@@ -92,6 +69,7 @@ if (fixture === undefined) {
 }
 
 await writeFixture(fixture);
+await stdin.waitForEof();
 if (
   selectedScenario === "bad-model" ||
   selectedScenario === "budget-exhaustion"

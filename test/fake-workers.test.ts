@@ -1,6 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import type { FailureKind } from "../src/contracts.ts";
+import type { ClaudeStdinLifecycle } from "../scripts/fakes/harness.ts";
+import {
+  ADAPTER_DECLARATIONS,
+  type AnyWorker,
+  type ClaudeWorkerEnvironment,
+  createIdleTimeoutMs,
+  DEFAULT_IDLE_TIMEOUT_MS,
+  type FailureKind,
+  IDLE_TIMEOUT_BOUNDARY_MS,
+  type SpawnedWorker,
+  type WorkerEvent,
+  type WorkerOutcome,
+} from "../src/contracts.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const fakeBin = resolve(repositoryRoot, "scripts/fakes");
@@ -21,6 +33,10 @@ const claudeArgs = [
   "--strict-mcp-config",
 ] as const;
 const codexArgs = ["exec", "--json", "-"] as const;
+const claudeStdinLifecycles = [
+  "write-then-close",
+  "keep-open",
+] as const satisfies readonly ClaudeStdinLifecycle[];
 
 type JsonObject = Record<string, unknown>;
 
@@ -28,6 +44,7 @@ interface ReplayCase {
   readonly name: string;
   readonly executable: "claude" | "codex";
   readonly args: readonly string[];
+  readonly expectedStdin: string;
   readonly scenario: string;
   readonly exitCode: number;
   readonly failure: FailureKind | null;
@@ -38,6 +55,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude success",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "success",
     exitCode: 0,
     failure: null,
@@ -46,6 +64,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude bad model",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "bad-model",
     exitCode: 1,
     failure: "BAD_MODEL",
@@ -54,6 +73,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude budget exhaustion",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "budget-exhaustion",
     exitCode: 1,
     failure: "BUDGET_EXCEEDED",
@@ -62,6 +82,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude rate limit warning",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "rate-limit",
     exitCode: 0,
     failure: null,
@@ -70,6 +91,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude rate limit allowed",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "rate-limit-allowed",
     exitCode: 0,
     failure: null,
@@ -78,6 +100,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude rate limit rejected",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "rate-limit-rejected",
     exitCode: 0,
     failure: "QUOTA_EXHAUSTED",
@@ -86,6 +109,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude internal API retry",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "api-retry",
     exitCode: 0,
     failure: null,
@@ -94,6 +118,7 @@ const cases: readonly ReplayCase[] = [
     name: "Claude U+2028 payload",
     executable: "claude",
     args: claudeArgs,
+    expectedStdin: prompt,
     scenario: "unicode-separator",
     exitCode: 0,
     failure: null,
@@ -102,6 +127,7 @@ const cases: readonly ReplayCase[] = [
     name: "Codex success",
     executable: "codex",
     args: codexArgs,
+    expectedStdin: prompt,
     scenario: "success",
     exitCode: 0,
     failure: null,
@@ -110,75 +136,223 @@ const cases: readonly ReplayCase[] = [
     name: "Codex failure",
     executable: "codex",
     args: codexArgs,
+    expectedStdin: prompt,
     scenario: "failure",
     exitCode: 1,
     failure: "BAD_MODEL",
   },
 ];
 
+describe("worker contracts", () => {
+  test("keeps adapter discovery table-driven", () => {
+    expect(ADAPTER_DECLARATIONS).toEqual([
+      {
+        vendor: "claude",
+        executable: "claude",
+        processCompletion: "signals-then-must-be-killed",
+      },
+      {
+        vendor: "codex",
+        executable: "codex",
+        processCompletion: "self-exits",
+      },
+    ]);
+  });
+
+  test("keeps vendor and completion behavior correlated in AnyWorker", () => {
+    const contradictoryClaudeWorker = {
+      vendor: "claude",
+      processCompletion: "self-exits",
+      spawn: async () => {
+        throw new Error("not called");
+      },
+    } as const;
+
+    // @ts-expect-error AnyWorker rejects Claude paired with Codex completion behavior.
+    acceptAnyWorker(contradictoryClaudeWorker);
+  });
+
+  test("keeps the default idle timeout above the 600-second boundary", () => {
+    expect(DEFAULT_IDLE_TIMEOUT_MS).toBeGreaterThan(IDLE_TIMEOUT_BOUNDARY_MS);
+    expect(() => createIdleTimeoutMs(IDLE_TIMEOUT_BOUNDARY_MS)).toThrow(
+      "idle timeout must be a whole number above 600000 ms",
+    );
+    expect(() => createIdleTimeoutMs(599_999)).toThrow(RangeError);
+  });
+
+  test("couples pid presence to launch outcome", async () => {
+    const launchFailure = {
+      ok: false,
+      output: "",
+      usage: emptyUsage(),
+      durationMs: 0,
+      exitCode: null,
+      signal: null,
+      failure: {
+        kind: "LAUNCH_FAILURE",
+        message: "spawn ENOENT",
+        retryable: false,
+        statusCode: null,
+      },
+    } as const satisfies WorkerOutcome;
+
+    const numericPidWithLaunchFailure = {
+      pid: 123,
+      events: noWorkerEvents(),
+      completion: Promise.resolve(launchFailure),
+      cancel: async () => {
+        await Promise.resolve();
+      },
+    };
+    // @ts-expect-error A launched pid cannot resolve to LAUNCH_FAILURE.
+    acceptSpawnedWorker(numericPidWithLaunchFailure);
+
+    const success = {
+      ok: true,
+      output: "ok",
+      usage: emptyUsage(),
+      durationMs: 1,
+      exitCode: 0,
+      signal: null,
+    } as const satisfies WorkerOutcome;
+    const nullPidWithSuccess = {
+      pid: null,
+      events: noWorkerEvents(),
+      completion: Promise.resolve(success),
+      cancel: async () => {
+        await Promise.resolve();
+      },
+    };
+    // @ts-expect-error A null pid is reserved for a LAUNCH_FAILURE outcome.
+    acceptSpawnedWorker(nullPidWithSuccess);
+
+    const spawned = {
+      pid: null,
+      events: noWorkerEvents(),
+      completion: Promise.resolve(launchFailure),
+      cancel: async () => {
+        await Promise.resolve();
+      },
+    } satisfies SpawnedWorker;
+
+    expect(spawned.pid).toBeNull();
+    expect(await spawned.completion).toEqual(launchFailure);
+  });
+
+  test("requires non-TTY and Claude auto-memory environment guarantees", () => {
+    const environment = {
+      SHELL: "/bin/sh",
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+      EXTRA: "allowed",
+    } as const satisfies ClaudeWorkerEnvironment;
+    expect(environment.SHELL).toBe("/bin/sh");
+    expect(environment.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe("1");
+
+    type AutoMemoryIsMandatory =
+      ClaudeWorkerEnvironment["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] extends "1"
+        ? true
+        : false;
+    type NonTtyShellIsMandatory =
+      ClaudeWorkerEnvironment["SHELL"] extends "/bin/sh" ? true : false;
+    const guarantees: [AutoMemoryIsMandatory, NonTtyShellIsMandatory] = [
+      true,
+      true,
+    ];
+    expect(guarantees).toEqual([true, true]);
+  });
+});
+
 describe("fake worker executables", () => {
   for (const replayCase of cases) {
-    test(`replays and classifies ${replayCase.name}`, async () => {
-      const processHandle = spawnFake(
-        replayCase.executable,
-        replayCase.args,
-        replayCase.scenario,
-      );
-      processHandle.stdin.write(prompt);
-      processHandle.stdin.end();
+    const lifecycles =
+      replayCase.executable === "claude"
+        ? claudeStdinLifecycles
+        : ([null] as const);
+    for (const lifecycle of lifecycles) {
+      const lifecycleLabel = lifecycle === null ? "one-shot stdin" : lifecycle;
+      test(`replays and classifies ${replayCase.name} with ${lifecycleLabel}`, async () => {
+        const processHandle = spawnFake(
+          replayCase.executable,
+          replayCase.args,
+          replayCase.scenario,
+          {
+            expectedArgs: replayCase.args,
+            expectedStdin: replayCase.expectedStdin,
+            claudeStdinLifecycle: lifecycle ?? undefined,
+          },
+        );
+        const [stdout, stderr, exitCode] = await runPromptScenario(
+          processHandle,
+          replayCase.expectedStdin,
+          lifecycle,
+          replayCase.name,
+        );
+        const events = parseNdjson(stdout);
 
-      const [stdout, stderr, exitCode] = await within(
+        expect(stderr).toBe("");
+        expect(exitCode).toBe(replayCase.exitCode);
+        expect(events.length).toBeGreaterThan(0);
+        expect(
+          events.every((event) => typeof event.type === "string"),
+        ).toBeTrue();
+        expect(classify(events, exitCode)).toBe(replayCase.failure);
+        assertBehavior(replayCase.scenario, events);
+      });
+    }
+  }
+
+  for (const vendor of ["claude", "codex"] as const) {
+    const expectedArgs = vendor === "claude" ? claudeArgs : codexArgs;
+    const errorExitCode = vendor === "claude" ? 1 : 2;
+
+    test(`rejects a swallowed positional prompt for ${vendor}`, async () => {
+      const processHandle = spawnFake(vendor, expectedArgs, "success", {
+        expectedArgs,
+        expectedStdin: prompt,
+        claudeStdinLifecycle:
+          vendor === "claude" ? "write-then-close" : undefined,
+      });
+      processHandle.stdin.end();
+      const [stderr, exitCode] = await within(
         Promise.all([
-          new Response(processHandle.stdout).text(),
           new Response(processHandle.stderr).text(),
           processHandle.exited,
         ]),
         2_000,
-        replayCase.name,
+        `${vendor} stdin validation`,
       );
-      const events = parseNdjson(stdout);
+      expect(exitCode).toBe(errorExitCode);
+      expect(stderr).toContain("stdin mismatch");
+    });
 
-      expect(stderr).toBe("");
-      expect(exitCode).toBe(replayCase.exitCode);
-      expect(events.length).toBeGreaterThan(0);
-      expect(
-        events.every((event) => typeof event.type === "string"),
-      ).toBeTrue();
-      expect(classify(events, exitCode)).toBe(replayCase.failure);
-      assertBehavior(replayCase.scenario, events);
+    test(`rejects bad argv for ${vendor}`, async () => {
+      const processHandle = spawnFake(vendor, ["--bad-argv"], "success", {
+        expectedArgs,
+        expectedStdin: prompt,
+        claudeStdinLifecycle:
+          vendor === "claude" ? "write-then-close" : undefined,
+      });
+      processHandle.stdin.end();
+      const [stderr, exitCode] = await within(
+        Promise.all([
+          new Response(processHandle.stderr).text(),
+          processHandle.exited,
+        ]),
+        2_000,
+        `${vendor} argv validation`,
+      );
+      expect(exitCode).toBe(errorExitCode);
+      expect(stderr).toContain("argv mismatch");
     });
   }
 
-  test("validates Claude argv and Codex stdin with vendor exit codes", async () => {
-    const claude = spawnFake("claude", ["-p"], "success", {
-      expectedArgs: claudeArgs,
-    });
-    claude.stdin.end();
-    const [claudeStderr, claudeExit] = await within(
-      Promise.all([new Response(claude.stderr).text(), claude.exited]),
-      2_000,
-      "Claude argv validation",
-    );
-    expect(claudeExit).toBe(1);
-    expect(claudeStderr).toContain("argv mismatch");
-
-    const codex = spawnFake("codex", codexArgs, "success", {
-      expectedStdin: prompt,
-    });
-    codex.stdin.write("wrong prompt");
-    codex.stdin.end();
-    const [codexStderr, codexExit] = await within(
-      Promise.all([new Response(codex.stderr).text(), codex.exited]),
-      2_000,
-      "Codex stdin validation",
-    );
-    expect(codexExit).toBe(2);
-    expect(codexStderr).toContain("stdin mismatch");
-  });
-
   test("classifies a Codex argv parser failure from exit 2", async () => {
     const args = ["exec", "--definitely-invalid"] as const;
-    const processHandle = spawnFake("codex", args, "argv-error");
+    const processHandle = spawnFake("codex", args, "argv-error", {
+      expectedArgs: args,
+      expectedStdin: "",
+      claudeStdinLifecycle: undefined,
+    });
     processHandle.stdin.end();
 
     const [stdout, stderr, exitCode] = await within(
@@ -197,8 +371,23 @@ describe("fake worker executables", () => {
     expect(classify([], exitCode)).toBe("ARGV_BUG");
   });
 
-  test("exposes Claude completion before its process exits", async () => {
-    const processHandle = spawnFake("claude", claudeArgs, "never-exits");
+  test("classifies Claude terminal results from all three error fields", () => {
+    const hard404 = {
+      type: "result",
+      is_error: true,
+      terminal_reason: "api_error",
+      api_error_status: 404,
+    };
+    expect(classify([hard404], 0)).toBe("BAD_MODEL");
+    expect(classify([{ ...hard404, is_error: false }], 0)).toBeNull();
+  });
+
+  test("exposes Claude completion before its keep-open process exits", async () => {
+    const processHandle = spawnFake("claude", claudeArgs, "success", {
+      expectedArgs: claudeArgs,
+      expectedStdin: prompt,
+      claudeStdinLifecycle: "keep-open",
+    });
     const [eventStream, drainStream] = processHandle.stdout.tee();
     const events = createNdjsonReader(eventStream);
     const draining = new Response(drainStream).text();
@@ -235,67 +424,96 @@ describe("fake worker executables", () => {
     await within(draining, 2_000, "Claude stdout EOF");
   });
 
-  test("requires process-group kill to close a grandchild-held pipe", async () => {
-    const processHandle = spawnFake("claude", claudeArgs, "grandchild-pipe", {
-      detached: true,
-    });
-    const output = new Response(processHandle.stdout).text();
-    processHandle.stdin.write(prompt);
-    processHandle.stdin.end();
-
-    try {
-      expect(
-        await within(processHandle.exited, 2_000, "fake parent exit"),
-      ).toBe(0);
-      processHandle.kill("SIGTERM");
-      await expect(within(output, 100, "pid-only pipe close")).rejects.toThrow(
-        "pid-only pipe close timed out",
+  for (const lifecycle of claudeStdinLifecycles) {
+    test(`requires process-group kill with ${lifecycle} Claude stdin`, async () => {
+      const processHandle = spawnFake("claude", claudeArgs, "grandchild-pipe", {
+        detached: true,
+        expectedArgs: claudeArgs,
+        expectedStdin: prompt,
+        claudeStdinLifecycle: lifecycle,
+      });
+      const reader = processHandle.stdout.getReader();
+      processHandle.stdin.write(
+        lifecycle === "keep-open" ? `${prompt}\n` : prompt,
       );
-
-      process.kill(-processHandle.pid, "SIGTERM");
-      const events = parseNdjson(
-        await within(output, 2_000, "process-group pipe close"),
-      );
-      expect(events).toHaveLength(1);
-      expect(events[0]?.subtype).toBe("grandchild_pipe_open");
-    } finally {
-      try {
-        process.kill(-processHandle.pid, "SIGKILL");
-      } catch {
-        // The group normally no longer exists after the asserted SIGTERM.
+      if (lifecycle === "write-then-close") {
+        processHandle.stdin.end();
       }
-    }
-  });
+      const first = await within(
+        reader.read(),
+        2_000,
+        `${lifecycle} grandchild output`,
+      );
+      expect(first.done).toBeFalse();
 
-  test("models a healthy 405-second Claude silence without waiting 405 seconds", async () => {
-    const startedAt = performance.now();
-    const processHandle = spawnFake("claude", claudeArgs, "long-silence", {
-      extraEnvironment: { BRIGADIER_FAKE_SILENCE_MS: "80" },
+      try {
+        if (lifecycle === "keep-open") {
+          await expect(
+            within(processHandle.exited, 75, "fake parent before stdin EOF"),
+          ).rejects.toThrow("fake parent before stdin EOF timed out");
+          processHandle.stdin.end();
+        }
+        expect(
+          await within(processHandle.exited, 2_000, "fake parent exit"),
+        ).toBe(0);
+        processHandle.kill("SIGTERM");
+        await expect(
+          within(reader.read(), 100, "pid-only pipe close"),
+        ).rejects.toThrow("pid-only pipe close timed out");
+
+        process.kill(-processHandle.pid, "SIGTERM");
+        const output =
+          decodeChunk(first.value) +
+          (await within(
+            readRemaining(reader),
+            2_000,
+            "process-group pipe close",
+          ));
+        const events = parseNdjson(output);
+        expect(events).toHaveLength(1);
+        expect(events[0]?.subtype).toBe("grandchild_pipe_open");
+      } finally {
+        try {
+          process.kill(-processHandle.pid, "SIGKILL");
+        } catch {
+          // The group normally no longer exists after the asserted SIGTERM.
+        }
+      }
     });
-    processHandle.stdin.write(prompt);
-    processHandle.stdin.end();
+  }
 
-    const [stdout, exitCode] = await within(
-      Promise.all([
-        new Response(processHandle.stdout).text(),
-        processHandle.exited,
-      ]),
-      2_000,
-      "scaled long silence",
-    );
-    const elapsedMs = performance.now() - startedAt;
-    const events = parseNdjson(stdout);
-    const terminal = events.at(-1);
+  for (const lifecycle of claudeStdinLifecycles) {
+    test(`models a healthy 405-second Claude silence with ${lifecycle}`, async () => {
+      const startedAt = performance.now();
+      const processHandle = spawnFake("claude", claudeArgs, "long-silence", {
+        expectedArgs: claudeArgs,
+        expectedStdin: prompt,
+        claudeStdinLifecycle: lifecycle,
+        extraEnvironment: { BRIGADIER_FAKE_SILENCE_MS: "80" },
+      });
+      const [stdout, _stderr, exitCode] = await runPromptScenario(
+        processHandle,
+        prompt,
+        lifecycle,
+        "scaled long silence",
+      );
+      const elapsedMs = performance.now() - startedAt;
+      const events = parseNdjson(stdout);
+      const terminal = events.at(-1);
 
-    expect(exitCode).toBe(0);
-    expect(elapsedMs).toBeGreaterThanOrEqual(70);
-    expect(terminal?.duration_ms).toBe(405_000);
-    expect(600_001).toBeGreaterThan(600_000);
-  });
+      expect(exitCode).toBe(0);
+      expect(elapsedMs).toBeGreaterThanOrEqual(70);
+      expect(terminal?.duration_ms).toBe(405_000);
+    });
+  }
 
   test("keeps a Codex app-server alive across requests and exits on stdin EOF", async () => {
     const args = ["app-server", "--stdio"] as const;
-    const processHandle = spawnFake("codex", args, "app-server");
+    const processHandle = spawnFake("codex", args, "app-server", {
+      expectedArgs: args,
+      expectedStdin: "",
+      claudeStdinLifecycle: undefined,
+    });
     const responses = createNdjsonReader(processHandle.stdout);
     const stderr = new Response(processHandle.stderr).text();
 
@@ -367,10 +585,11 @@ function spawnFake(
   selectedScenario: string,
   options: {
     readonly detached?: boolean;
-    readonly expectedArgs?: readonly string[];
-    readonly expectedStdin?: string;
+    readonly expectedArgs: readonly string[];
+    readonly expectedStdin: string;
+    readonly claudeStdinLifecycle: ClaudeStdinLifecycle | undefined;
     readonly extraEnvironment?: Readonly<Record<string, string>>;
-  } = {},
+  },
 ) {
   const currentPath = process.env.PATH;
   if (currentPath === undefined) {
@@ -383,10 +602,13 @@ function spawnFake(
     env: {
       ...process.env,
       ...options.extraEnvironment,
-      BRIGADIER_FAKE_EXPECTED_ARGV: JSON.stringify(
-        options.expectedArgs ?? args,
-      ),
-      BRIGADIER_FAKE_EXPECTED_STDIN: options.expectedStdin ?? prompt,
+      ...(options.claudeStdinLifecycle === undefined
+        ? {}
+        : {
+            BRIGADIER_FAKE_STDIN_LIFECYCLE: options.claudeStdinLifecycle,
+          }),
+      BRIGADIER_FAKE_EXPECTED_ARGV: JSON.stringify(options.expectedArgs),
+      BRIGADIER_FAKE_EXPECTED_STDIN: options.expectedStdin,
       BRIGADIER_FAKE_SCENARIO: selectedScenario,
       PATH: `${fakeBin}:${currentPath}`,
     },
@@ -394,6 +616,68 @@ function spawnFake(
     stderr: "pipe",
     stdout: "pipe",
   });
+}
+
+async function runPromptScenario(
+  processHandle: ReturnType<typeof spawnFake>,
+  expectedStdin: string,
+  lifecycle: ClaudeStdinLifecycle | null,
+  label: string,
+): Promise<readonly [stdout: string, stderr: string, exitCode: number]> {
+  const stderrPromise = new Response(processHandle.stderr).text();
+  if (lifecycle !== "keep-open") {
+    processHandle.stdin.write(expectedStdin);
+    processHandle.stdin.end();
+    return within(
+      Promise.all([
+        new Response(processHandle.stdout).text(),
+        stderrPromise,
+        processHandle.exited,
+      ]),
+      2_000,
+      label,
+    );
+  }
+
+  const reader = processHandle.stdout.getReader();
+  const decoder = new TextDecoder();
+  processHandle.stdin.write(`${expectedStdin}\n`);
+  const first = await within(reader.read(), 2_000, `${label} first output`);
+  expect(first.done).toBeFalse();
+  await expect(
+    within(processHandle.exited, 75, `${label} before stdin EOF`),
+  ).rejects.toThrow(`${label} before stdin EOF timed out`);
+  processHandle.stdin.end();
+  const firstText = decoder.decode(first.value, { stream: true });
+
+  const [remaining, stderr, exitCode] = await within(
+    Promise.all([
+      readRemaining(reader, decoder),
+      stderrPromise,
+      processHandle.exited,
+    ]),
+    2_000,
+    `${label} after stdin EOF`,
+  );
+  return [firstText + remaining, stderr, exitCode];
+}
+
+async function readRemaining(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  decoder = new TextDecoder(),
+): Promise<string> {
+  let text = "";
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) {
+      return text + decoder.decode();
+    }
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+}
+
+function decodeChunk(chunk: Uint8Array | undefined): string {
+  return chunk === undefined ? "" : new TextDecoder().decode(chunk);
 }
 
 function parseNdjson(text: string): JsonObject[] {
@@ -452,6 +736,10 @@ function createNdjsonReader(stream: ReadableStream<Uint8Array>): {
   };
 }
 
+/**
+ * Reference oracle for fixture expectations only. WO-001 must replace this
+ * function's callers by importing the production normalizer it implements.
+ */
 function classify(
   events: readonly JsonObject[],
   exitCode: number,
@@ -461,17 +749,19 @@ function classify(
   }
 
   const result = events.findLast((event) => event.type === "result");
-  if (result?.terminal_reason === "max_budget_usd") {
-    return "BUDGET_EXCEEDED";
-  }
-  if (
-    result?.terminal_reason === "rate_limit" ||
-    result?.api_error_status === 429
-  ) {
-    return "QUOTA_EXHAUSTED";
-  }
-  if (result?.api_error_status === 404) {
-    return "BAD_MODEL";
+  const isError = result?.is_error === true;
+  const terminalReason = result?.terminal_reason;
+  const apiErrorStatus = result?.api_error_status;
+  if (isError) {
+    if (terminalReason === "max_budget_usd") {
+      return "BUDGET_EXCEEDED";
+    }
+    if (terminalReason === "rate_limit" || apiErrorStatus === 429) {
+      return "QUOTA_EXHAUSTED";
+    }
+    if (apiErrorStatus === 404) {
+      return "BAD_MODEL";
+    }
   }
 
   const serialized = JSON.stringify(events);
@@ -525,6 +815,10 @@ function assertBehavior(
   }
 }
 
+/**
+ * Reference oracle for fixture expectations only. WO-001 must replace this
+ * function's callers by importing production token normalization.
+ */
 function preferredClaudeInputTotal(result: JsonObject | undefined): number {
   const modelUsage = asObject(result?.modelUsage);
   const models = Object.values(modelUsage);
@@ -558,6 +852,21 @@ function asObject(value: unknown): JsonObject {
 function asNumber(value: unknown): number {
   return typeof value === "number" ? value : 0;
 }
+
+function emptyUsage(): WorkerOutcome["usage"] {
+  return {
+    input: { total: 0, uncached: 0, cacheRead: 0, cacheWrite: 0 },
+    output: { total: 0, reasoning: null },
+  };
+}
+
+async function* noWorkerEvents(): AsyncGenerator<WorkerEvent> {
+  yield* [] as WorkerEvent[];
+}
+
+function acceptAnyWorker(_worker: AnyWorker): void {}
+
+function acceptSpawnedWorker(_worker: SpawnedWorker): void {}
 
 async function within<T>(
   promise: Promise<T>,
