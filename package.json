@@ -5,21 +5,35 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "brigadier": "./src/cli.ts"
+    "brigadier": "./bin/brigadier.js"
   },
   "exports": {
     ".": "./src/index.ts",
     "./contracts": "./src/contracts.ts"
   },
   "files": [
+    "bin",
+    "brigadier",
+    "dist",
     "src"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier",
+    "build": "bun build ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier && codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
     "check": "biome check .",
     "format": "biome format --write .",
+    "prepack": "bun run build",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
+  },
+  "optionalDependencies": {
+    "@stephen-golban/brigadier-darwin-arm64": "0.0.0",
+    "@stephen-golban/brigadier-darwin-x64": "0.0.0",
+    "@stephen-golban/brigadier-linux-arm64": "0.0.0",
+    "@stephen-golban/brigadier-linux-x64": "0.0.0",
+    "@stephen-golban/brigadier-win32-x64": "0.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

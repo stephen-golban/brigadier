@@ -1,8 +1,8 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 
 import packageJson from "../package.json";
 
-const args = Bun.argv.slice(2);
+const args = process.argv.slice(2);
 
 if (args.length === 1 && (args[0] === "--version" || args[0] === "-V")) {
   console.log(packageJson.version);

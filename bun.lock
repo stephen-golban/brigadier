@@ -9,6 +9,13 @@
         "@types/bun": "1.3.14",
         "typescript": "5.9.3",
       },
+      "optionalDependencies": {
+        "@stephen-golban/brigadier-darwin-arm64": "0.0.0",
+        "@stephen-golban/brigadier-darwin-x64": "0.0.0",
+        "@stephen-golban/brigadier-linux-arm64": "0.0.0",
+        "@stephen-golban/brigadier-linux-x64": "0.0.0",
+        "@stephen-golban/brigadier-win32-x64": "0.0.0",
+      },
     },
   },
   "packages": {

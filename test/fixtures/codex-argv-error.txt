@@ -1,0 +1,3 @@
+error: unexpected argument '--definitely-invalid' found
+
+Usage: codex exec [OPTIONS] [PROMPT] [COMMAND]

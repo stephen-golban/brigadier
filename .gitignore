@@ -1,3 +1,4 @@
 brigadier
+dist/
 *.js.map
 node_modules/

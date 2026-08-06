@@ -1,27 +1,2 @@
-#!/usr/bin/env bun
-
-import { dirname, resolve } from "node:path";
-
-const scenario = process.env.BRIGADIER_FAKE_SCENARIO;
-const fixtureByScenario: Readonly<Record<string, string>> = {
-  "bad-model": "claude-bad-model.jsonl",
-  "rate-limit": "claude-rate-limit.jsonl",
-  success: "claude-success.jsonl",
-};
-const fixture = scenario === undefined ? undefined : fixtureByScenario[scenario];
-
-if (fixture === undefined) {
-  console.error(`Unknown Claude fixture scenario: ${scenario ?? "<unset>"}`);
-  process.exit(64);
-}
-
-const fixturePath = resolve(
-  dirname(import.meta.path),
-  "../../test/fixtures",
-  fixture,
-);
-process.stdout.write(await Bun.file(fixturePath).text());
-
-if (scenario === "bad-model") {
-  process.exitCode = 1;
-}
+#!/bin/sh
+exec bun "$(dirname "$0")/claude.ts" "$@"
