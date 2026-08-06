@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"rateLimits":{"primary":{"usedPercent":87,"windowDurationMins":300,"resetsAt":1786026000},"secondary":{"usedPercent":42,"windowDurationMins":10080,"resetsAt":1786458000},"rateLimitReachedType":"primary","planType":"pro"}}}
