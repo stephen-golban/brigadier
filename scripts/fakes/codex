@@ -1,0 +1,26 @@
+#!/usr/bin/env bun
+
+import { dirname, resolve } from "node:path";
+
+const scenario = process.env.BRIGADIER_FAKE_SCENARIO;
+const fixtureByScenario: Readonly<Record<string, string>> = {
+  failure: "codex-failure.jsonl",
+  success: "codex-success.jsonl",
+};
+const fixture = scenario === undefined ? undefined : fixtureByScenario[scenario];
+
+if (fixture === undefined) {
+  console.error(`Unknown Codex fixture scenario: ${scenario ?? "<unset>"}`);
+  process.exit(64);
+}
+
+const fixturePath = resolve(
+  dirname(import.meta.path),
+  "../../test/fixtures",
+  fixture,
+);
+process.stdout.write(await Bun.file(fixturePath).text());
+
+if (scenario === "failure") {
+  process.exitCode = 1;
+}
