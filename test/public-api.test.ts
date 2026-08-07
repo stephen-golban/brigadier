@@ -6,32 +6,115 @@ import * as packageApi from "../src/index.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 
-test("root barrel exposes each unit's curated implementation surface", () => {
+/**
+ * The exact public surface, sorted.
+ *
+ * This is an exact-set assertion on purpose. The previous `arrayContaining`
+ * spot-check could never fail on growth: it passed as long as the named symbols
+ * existed, so a unit could triple the barrel without a single test noticing.
+ * Adding or removing a package export must be a deliberate edit to this list,
+ * reviewed like any other API change.
+ */
+const PUBLIC_API: readonly string[] = [
+  "ADAPTER_DECLARATIONS",
+  "CLAUDE_STATIC_MODELS",
+  "COMPETENCE_TABLE",
+  "CONFIG_FILE_NAME",
+  "CONFIG_HOME_VARIABLE",
+  "CONFIG_VERSION",
+  "ClaudeQuotaOracle",
+  "ClaudeWorker",
+  "CodexQuotaOracle",
+  "CodexWorker",
+  "ConfigValidationError",
+  "DEFAULT_EFFORT_CEILING",
+  "DEFAULT_IDLE_TIMEOUT_MS",
+  "EFFORT_LADDER",
+  "FAILURE_KINDS",
+  "GitWorktreeEngine",
+  "IDLE_TIMEOUT_BOUNDARY_MS",
+  "LinkedSecretCommitError",
+  "NoChangesToCommitError",
+  "VendorDiscoverer",
+  "buildClaudeCommand",
+  "buildCodexCommand",
+  "claudeWorker",
+  "codexWorker",
+  "createClaudeQuotaOracle",
+  "createCodexQuotaOracle",
+  "createDiscoverer",
+  "createIdleTimeoutMs",
+  "defaultEffortCeiling",
+  "narrowEfforts",
+  "normalizeClaudeRateLimitEvent",
+  "normalizeCodexRateLimits",
+  "parseCodexCatalog",
+  "parseConfig",
+  "proposeConfig",
+  "readConfig",
+  "readNdjson",
+  "resolveConfigHome",
+  "resolveConfigPath",
+  "runInit",
+  "serializeConfig",
+  "withDefaultModel",
+  "withEffortCeiling",
+  "withQuotaFallback",
+  "withSecretsConsent",
+  "writeConfig",
+];
+
+test("root barrel exposes exactly the curated public surface", () => {
+  const exports = Object.keys(packageApi).sort();
+
+  expect(exports).toEqual([...PUBLIC_API]);
+  expect(exports).toHaveLength(46);
+});
+
+test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {
   const exports = Object.keys(packageApi);
 
-  expect(exports).toEqual(
-    expect.arrayContaining([
-      "ClaudeWorker",
-      "CodexWorker",
-      "ClaudeQuotaOracle",
-      "CodexQuotaOracle",
-      "createClaudeQuotaOracle",
-      "createCodexQuotaOracle",
-      "GitWorktreeEngine",
-      "LinkedSecretCommitError",
-      "NoChangesToCommitError",
-    ]),
-  );
-  expect(exports).not.toEqual(
-    expect.arrayContaining([
-      "isObject",
-      "stringValue",
-      "failure",
-      "asObject",
-      "GitCommandError",
-      "consumeNdjson",
-    ]),
-  );
+  // Asserted one at a time: `not.toEqual(arrayContaining([a, b]))` passes as
+  // soon as a single name is absent, so a list of them proves almost nothing.
+  const mustNotLeak: readonly string[] = [
+    "isObject",
+    "stringValue",
+    "failure",
+    "asObject",
+    "GitCommandError",
+    "consumeNdjson",
+    "LineReader",
+    "confirmPrompt",
+    "selectPrompt",
+    "rankModels",
+    "nodeConfigIo",
+    "isEffort",
+    // CLI internals: `src/cli.ts` imports these from `./init/index.js`.
+    "runCli",
+    "USAGE",
+    // Discovery wiring and low-level readers.
+    "VENDOR_CATALOG_SOURCES",
+    "CLAUDE_CATALOG_SOURCE",
+    "CODEX_CATALOG_SOURCE",
+    "CLAUDE_VERSION_ARGS",
+    "CODEX_VERSION_ARGS",
+    "CODEX_CATALOG_ARGS",
+    "readClaudeCatalog",
+    "readCodexCatalog",
+    "createCommandRunner",
+    "createExecutableResolver",
+    "resolveExecutable",
+    // Prompt copy, not API.
+    "EFFORT_CEILING_NOTE",
+    "EFFORT_CEILING_WARNING",
+    "ROUTER_NOTE",
+    "FALLBACK_NONE_LABEL",
+  ];
+
+  for (const name of mustNotLeak) {
+    expect(exports).not.toContain(name);
+  }
+  expect(mustNotLeak).toHaveLength(29);
 });
 
 test("built dist output executes the Codex quota oracle under Node", () => {
