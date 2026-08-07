@@ -170,6 +170,7 @@ export function proposeConfig(
     version: CONFIG_VERSION,
     vendors: vendors.map((entry) => entry.config),
     secretsConsent: existing?.secretsConsent ?? false,
+    allowDegradedRouting: existing?.allowDegradedRouting ?? false,
   });
 
   return {
@@ -249,21 +250,6 @@ function proposeVendor(
     }
   }
 
-  // Decision #21: nothing is proposed as a fallback. Brigadier never invents a
-  // same-vendor downgrade; substituting a model is a choice the user makes.
-  let quotaFallbackModel: string | null = null;
-  const priorFallback = prior?.quotaFallbackModel ?? null;
-  if (priorFallback !== null) {
-    if (selectableIds.has(priorFallback)) {
-      quotaFallbackModel = priorFallback;
-      carriedOver = true;
-    } else {
-      resetChoices.push(
-        `${discovered.vendor}: previous quota fallback "${priorFallback}" ${whyUnavailable(discovered, unusableReasons, priorFallback)}; reset to none`,
-      );
-    }
-  }
-
   return {
     vendor: discovered.vendor,
     executable: discovered.executable,
@@ -279,7 +265,6 @@ function proposeVendor(
       version: discovered.version,
       defaultModel,
       models,
-      quotaFallbackModel,
     },
   };
 }
@@ -388,18 +373,22 @@ export function withDefaultModel(
 }
 
 /**
- * Replaces a vendor's quota fallback. `null` means fail the slice instead.
- * A model absent from the vendor's discovered list is rejected.
+ * Records whether a slice nothing can reach may run on a below-floor model
+ * instead of failing.
+ *
+ * It is one setting for the whole config rather than one per vendor, and that
+ * is the substance of WO-010H rather than a simplification of it: what is being
+ * consented to is a *routing behaviour*, and the router picks the best
+ * below-floor model on the machine without asking which vendor holds it. The
+ * per-vendor `withQuotaFallback` this replaces recorded a model id as well, for
+ * a substitution that per-model quota metering made the ordinary pipeline
+ * perform on merit.
  */
-export function withQuotaFallback(
+export function withDegradedRouting(
   config: BrigadierConfig,
-  vendor: Vendor,
-  modelId: string | null,
+  allowed: boolean,
 ): BrigadierConfig {
-  return mapVendor(config, vendor, (entry) => ({
-    ...entry,
-    quotaFallbackModel: modelId,
-  }));
+  return parseConfig({ ...config, allowDegradedRouting: allowed });
 }
 
 /** Replaces one model's effort ceiling. */

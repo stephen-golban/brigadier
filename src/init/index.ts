@@ -37,13 +37,23 @@ import type {
 import {
   proposeConfig,
   withDefaultModel,
+  withDegradedRouting,
   withEffortCeiling,
-  withQuotaFallback,
   withSecretsConsent,
 } from "./propose.js";
 
-/** Offered verbatim in the quota-fallback prompt; not a hidden default. */
-export const FALLBACK_NONE_LABEL = "none — fail the slice instead";
+/**
+ * The degraded-routing question, asked once for the whole config.
+ *
+ * The wording is the whole point of WO-010H. Its predecessor asked "When claude
+ * quota drains, fall back to:" and offered a model list — a description of a
+ * capability that no longer exists, since per-model quota metering means a
+ * drained tier leaves its healthy siblings competing in the ordinary pipeline
+ * on merit. What configuring a fallback actually did by then was authorize the
+ * difficulty-floor waiver, so that is what is asked here, in those terms.
+ */
+export const DEGRADED_ROUTING_QUESTION =
+  "If no model on this machine meets a slice's difficulty bar, run the slice on a weaker model instead of failing it?";
 
 /** Decision #20's documented warning, shown before any ceiling is raised. */
 export const EFFORT_CEILING_WARNING =
@@ -262,12 +272,12 @@ function renderProposal(stdout: OutputStream, proposal: Proposal): void {
         `    ${model.id}: ceiling ${model.effortCeiling}${describeAllowed(ranked)}\n`,
       );
     }
-    stdout.write(
-      `    quota fallback: ${vendor.config.quotaFallbackModel ?? FALLBACK_NONE_LABEL}\n`,
-    );
   }
   stdout.write(
     `\n  secrets consent: ${proposal.config.secretsConsent ? "yes" : "no"}\n`,
+  );
+  stdout.write(
+    `  run below-difficulty models rather than fail: ${proposal.config.allowDegradedRouting ? "yes" : "no"}\n`,
   );
   stdout.write(`\n${ROUTER_NOTE}\n`);
 }
@@ -315,8 +325,19 @@ async function confirmInteractively(
     }
 
     config = await promptEffortCeilings(io, vendor, config);
-    config = await promptQuotaFallback(io, vendor, config);
   }
+
+  // Asked once, after the per-vendor questions, because it is not a per-vendor
+  // setting. Default No on a fresh config, matching the config default and
+  // decision #21's original spirit that brigadier never silently substitutes;
+  // on a re-run the current value is the default, so an existing yes is not
+  // discarded by pressing enter.
+  const degraded = await confirmPrompt(
+    io,
+    DEGRADED_ROUTING_QUESTION,
+    config.allowDegradedRouting,
+  );
+  config = withDegradedRouting(config, degraded);
 
   // Decision #6: default No on a fresh config. On a re-run the current value is
   // the default, so an existing yes is not silently discarded by pressing enter.
@@ -370,33 +391,6 @@ async function promptEffortCeilings(
     next = withEffortCeiling(next, vendor.vendor, ranked.model.id, chosen);
   }
   return next;
-}
-
-async function promptQuotaFallback(
-  io: PromptIo,
-  vendor: VendorProposal,
-  config: BrigadierConfig,
-): Promise<BrigadierConfig> {
-  const choices = [
-    ...vendor.ranked.map((entry) => ({
-      label: entry.model.id,
-      value: entry.model.id as string | null,
-      detail: entry.model.displayName,
-    })),
-    { label: FALLBACK_NONE_LABEL, value: null as string | null },
-  ];
-  const currentFallback = current(config, vendor.vendor).quotaFallbackModel;
-  const defaultIndex =
-    currentFallback === null
-      ? choices.length - 1
-      : indexOfModel(vendor.ranked, currentFallback);
-  const chosen = await selectPrompt<string | null>(
-    io,
-    `  When ${vendor.vendor} quota drains, fall back to:`,
-    choices,
-    defaultIndex,
-  );
-  return withQuotaFallback(config, vendor.vendor, chosen);
 }
 
 function current(config: BrigadierConfig, vendor: Vendor): VendorConfig {
@@ -541,7 +535,7 @@ export {
   COMPETENCE_TABLE,
   proposeConfig,
   withDefaultModel,
+  withDegradedRouting,
   withEffortCeiling,
-  withQuotaFallback,
   withSecretsConsent,
 } from "./propose.js";

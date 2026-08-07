@@ -61,8 +61,8 @@ const PUBLIC_API: readonly string[] = [
   "serializeConfig",
   "validatePlan",
   "withDefaultModel",
+  "withDegradedRouting",
   "withEffortCeiling",
-  "withQuotaFallback",
   "withSecretsConsent",
   "writeConfig",
 ];
@@ -111,7 +111,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     "EFFORT_CEILING_NOTE",
     "EFFORT_CEILING_WARNING",
     "ROUTER_NOTE",
-    "FALLBACK_NONE_LABEL",
+    "DEGRADED_ROUTING_QUESTION",
     // Routing internals. `COMPETENCE_TABLE` and `DIFFICULTY_FLOORS` are API
     // because decision #7 promises the ranking is auditable data; the scoring
     // path that reads them is how the router and `init` stay in agreement, and

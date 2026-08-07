@@ -7,10 +7,11 @@
  * configured model from every configured vendor enters one pool and competes on
  * the competence scale in `./competence.ts`; nothing in this file may branch on
  * `entry.vendor` to prefer one, and the only places vendor is read at all are
- * quota (which is per-account, so it has to be) and the identity of the result.
+ * quota (which is scoped to an account, so it has to be) and the identity of the
+ * result.
  *
- * Three rules here are product decisions rather than implementation choices,
- * and all three are load-bearing:
+ * The rules below are product decisions rather than implementation choices, and
+ * every one of them is load-bearing:
  *
  * - Difficulty sets a *floor*, and the winner is the **lowest** scorer above
  *   it. Ranking without that inversion would route every slice to the best
@@ -19,31 +20,50 @@
  *   #9/#20). Effort is clamped downward only, from a base that can be `xhigh`
  *   solely on an escalated request, and `assertEffortEarned` re-checks the
  *   result rather than trusting the arithmetic.
- * - A configured `quotaFallbackModel` is a **last resort, never a preemption**
- *   (owner ruling, 2026-08-07). An exhausted vendor's models leave the pool and
- *   the whole pipeline runs over what is left; only when *that* yields nothing
- *   is a fallback consulted. The earlier shape let a drained vendor's downgrade
- *   take the slice the moment its quota ran out, so `claude` running dry could
- *   route a `hard` slice to `claude-haiku-5` (score 40, floor 90) while a
- *   healthy `gpt-5.6-sol` (score 96) sat idle. While the ordinary pipeline
- *   yields anything at all, healthy capacity takes the slice and no fallback is
- *   even looked up.
- * - The last resort is a **salvage pool, not a fallback lookup**. Waiving the
- *   floor only for the exhausted vendors' fallbacks re-created the preemption
- *   bug in a narrower corner: with nothing clearing a `hard` floor of 90, a
- *   healthy `gpt-5.6-terra` (score 70) lost to a drained vendor's configured
- *   `claude-haiku-5` (score 40), because only the fallback was allowed through
- *   the waived floor. So when the ordinary pipeline yields nothing, the waiver
- *   applies to the union: every exhausted vendor's usable fallback *and* every
- *   healthy model that passed capability and was rejected only for scoring
- *   below the floor. Highest score wins, and a healthy vendor breaks a tie —
- *   so a drained vendor's substitution can still take a salvage slice when it
- *   outranks everything healthy, which is the case the user configured it for.
+ * - Quota is resolved **per model, not per vendor** (WO-010B). A CLI account
+ *   meters some limits account-wide and others per model tier — a drained
+ *   `seven_day_opus` bucket says nothing about Sonnet — so each pooled model
+ *   asks `modelQuotaStatus` about itself. Reading only `QuotaSnapshot.status`
+ *   made an Opus-only limit invisible to the router, which then routed a hard
+ *   slice straight into the drained tier; reading a model-scoped window as
+ *   vendor-wide exhaustion, which is what the code did before the WO-010A
+ *   reshape, made a healthy Sonnet unreachable. Per-model is the only reading
+ *   that is wrong in neither direction.
+ * - The difficulty floor is waived **only with the user's explicit consent**,
+ *   recorded as `BrigadierConfig.allowDegradedRouting`. When the ordinary
+ *   pipeline yields nothing and the flag is off, `route` fails and says so; a
+ *   user who left it off asked to be told brigadier could not route the slice,
+ *   not to have it quietly run on something under the bar.
+ * - When the flag is on, the last resort is a **salvage pool**: every model that
+ *   passed the capability filter, resolves to a runnable effort, and was
+ *   eliminated *only* for scoring below the difficulty floor. Highest competence
+ *   wins — the one place in the engine where highest rather than lowest wins,
+ *   because "cheapest adequate" has no adequate set left to range over once the
+ *   floor is gone. Ties break on config order, like everywhere else.
+ * - A quota-exhausted model is **never** in that pool. The waiver waives the
+ *   floor and nothing else; capability, effort, and quota all still answer "can
+ *   this model do the work at all", which no amount of consent changes.
  *
- * Salvage stays locked unless at least one exhausted vendor has a fallback
- * configured. That is what keeps decision #21's `null` meaningful: a user who
- * configured no substitution asked to be told brigadier could not route the
- * slice, not to have it quietly run on something under the floor.
+ * WO-010H removed the per-vendor `quotaFallbackModel` this stage used to be
+ * built around, and the removal was a deletion rather than a rename because
+ * per-model quota (WO-010B) had already taken both halves of its job away:
+ *
+ * - Its stated job now happens without it. Claude meters Opus separately, so a
+ *   drained Opus tier leaves Sonnet in the pool, where Sonnet competes and wins
+ *   on merit through the ordinary pipeline. No substitution is looked up, no
+ *   consent is spent, and no floor is waived.
+ * - Its remaining code path was provably dead. `parseConfig` required a
+ *   fallback to name one of that vendor's *own* models, salvage only consulted a
+ *   vendor once *every* one of its models was exhausted, and WO-010G made
+ *   salvage re-check per-model quota — so the named fallback was always itself
+ *   exhausted and always rejected.
+ *
+ * What was left of it was consent, and consent is what `allowDegradedRouting`
+ * records. Everything the field could still reach — the drained half of the
+ * salvage pool, the healthy/drained tie-break, the `usedQuotaFallback` flag —
+ * went with it, and `RoutedWorker.waivedDifficultyFloor` now states the one
+ * thing about a salvage run that is true and useful: the slice ran below the
+ * bar its difficulty asked for.
  *
  * `route` is pure and synchronous: no clock, no filesystem, no subprocess. It
  * returns a failure rather than throwing for anything a caller could
@@ -51,14 +71,16 @@
  * which is a bug in the caller and not a routing outcome.
  */
 
-import type { BrigadierConfig, VendorConfig } from "../config/contracts.js";
+import type { BrigadierConfig } from "../config/contracts.js";
 import { EFFORT_LADDER } from "../config/contracts.js";
 import type {
   Capability,
   Effort,
   QuotaSnapshot,
+  QuotaWindow,
   Vendor,
 } from "../contracts.js";
+import { modelQuotaStatus } from "../quota/contracts.js";
 import {
   DIFFICULTY_FLOORS,
   matchCompetenceRule,
@@ -114,17 +136,15 @@ interface Selection {
 
 /**
  * One model admitted to the waived-floor salvage pool, proven able to run the
- * slice at some effort. Either an exhausted vendor's configured fallback or a
- * healthy model the difficulty floor rejected; `healthy` is the only thing that
- * distinguishes them, and it decides `usedQuotaFallback`.
+ * slice at some effort: it passed the capability filter, resolved to a runnable
+ * rung, was not removed by quota, and was eliminated only by the difficulty
+ * floor.
  */
 interface SalvageCandidate {
   readonly entry: PooledModel;
   readonly effort: Effort;
   readonly score: number;
   readonly clamps: readonly string[];
-  /** False when this model's own vendor is the one reporting exhaustion. */
-  readonly healthy: boolean;
 }
 
 /** What one run of the capability/competence/effort pipeline produced. */
@@ -132,11 +152,11 @@ interface SelectionOutcome {
   /** Null when nothing survived all three stages. */
   readonly selection: Selection | null;
   /**
-   * Healthy models that passed capability and were eliminated *only* for
-   * scoring below the difficulty floor, each with the effort it would run at.
-   * These are the healthy half of the salvage pool, and they are carried out of
-   * the pipeline rather than recomputed because the pipeline is the only place
-   * that knows which models failed for which reason.
+   * Models that passed capability and were eliminated *only* for scoring below
+   * the difficulty floor, each with the effort it would run at. This is the
+   * whole salvage pool, and it is carried out of the pipeline rather than
+   * recomputed because the pipeline is the only place that knows which models
+   * failed for which reason.
    */
   readonly salvageable: readonly SalvageCandidate[];
 }
@@ -144,6 +164,23 @@ interface SelectionOutcome {
 const EFFORT_RANK: ReadonlyMap<Effort, number> = new Map(
   EFFORT_LADDER.map((effort, index) => [effort, index]),
 );
+
+type QuotaStatus = QuotaSnapshot["status"];
+
+/**
+ * One pooled model's quota reading, resolved against the newest snapshots for
+ * its vendor, with the sentence that explains it.
+ */
+interface QuotaJudgement {
+  readonly entry: PooledModel;
+  readonly status: QuotaStatus;
+  /**
+   * Why, naming the vendor, the window kind, the scope, and — when the limit is
+   * scoped to one tier — that tier's label. Built for every judgement rather
+   * than only the exhausted ones so the warning line can use it too.
+   */
+  readonly cause: string;
+}
 
 /**
  * Routes one slice.
@@ -177,35 +214,67 @@ export function route(
   );
 
   const capabilities = indexCapabilities(input.capabilities);
-  const statuses = indexQuota(input.quota);
+  const observations = indexQuota(input.quota);
 
-  const exhausted = input.config.vendors.filter(
-    (vendor) => statuses.get(vendor.vendor) === "exhausted",
+  const judgements = pool.map((entry) => judgeQuota(observations, entry));
+  const drained = judgements.filter(
+    (judgement) => judgement.status === "exhausted",
   );
-  const exhaustedVendors = new Set(exhausted.map((vendor) => vendor.vendor));
+  const warned = judgements.filter(
+    (judgement) => judgement.status === "warning",
+  );
 
-  let quotaLine = `quota: ${describeQuotaStatuses(input.config, statuses)}`;
-  let working: readonly PooledModel[] = pool;
+  // A vendor is "exhausted" only when EVERY model it pooled is exhausted. That
+  // is what keeps `ALL_VENDORS_EXHAUSTED`'s message honest, and it is what lets
+  // a drop be explained as "this vendor has nothing left" rather than "this one
+  // tier is out" — two sentences that stopped being the same one when quota
+  // became per model. A vendor listing no models is not vacuously exhausted; it
+  // never entered the pool and has nothing to report.
+  const exhaustedVendors = new Set(
+    input.config.vendors
+      .filter((vendor) => {
+        const owned = judgements.filter(
+          (judgement) => judgement.entry.vendor === vendor.vendor,
+        );
+        return (
+          owned.length > 0 &&
+          owned.every((judgement) => judgement.status === "exhausted")
+        );
+      })
+      .map((vendor) => vendor.vendor),
+  );
 
-  if (exhaustedVendors.size > 0) {
-    // An exhausted vendor leaves the pool outright, fallback or not. The
-    // rejection reason is written now but only ever surfaces on failure, and a
-    // failure can only happen after every fallback was found unusable, so
-    // `describeFallbackFailure` is accurate everywhere it can be read.
-    for (const entry of pool) {
-      if (exhaustedVendors.has(entry.vendor)) {
-        rejections.push({
-          vendor: entry.vendor,
-          model: entry.model,
-          stage: "quota",
-          reason: `${entry.vendor} reports its quota exhausted and ${describeFallbackFailure(input.config, entry.vendor)}`,
-        });
-      }
+  let quotaLine = `quota: ${describeQuotaStatuses(input.config, observations)}`;
+  const working: readonly PooledModel[] = judgements
+    .filter((judgement) => judgement.status !== "exhausted")
+    .map((judgement) => judgement.entry);
+
+  if (drained.length > 0) {
+    // An exhausted model leaves the pool outright. The two reasons differ in
+    // what the user's next move is: a vendor with nothing left is a vendor to
+    // wait on, while a single drained tier on a vendor that still has healthy
+    // ones changed which model runs and nothing else.
+    for (const judgement of drained) {
+      rejections.push({
+        vendor: judgement.entry.vendor,
+        model: judgement.entry.model,
+        stage: "quota",
+        reason: exhaustedVendors.has(judgement.entry.vendor)
+          ? `${judgement.cause}, and every model configured for ${judgement.entry.vendor} reports the same, so ${judgement.entry.vendor} has nothing left to run this slice`
+          : `${judgement.cause}, so this model cannot run; ${judgement.entry.vendor}'s other configured model(s) are unaffected`,
+      });
     }
-    working = pool.filter((entry) => !exhaustedVendors.has(entry.vendor));
-    quotaLine += `; dropped ${pool.length - working.length} model(s) from ${[...exhaustedVendors].join(", ")} (quota exhausted; a configured fallback is a last resort, consulted only if no healthy model can take the slice)`;
+    quotaLine += `; dropped ${drained.length} of ${pool.length} model(s) — ${drained.map(describeJudgement).join(", ")} (a model quota removed is out for this slice; routing continues over what is left)`;
   }
   rationale.push(quotaLine);
+  if (warned.length > 0) {
+    // A warning removes nothing. It is reported because a user reading a trace
+    // after a slow or truncated run deserves to know the window was close, not
+    // because it changed the routing.
+    rationale.push(
+      `quota warning: ${warned.map(describeJudgement).join(", ")} — kept in the pool, since a warning says a window is close, not that it is spent`,
+    );
+  }
 
   const outcome = selectWorker(working, request, capabilities, rejections);
   const selection = outcome.selection;
@@ -226,34 +295,26 @@ export function route(
         model: selection.candidate.model,
         effort: selection.effort,
         rationale,
-        usedQuotaFallback: false,
+        waivedDifficultyFloor: false,
       },
     };
   }
 
   // Last resort. Nothing cleared the ordinary pipeline, so the difficulty floor
-  // is waived — and waived for everything at once, not only for the exhausted
-  // vendors' substitutions. Waiving it for the fallbacks alone is what let a
-  // score-40 model on a drained account beat a healthy score-70 one. The
-  // capability filter and the effort clamp are not waived: they answer "can
-  // this model do the work at all", which no amount of consent changes.
+  // is waived — but only for a user who said in their config that they would
+  // rather have the work done badly than not at all. The capability filter, the
+  // effort clamp, and the quota stage are not waived: they answer "can this
+  // model do the work at all", which no amount of consent changes.
   //
-  // The gate is a *configured* fallback, not a usable one. Configuring a
-  // substitution is the user's consent to degrade rather than fail, and that
-  // consent is what unlocks the waiver; whether their chosen model turns out to
-  // be the best salvage available is a separate question, settled below.
-  const salvageUnlocked = exhausted.some(
-    (vendor) => vendor.quotaFallbackModel !== null,
-  );
-  if (salvageUnlocked) {
-    const drained = collectUsableFallbacks(
-      exhausted,
-      pool,
-      request,
-      capabilities,
-      rejections,
-    );
-    const salvage = [...drained, ...outcome.salvageable];
+  // The gate is one boolean and nothing else. It used to be "some vendor whose
+  // quota drained configured a substitution", which conflated three unrelated
+  // questions — did quota take anything, did the user consent, and which model
+  // did they name — and answered the consent one by inference from the other
+  // two. It is now asked directly: a user with a healthy machine and a slice
+  // nothing can reach gets the same waiver as a user whose Opus tier just
+  // drained, because the situation they are in is the same one.
+  if (input.config.allowDegradedRouting) {
+    const salvage = outcome.salvageable;
     const chosen = chooseSalvage(salvage);
     if (chosen !== null) {
       rationale.push(
@@ -269,26 +330,27 @@ export function route(
           model: chosen.entry.model,
           effort: chosen.effort,
           rationale,
-          // True only when the winner sits on the drained account. A healthy
-          // model that won the salvage pool ran on quota brigadier believes is
-          // there, so calling it a quota fallback would be a lie to every
-          // caller that branches on this flag.
-          usedQuotaFallback: !chosen.healthy,
+          // The one thing a salvage run has to admit: this slice ran on a model
+          // its own difficulty said was not good enough for it.
+          waivedDifficultyFloor: true,
         },
       };
     }
   }
 
   // `ALL_VENDORS_EXHAUSTED` is reserved for the case its message states: quota
-  // emptied the pool. When a healthy vendor is still standing and merely failed
+  // emptied the pool. When a healthy model is still standing and merely failed
   // capability, competence, or effort, the honest answer is `NO_CAPABLE_MODEL`
   // — reporting exhaustion there would tell a user to wait for a quota window
-  // that is not what stopped them.
+  // that is not what stopped them. An empty `working` means every pooled model
+  // is exhausted, which is exactly when every vendor holding a model is in
+  // `exhaustedVendors`, so the message's "every configured vendor" stays true
+  // under per-model metering as well.
   if (working.length === 0 && exhaustedVendors.size > 0) {
     return {
       ok: false,
       reason: "ALL_VENDORS_EXHAUSTED",
-      message: `every configured vendor (${[...exhaustedVendors].join(", ")}) reports its quota exhausted, and none has a usable quota fallback configured`,
+      message: `every configured vendor (${[...exhaustedVendors].join(", ")}) reports its quota exhausted, so no model is left to run this slice`,
       rejected: rejections,
     };
   }
@@ -332,151 +394,182 @@ const STATUS_CAUTION: Readonly<Record<QuotaSnapshot["status"], number>> =
     available: 0,
   });
 
+/** The most cautious of `statuses`, or `"unknown"` when there are none. */
+function mostCautious(statuses: readonly QuotaStatus[]): QuotaStatus {
+  let worst: QuotaStatus | null = null;
+  for (const status of statuses) {
+    if (worst === null || STATUS_CAUTION[status] > STATUS_CAUTION[worst]) {
+      worst = status;
+    }
+  }
+  return worst ?? "unknown";
+}
+
 /**
- * Latest snapshot per vendor. Duplicates are resolved by `observedAtMs` rather
- * than by array position: a caller that concatenates a cached snapshot with a
- * fresh one must not have the stale reading win on ordering alone.
+ * The newest snapshots per vendor — plural, because a tie has to stay a tie.
+ *
+ * Duplicates are resolved by `observedAtMs` rather than by array position: a
+ * caller that concatenates a cached snapshot with a fresh one must not have the
+ * stale reading win on ordering alone. A strictly later reading replaces
+ * everything before it, however optimistic it is.
  *
  * Equal timestamps are settled by caution, never by which record was appended
  * last. Two readings of the same instant that disagree are a reason to be
  * careful, not a reason to trust whichever the caller happened to concatenate
- * second: `exhausted` beats `warning` beats `unknown` beats `available`. The
- * strict `>` is load-bearing — with `>=`, the same two snapshots in the other
- * order produced a different routing decision from identical information.
+ * second. Before quota was per model that could be done by keeping the single
+ * more cautious snapshot; it cannot be any more, because "more cautious" is now
+ * a question asked once per model and two snapshots of the same instant can
+ * each be the pessimistic one for a different tier. So every snapshot tied at
+ * the newest instant is kept, and each model takes the most cautious reading
+ * across all of them. That is strictly the same answer the old rule gave for
+ * account status, and it removes the last place array order could be read.
  */
 function indexQuota(
   snapshots: readonly QuotaSnapshot[],
-): ReadonlyMap<Vendor, QuotaSnapshot["status"]> {
-  const latest = new Map<Vendor, QuotaSnapshot>();
+): ReadonlyMap<Vendor, readonly QuotaSnapshot[]> {
+  const newest = new Map<Vendor, QuotaSnapshot[]>();
   for (const snapshot of snapshots) {
-    const current = latest.get(snapshot.vendor);
-    if (current === undefined || snapshot.observedAtMs > current.observedAtMs) {
-      latest.set(snapshot.vendor, snapshot);
+    const current = newest.get(snapshot.vendor);
+    const currentAt = current?.[0]?.observedAtMs;
+    if (current === undefined || currentAt === undefined) {
+      newest.set(snapshot.vendor, [snapshot]);
       continue;
     }
-    if (
-      snapshot.observedAtMs === current.observedAtMs &&
-      STATUS_CAUTION[snapshot.status] > STATUS_CAUTION[current.status]
-    ) {
-      latest.set(snapshot.vendor, snapshot);
+    if (snapshot.observedAtMs > currentAt) {
+      newest.set(snapshot.vendor, [snapshot]);
+      continue;
+    }
+    if (snapshot.observedAtMs === currentAt) {
+      current.push(snapshot);
     }
   }
-  return new Map(
-    [...latest].map(([vendor, snapshot]) => [vendor, snapshot.status]),
-  );
+  return newest;
 }
 
 /**
- * A vendor with no snapshot is available. Absence of information is not
- * evidence of exhaustion, and treating it as exhaustion would make a quota
- * probe that failed to run look exactly like an account that ran out.
+ * One pooled model's quota reading.
+ *
+ * The status is `modelQuotaStatus`'s answer floored by the snapshot's own
+ * account status, and both halves are load-bearing:
+ *
+ * - `modelQuotaStatus` is the only thing that knows which windows constrain
+ *   this model. It is imported rather than reimplemented so that the oracle and
+ *   the router can never disagree about what `"opus"` claims.
+ * - `snapshot.status` is folded in because it can carry an account-wide refusal
+ *   that no window records. `normalizeCodexRateLimits` sets `status` to
+ *   `"exhausted"` from a bare `rateLimitReachedType` when the payload carried
+ *   no account-scoped window at all (`src/quota/codex.ts`), and a router that
+ *   read windows alone would route straight into that refusal — the very defect
+ *   this stage exists to prevent, reintroduced from the other side. Folding it
+ *   in is a floor and not a double count: `mostCautious` is idempotent, and an
+ *   account-scoped window already reaches `modelQuotaStatus` on its own.
+ *
+ * A vendor with no snapshot reads `"unknown"`, which the pipeline treats as
+ * available. Absence of information is not evidence of exhaustion, and treating
+ * it as exhaustion would make a quota probe that failed to run look exactly
+ * like an account that ran out.
+ */
+function judgeQuota(
+  observations: ReadonlyMap<Vendor, readonly QuotaSnapshot[]>,
+  entry: PooledModel,
+): QuotaJudgement {
+  const snapshots = observations.get(entry.vendor) ?? [];
+  const status = mostCautious(
+    snapshots.flatMap((snapshot) => [
+      snapshot.status,
+      modelQuotaStatus(snapshot, entry.model),
+    ]),
+  );
+  return { entry, status, cause: describeQuotaCause(snapshots, entry, status) };
+}
+
+/**
+ * The sentence behind a judgement, naming the narrowest window that produced
+ * it. A user whose Opus tier drained has to read "the \"opus\" model tier",
+ * not "claude" — telling them their whole account is spent when Sonnet is
+ * sitting there ready is the failure the reshape was done to end.
+ *
+ * The culprit window is identified by asking `modelQuotaStatus` about a
+ * one-window snapshot rather than by re-testing the label here. The matching
+ * rule — an account-scoped window constrains every model; otherwise the label
+ * is trimmed and lowercased, constrains nobody when it is empty or a bare
+ * vendor-family word such as `"gpt"` or `"claude"`, and otherwise must occur in
+ * the model id delimited by non-alphanumerics or by the ends of the id — lives
+ * in exactly one place, `modelQuotaStatus` in `src/quota/contracts.ts`.
+ * Re-testing the label here would let the trace explain a decision by a
+ * different rule than the one that made it, which is worse than no trace at
+ * all. Restating the rule in prose has the same failure mode more quietly: this
+ * paragraph went on describing the bare substring test for a release after
+ * WO-010F replaced it with token boundaries and the vendor-family guard.
+ *
+ * That probe cannot speak about `"unknown"`, which is also what
+ * `modelQuotaStatus` returns for a window that constrains nothing, so windows
+ * reading `"unknown"` are never named as a culprit. Nothing is lost: the only
+ * statuses this sentence is ever printed for are `"exhausted"` and `"warning"`.
+ */
+function describeQuotaCause(
+  snapshots: readonly QuotaSnapshot[],
+  entry: PooledModel,
+  status: QuotaStatus,
+): string {
+  const culprits: QuotaWindow[] = [];
+  for (const snapshot of snapshots) {
+    for (const window of snapshot.windows) {
+      if (
+        window.status === status &&
+        status !== "unknown" &&
+        modelQuotaStatus({ ...snapshot, windows: [window] }, entry.model) ===
+          status
+      ) {
+        culprits.push(window);
+      }
+    }
+  }
+  const scoped = culprits.find((window) => window.scope.kind === "model");
+  if (scoped !== undefined && scoped.scope.kind === "model") {
+    return `${entry.vendor} reports its ${describeWindowKind(scoped.kind)} window for the ${JSON.stringify(scoped.scope.label)} model tier ${status}`;
+  }
+  const account = culprits[0];
+  if (account !== undefined) {
+    return `${entry.vendor} reports its account-wide ${describeWindowKind(account.kind)} window ${status}`;
+  }
+  return `${entry.vendor} reports its account-wide quota ${status}`;
+}
+
+function describeWindowKind(kind: QuotaWindow["kind"]): string {
+  return kind === "unknown" ? "quota" : kind;
+}
+
+function describeJudgement(judgement: QuotaJudgement): string {
+  return `${describe(judgement.entry)} (${judgement.cause})`;
+}
+
+/**
+ * The per-vendor account-scope summary. It reports what the *account* windows
+ * said and nothing more; the per-model detail is the drop and warning lists
+ * that follow it, because after the reshape those are the only lines that can
+ * distinguish one tier from another.
  */
 function describeQuotaStatuses(
   config: BrigadierConfig,
-  statuses: ReadonlyMap<Vendor, QuotaSnapshot["status"]>,
+  observations: ReadonlyMap<Vendor, readonly QuotaSnapshot[]>,
 ): string {
   return config.vendors
     .map((vendor) => {
-      const status = statuses.get(vendor.vendor);
-      if (status === undefined) {
+      const snapshots = observations.get(vendor.vendor);
+      if (snapshots === undefined || snapshots.length === 0) {
         return `${vendor.vendor}=no snapshot (treated as available)`;
       }
+      const status = mostCautious(snapshots.map((snapshot) => snapshot.status));
       if (status === "unknown") {
-        return `${vendor.vendor}=unknown (treated as available)`;
+        return `${vendor.vendor}=no account-wide limit reported (treated as available)`;
       }
       if (status === "warning") {
-        return `${vendor.vendor}=warning (kept in the pool)`;
+        return `${vendor.vendor}=account-wide warning (kept in the pool)`;
       }
-      return `${vendor.vendor}=${status}`;
+      return `${vendor.vendor}=account-wide ${status}`;
     })
     .join(", ");
-}
-
-/**
- * The drained half of the salvage pool: each exhausted vendor's configured
- * `quotaFallbackModel`, proven usable.
- *
- * Every fallback that fails writes a rejection naming the stage that actually
- * eliminated it. The contract on `RoutingDecision.rejected` promises "every
- * model considered and the stage that eliminated it", and this path used to
- * discard capability and effort failures with a bare `continue` — so the only
- * trace of a fallback that could not take the slice was the generic quota line,
- * which says a fallback exists but not what was wrong with it. "Why didn't
- * brigadier use the fallback I configured?" is exactly the question this trace
- * is printed to answer.
- */
-function collectUsableFallbacks(
-  exhausted: readonly VendorConfig[],
-  pool: readonly PooledModel[],
-  request: RoutingRequest,
-  capabilities: ReadonlyMap<string, Capability>,
-  rejections: RoutingRejection[],
-): readonly SalvageCandidate[] {
-  const usable: SalvageCandidate[] = [];
-  const demands = demandsCapability(request.requires);
-  for (const vendor of exhausted) {
-    const fallbackId = vendor.quotaFallbackModel;
-    if (fallbackId === null) {
-      continue;
-    }
-    const entry = pool.find(
-      (pooled) =>
-        pooled.vendor === vendor.vendor && pooled.model === fallbackId,
-    );
-    if (entry === undefined) {
-      // A fallback naming a model the vendor does not list cannot be acted on.
-      // `parseConfig` rejects that pairing, so this is unreachable for a config
-      // that came through the parser — but `route` takes a `BrigadierConfig`
-      // from any caller, and the alternative to a rejection here is the fallback
-      // vanishing from the trace with no explanation at all.
-      rejections.push({
-        vendor: vendor.vendor,
-        model: fallbackId,
-        stage: "quota",
-        reason: `${vendor.vendor} configures ${JSON.stringify(fallbackId)} as its quota fallback, but that model is not among its configured models`,
-      });
-      continue;
-    }
-    const capability = capabilities.get(keyOf(entry.vendor, entry.model));
-    const failure = judgeCapability(
-      entry,
-      capability,
-      request.requires,
-      demands,
-    );
-    if (failure !== null) {
-      rejections.push({
-        vendor: entry.vendor,
-        model: entry.model,
-        stage: "capability",
-        reason: `as ${entry.vendor}'s configured quota fallback, ${failure}`,
-      });
-      continue;
-    }
-    const base = baseEffort(request);
-    const resolved = resolveEffort(
-      base,
-      entry.effortCeiling,
-      capability?.supportedEfforts ?? null,
-    );
-    if (resolved.effort === null) {
-      rejections.push({
-        vendor: entry.vendor,
-        model: entry.model,
-        stage: "effort",
-        reason: `as ${entry.vendor}'s configured quota fallback, no effort at or below "${base}" survives its ceiling "${entry.effortCeiling}" and its supported efforts (${capability?.supportedEfforts.join(", ") || "none reported"})`,
-      });
-      continue;
-    }
-    usable.push({
-      entry,
-      effort: resolved.effort,
-      score: scoreModelId(entry.model).score,
-      clamps: resolved.clamps,
-      healthy: false,
-    });
-  }
-  return usable;
 }
 
 /**
@@ -484,7 +577,7 @@ function collectUsableFallbacks(
  *
  * The highest competence score wins. This is the one place in the engine where
  * the *highest* score wins rather than the lowest, and it is deliberate. A
- * review read it as "the fallback path reverses the cost rule" and asked for
+ * review read it as "the last-resort path reverses the cost rule" and asked for
  * the lowest scorer instead; that reading is wrong, and rejected on the record
  * (2026-08-07). The cost stage takes the *cheapest adequate* model, and
  * "adequate" means "at or above the difficulty floor". In salvage the floor has
@@ -494,36 +587,21 @@ function collectUsableFallbacks(
  * the machine. When the floor is gone, "best available" is the only rule left
  * that means anything.
  *
- * Ties prefer a healthy vendor over a drained one: two models of equal
- * competence are not equal if one of them is on an account that just reported
- * no quota. Remaining ties break on config order, as everywhere else, so the
- * choice is reproducible across runs and machines.
+ * Ties break on config order, as everywhere else, so the choice is reproducible
+ * across runs and across machines holding the same config. There is no
+ * healthy/drained tie-break any more: every candidate here passed the same
+ * per-model quota check every pooled model passed, so they are all healthy and
+ * the distinction has no subject.
  */
 function chooseSalvage(
   candidates: readonly SalvageCandidate[],
 ): SalvageCandidate | null {
-  const ordered = [...candidates].sort((left, right) => {
-    if (left.score !== right.score) {
-      return right.score - left.score;
-    }
-    if (left.healthy !== right.healthy) {
-      return left.healthy ? -1 : 1;
-    }
-    return left.entry.order - right.entry.order;
-  });
+  const ordered = [...candidates].sort((left, right) =>
+    left.score === right.score
+      ? left.entry.order - right.entry.order
+      : right.score - left.score,
+  );
   return ordered[0] ?? null;
-}
-
-function describeFallbackFailure(
-  config: BrigadierConfig,
-  vendor: Vendor,
-): string {
-  const configured = config.vendors.find((entry) => entry.vendor === vendor);
-  const fallback = configured?.quotaFallbackModel ?? null;
-  if (fallback === null) {
-    return "no quota fallback model is configured for it";
-  }
-  return `its configured fallback ${JSON.stringify(fallback)} cannot take this slice`;
 }
 
 /* --------------------------- stages 2, 3, and 4 -------------------------- */
@@ -591,7 +669,7 @@ function selectWorker(
       reason: `competence score ${below.score} is below the ${request.difficulty} floor of ${floor}`,
     });
   }
-  const salvageable = collectHealthySalvage(belowFloor, request, capabilities);
+  const salvageable = collectSalvageable(belowFloor, request, capabilities);
 
   let eligible: readonly ScoredModel[] = clearing;
   let usedUnranked = false;
@@ -651,17 +729,18 @@ function selectWorker(
 }
 
 /**
- * The healthy half of the salvage pool: models that passed the capability
- * filter, were eliminated only by the difficulty floor, and can still resolve
- * to a runnable effort.
+ * The salvage pool: models that passed the capability filter, were eliminated
+ * only by the difficulty floor, and can still resolve to a runnable effort.
  *
- * The floor is the one rule salvage waives, so these models are eligible again
- * the moment the waiver applies. Capability and effort are not waived — they
- * answer "can this model do the work at all" — which is why a model with no
- * runnable rung is dropped here rather than carried into the pool and skipped
- * later.
+ * Every model here already survived the quota stage, because `selectWorker`
+ * only ever runs over models quota left standing. That is what makes the pool
+ * safe to route into at all: the floor is the one rule salvage waives, and a
+ * model quota removed is gone for reasons the waiver has nothing to say about.
+ * Capability and effort are not waived either — they answer "can this model do
+ * the work at all" — which is why a model with no runnable rung is dropped here
+ * rather than carried into the pool and skipped later.
  */
-function collectHealthySalvage(
+function collectSalvageable(
   belowFloor: readonly ScoredModel[],
   request: RoutingRequest,
   capabilities: ReadonlyMap<string, Capability>,
@@ -682,7 +761,6 @@ function collectHealthySalvage(
       effort: resolved.effort,
       score: entry.score,
       clamps: resolved.clamps,
-      healthy: true,
     });
   }
   return candidates;
@@ -949,13 +1027,16 @@ function describeCompetenceLine(
  * The one trace line that has to admit brigadier gave the user less than they
  * asked for.
  *
- * It names the floor that was waived, the whole salvage pool it chose from, the
- * score of the model that took the slice anyway, and whether that model's
- * vendor was healthy or drained. A user reading a trace after a bad result must
- * be able to see at a glance that a `hard` slice ran on a model the `hard`
- * floor would normally have rejected, why brigadier did that instead of
- * failing, and whether the work went onto an account that had already reported
- * no quota.
+ * It names the floor that was waived, the setting that authorized waiving it,
+ * the whole salvage pool it chose from, and the score of the model that took
+ * the slice anyway. A user reading a trace after a bad result must be able to
+ * see at a glance that a `hard` slice ran on a model the `hard` floor would
+ * normally have rejected, and that it happened because they asked for degraded
+ * routing rather than because a rule went wrong.
+ *
+ * It no longer reports whether the winner's vendor was healthy or drained,
+ * because after WO-010H there is no drained candidate to distinguish it from:
+ * every model in this pool passed the quota stage.
  */
 function describeWaivedCompetenceLine(
   request: RoutingRequest,
@@ -965,19 +1046,9 @@ function describeWaivedCompetenceLine(
   const floor = DIFFICULTY_FLOORS[request.difficulty];
   const considered = [...salvage]
     .sort((left, right) => left.entry.order - right.entry.order)
-    .map(
-      (candidate) =>
-        `${describe(candidate.entry)}=${candidate.score} (${describeHealth(candidate)})`,
-    )
+    .map((candidate) => `${describe(candidate.entry)}=${candidate.score}`)
     .join(", ");
-  const origin = chosen.healthy
-    ? `it is on a healthy vendor and was eliminated only by the floor`
-    : `it is exhausted vendor ${chosen.entry.vendor}'s configured quota fallback`;
-  return `competence: the ${request.difficulty} difficulty floor of ${floor} was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: ${considered}; picked ${describe(chosen.entry)} at an actual competence score of ${chosen.score}, ${describeHealth(chosen)}, because ${origin} (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)`;
-}
-
-function describeHealth(candidate: SalvageCandidate): string {
-  return candidate.healthy ? "healthy" : "quota-drained";
+  return `competence: the ${request.difficulty} difficulty floor of ${floor} was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: ${considered}; picked ${describe(chosen.entry)} at an actual competence score of ${chosen.score} (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)`;
 }
 
 function describeEffortLine(

@@ -1,4 +1,4 @@
-import type { QuotaSnapshot, QuotaWindow } from "../contracts.js";
+import type { QuotaScope, QuotaSnapshot, QuotaWindow } from "../contracts.js";
 import { consumeNdjson } from "../shared/ndjson.js";
 import {
   collectBoundedText,
@@ -8,6 +8,7 @@ import {
   writeToProcess,
 } from "../shared/process.js";
 import type { CodexQuotaOracle as CodexQuotaOracleContract } from "./contracts.js";
+import { deriveAccountStatus } from "./contracts.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -252,61 +253,276 @@ export function createCodexQuotaOracle(
   return new CodexQuotaOracle(options);
 }
 
+/**
+ * The `limitId` of the general bucket every Codex tier shares.
+ *
+ * R-11 §2a establishes that Sol, Terra, and Luna draw from one allowance at
+ * different burn rates, and §2b observed that allowance reported under
+ * `limitId: "codex"` with `limitName: null`. Used only as a fallback identity
+ * for the aggregate `result.rateLimits` object, which carried no `limitId` in
+ * some payloads.
+ */
+const GENERAL_LIMIT_ID = "codex";
+
+const ACCOUNT_SCOPE: QuotaScope = Object.freeze({ kind: "account" });
+
+/**
+ * Reads both quota surfaces the Codex app-server returns.
+ *
+ * `result.rateLimits` is the aggregate the adapter has always read. It is the
+ * shared Sol/Terra/Luna bucket, so it is account-scoped. `rateLimitsByLimitId`
+ * is a map of *independent* buckets that the adapter used to drop on the floor
+ * entirely — R-11 §2b observed a model-named bucket sitting at 0% while the
+ * general bucket was 72% drained, with a different reset time, which is a live
+ * instance of "one model has quota while the account's general bucket does
+ * not". Every bucket in that map other than the general one is model-scoped.
+ */
 export function normalizeCodexRateLimits(
   result: unknown,
   observedAtMs: number,
 ): QuotaSnapshot & { readonly vendor: "codex" } {
   const resultObject = asObject(result);
-  const rateLimits = asObject(resultObject?.rateLimits);
-  const windows = rateLimits === null ? [] : collectWindows(rateLimits);
-  const rateLimitsHaveReachedType = hasProperty(
-    rateLimits,
-    "rateLimitReachedType",
-  );
-  const resultHasReachedType = hasProperty(
-    resultObject,
-    "rateLimitReachedType",
-  );
-  const reachedType = rateLimitsHaveReachedType
-    ? rateLimits?.rateLimitReachedType
-    : resultObject?.rateLimitReachedType;
-  const hasReachedType = rateLimitsHaveReachedType || resultHasReachedType;
+  const aggregate = asObject(resultObject?.rateLimits);
+  const byLimitId = asObject(resultObject?.rateLimitsByLimitId);
+
+  const aggregateId = stringValue(aggregate?.limitId) ?? GENERAL_LIMIT_ID;
+  // The aggregate is normally repeated inside the map under its own id. Reading
+  // both without this guard would emit each of its windows twice.
+  const seen = new Set<string>();
+  const windows: QuotaWindow[] = [];
+
+  if (aggregate !== null) {
+    seen.add(aggregateId);
+    windows.push(
+      ...collectWindows(
+        aggregate,
+        ACCOUNT_SCOPE,
+        effectiveReachedType(aggregate, resultObject),
+      ),
+    );
+  }
+
+  for (const [limitId, value] of Object.entries(byLimitId ?? {})) {
+    if (seen.has(limitId)) {
+      continue;
+    }
+    seen.add(limitId);
+    const bucket = asObject(value);
+    if (bucket === null) {
+      continue;
+    }
+    windows.push(
+      ...collectWindows(
+        bucket,
+        limitId === GENERAL_LIMIT_ID ? ACCOUNT_SCOPE : modelScope(limitId),
+        bucket.rateLimitReachedType,
+      ),
+    );
+  }
+
+  // The status is never manufactured past the windows.
+  //
+  // This used to read `derived === "unknown" && accountReached ? "exhausted" :
+  // derived`, which invented a vendor-wide `exhausted` with an EMPTY `windows`
+  // array. That contradicts `QuotaSnapshot.status`'s own contract in the frozen
+  // `src/contracts.ts` — the status is documented as deriving from
+  // account-scoped windows, and there were none — and it is not a harmless
+  // inconsistency: the router floors every per-model reading with
+  // `snapshot.status`, so `{ rateLimits: { rateLimitReachedType: "primary" } }`
+  // turned one configured model into `ALL_VENDORS_EXHAUSTED` with nothing in the
+  // snapshot able to explain why.
+  //
+  // The evidence is real, so it is recorded rather than discarded — downgrading
+  // to `unknown` would throw away a positive refusal, which is the same class of
+  // defect as dropping a partial window. It is recorded as a WINDOW, so status
+  // and windows agree and the trace can name its cause.
+  //
+  // `collectWindows` already synthesizes that window for any bucket it is given,
+  // so this backstop is reachable only when there is no aggregate object to give
+  // it: a top-level `rateLimitReachedType` beside a missing `rateLimits`.
+  if (
+    isReached(effectiveReachedType(aggregate, resultObject)) &&
+    !windows.some(
+      (window) =>
+        window.scope.kind === "account" && window.status === "exhausted",
+    )
+  ) {
+    windows.push(refusalWindow(ACCOUNT_SCOPE));
+  }
 
   return {
     vendor: "codex",
-    status:
-      hasReachedType && reachedType !== null
-        ? "exhausted"
-        : windows.length > 0
-          ? "available"
-          : "unknown",
+    status: deriveAccountStatus(windows),
     observedAtMs,
     windows,
     isUsingOverage: null,
   };
 }
 
-function collectWindows(rateLimits: JsonObject): QuotaWindow[] {
-  const preferredKeys = ["primary", "secondary"] as const;
-  const entries = preferredKeys
-    .map((key) => [key, rateLimits[key]] as const)
-    .filter((entry) => entry[1] !== undefined);
-
-  return entries.flatMap(([key, value]) => {
-    const window = normalizeWindow(key, value);
-    return window === null ? [] : [window];
-  });
+/**
+ * A window that records one fact and claims nothing else: this bucket was
+ * refused.
+ *
+ * Every number is null because the vendor supplied none. That is the honest
+ * encoding — `durationMinutes: null` and `resetsAtMs: null` already mean
+ * "unknown" throughout this contract, and inventing a duration or a reset
+ * instant here would be a guarantee brigadier cannot honour. `kind: "unknown"`
+ * for the same reason: with no window payload there is nothing to say whether
+ * the refused allowance was rolling or weekly.
+ */
+function refusalWindow(scope: QuotaScope): QuotaWindow {
+  return {
+    kind: "unknown",
+    scope,
+    status: "exhausted",
+    durationMinutes: null,
+    remainingFraction: null,
+    resetsAtMs: null,
+  };
 }
 
-function normalizeWindow(key: string, value: unknown): QuotaWindow | null {
-  const object = asObject(value);
-  if (object === null) {
-    return null;
-  }
-  const usedPercent = finiteNumber(object.usedPercent);
-  const durationMinutes = nonNegativeNumber(object.windowDurationMins);
-  const resetsAtSeconds = nonNegativeNumber(object.resetsAt);
+/**
+ * Whether a `rateLimitReachedType` is a positive refusal.
+ *
+ * `null` is the vendor's "not reached"; `undefined` is the field being absent.
+ * Anything else — including a value this build has never seen — is a refusal,
+ * because a payload that names a limit type at all is asserting one was hit.
+ */
+function isReached(reachedType: unknown): boolean {
+  return reachedType !== null && reachedType !== undefined;
+}
+
+function effectiveReachedType(
+  aggregate: JsonObject | null,
+  resultObject: JsonObject | null,
+): unknown {
+  return hasProperty(aggregate, "rateLimitReachedType")
+    ? aggregate?.rateLimitReachedType
+    : resultObject?.rateLimitReachedType;
+}
+
+/**
+ * The tier token for a non-general bucket, derived from `limitId` ALONE.
+ *
+ * `limitName` used to be preferred when present, and that was a defect, not a
+ * shortcut. `limitName` is the vendor's arbitrary display string, and
+ * `modelQuotaStatus` matches a label against model ids: a bucket whose
+ * `limitName` reads `"GPT"` produced the label `"gpt"`, and one independent
+ * bucket's exhaustion then reported BOTH `gpt-5.6-sol` and `gpt-5.6-terra` dead.
+ * `"Codex"` or `"Claude"` do the same. Untrusted display prose was being handed
+ * to a matcher with the authority to remove a whole fleet from routing.
+ *
+ * The frozen `src/contracts.ts` already forbade this outright: `QuotaScope.label`
+ * is documented as "a normalized tier token ... never the vendor's display
+ * prose", derived "from the stable wire identifier instead". The adapter was
+ * violating its own contract. `limitId` is that stable wire identifier — it is
+ * the map key the vendor itself uses to tell buckets apart, and unlike
+ * `limitName` it is not free text a rendering change can rewrite.
+ *
+ * The cost is real and is accepted deliberately. Every `limitId` observed so far
+ * is an opaque codename (`codex_bengalfox`, R-11 §2b) whose stripped label
+ * matches no model id, so Codex model-scoped windows now constrain nothing in
+ * practice — including the one bucket whose `limitName` genuinely did name a
+ * model. The window is still emitted and still carries the evidence; nothing
+ * matches it. That is the safe direction: under-matching costs one launch the
+ * vendor refuses and the supervisor observes, while over-matching turns vendor
+ * prose into a fleet-wide kill switch and can strand brigadier with
+ * `ALL_VENDORS_EXHAUSTED` while every model is in fact available.
+ *
+ * R-11 §5 is why the gap is not closed here: `limitId` values are not enumerable
+ * in advance, so a codename-to-model table written now would be brigadier
+ * guessing. A hand-curated table in a reviewed diff — the `COMPETENCE_TABLE`
+ * shape — is the right eventual fix, and it is out of scope for this unit.
+ */
+function modelScope(limitId: string): QuotaScope {
+  const label = (
+    limitId.startsWith(`${GENERAL_LIMIT_ID}_`)
+      ? limitId.slice(GENERAL_LIMIT_ID.length + 1)
+      : limitId
+  )
+    .trim()
+    .toLowerCase();
+  return { kind: "model", label };
+}
+
+/**
+ * Every window one bucket asserts something about.
+ *
+ * A key is collected when the bucket carries an object under it OR when
+ * `rateLimitReachedType` names it. The second half is what stops a partial
+ * bucket from losing evidence: `{"primary": null, "rateLimitReachedType":
+ * "primary"}` is a statement *about* the primary window, and skipping the key
+ * because its numbers are absent discarded the only thing the payload asserted.
+ */
+function collectWindows(
+  bucket: JsonObject,
+  scope: QuotaScope,
+  reachedType: unknown,
+): QuotaWindow[] {
+  const preferredKeys = ["primary", "secondary"] as const;
+  const keys = preferredKeys.filter(
+    (key) => bucket[key] !== undefined || reachedType === key,
+  );
+
+  const windows = keys.flatMap((key) => {
+    const window = normalizeWindow(key, bucket[key], scope, reachedType);
+    return window === null ? [] : [window];
+  });
+
+  // The invariant this function owes its callers: a bucket the vendor refused
+  // always yields at least one exhausted window, so no reader ever has to
+  // reconstruct a refusal from a status that has no window behind it.
+  //
+  // Reachable only when the refusal names neither `primary` nor `secondary` — a
+  // `rateLimitReachedType` value this build has never seen — on a bucket that
+  // carries no window objects either. Every other refusal is already attached to
+  // a window above.
   if (
+    isReached(reachedType) &&
+    !windows.some((window) => window.status === "exhausted")
+  ) {
+    return [...windows, refusalWindow(scope)];
+  }
+  return windows;
+}
+
+/**
+ * `rateLimitReachedType` names which of a bucket's windows was refused, so only
+ * that window is exhausted. A non-null value naming neither window exhausts both
+ * windows of that bucket: the account was demonstrably refused and brigadier
+ * cannot tell which allowance did it, so the conservative reading is that the
+ * bucket is spent.
+ */
+function normalizeWindow(
+  key: "primary" | "secondary",
+  value: unknown,
+  scope: QuotaScope,
+  reachedType: unknown,
+): QuotaWindow | null {
+  const object = asObject(value);
+  const usedPercent = object === null ? null : finiteNumber(object.usedPercent);
+  const durationMinutes =
+    object === null ? null : nonNegativeNumber(object.windowDurationMins);
+  const resetsAtSeconds =
+    object === null ? null : nonNegativeNumber(object.resetsAt);
+
+  const reached =
+    isReached(reachedType) &&
+    (reachedType === key ||
+      (reachedType !== "primary" && reachedType !== "secondary"));
+
+  // An empty, absent, or unparseable window is dropped only when nothing was
+  // asserted about it. A reached limit IS an assertion and outranks the absence
+  // of numbers: missing numbers mean unknown numbers, never absent evidence.
+  //
+  // This emptiness check used to run first, before `reached` was even computed,
+  // and before `object === null` was tolerated at all. A bucket reporting
+  // `{"limitName": "GPT-5.3-Codex-Spark", "primary": null,
+  // "rateLimitReachedType": "primary"}` therefore produced no window, an
+  // `unknown` snapshot, and a demonstrably refused model reading back as
+  // available — the wasted launch this whole unit exists to prevent.
+  if (
+    !reached &&
     usedPercent === null &&
     durationMinutes === null &&
     resetsAtSeconds === null
@@ -321,11 +537,17 @@ function normalizeWindow(key: string, value: unknown): QuotaWindow | null {
         : durationMinutes === null
           ? "unknown"
           : "rolling",
+    scope,
+    status: reached ? "exhausted" : "available",
     durationMinutes,
     remainingFraction:
       usedPercent === null ? null : clamp(1 - usedPercent / 100, 0, 1),
     resetsAtMs: resetsAtSeconds === null ? null : resetsAtSeconds * 1_000,
   };
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function asObject(value: unknown): JsonObject | null {

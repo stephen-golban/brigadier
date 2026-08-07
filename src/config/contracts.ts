@@ -9,9 +9,9 @@
  * routing pipeline (capability filter, competence rank, difficulty, effort,
  * cost), and this schema must never become a back door into it.
  *
- * It also never holds a secret. Model ids, effort ceilings, quota fallbacks,
- * resolved executable paths, vendor versions, and one consent boolean are the
- * entire surface; `parseConfig` rejects every other key.
+ * It also never holds a secret. Model ids, effort ceilings, resolved executable
+ * paths, vendor versions, and two consent booleans are the entire surface;
+ * `parseConfig` rejects every other key.
  */
 
 import {
@@ -20,8 +20,16 @@ import {
   type Vendor,
 } from "../contracts.js";
 
-/** Bumped only when the on-disk shape changes incompatibly. */
-export const CONFIG_VERSION = 1;
+/**
+ * Bumped only when the on-disk shape changes incompatibly.
+ *
+ * Version 2 (WO-010H) removed the per-vendor `quotaFallbackModel` and added the
+ * top-level `allowDegradedRouting` flag. Because `parseConfig` rejects unknown
+ * keys, a version-1 file read by this parser would otherwise produce a pile of
+ * `unknown key "quotaFallbackModel"` issues that name a symptom instead of the
+ * cause; the version check runs first and throws one actionable error instead.
+ */
+export const CONFIG_VERSION = 2;
 
 /**
  * Brigadier's own effort ladder, ordered lowest to highest. Vendor CLIs report
@@ -56,8 +64,6 @@ export interface VendorConfig {
   /** Must be one of `models`; the router still overrides it per slice. */
   readonly defaultModel: string;
   readonly models: readonly ModelPermission[];
-  /** Decision #21: user-chosen. `null` means fail the slice instead. */
-  readonly quotaFallbackModel: string | null;
 }
 
 export interface BrigadierConfig {
@@ -65,6 +71,29 @@ export interface BrigadierConfig {
   readonly vendors: readonly VendorConfig[];
   /** Decision #6: consent to link secret files into worker worktrees. */
   readonly secretsConsent: boolean;
+  /**
+   * Consent to run a slice on a model that scores below its difficulty floor
+   * rather than failing the slice.
+   *
+   * This replaces decision #21's per-vendor `quotaFallbackModel` ("when this
+   * vendor's quota drains, fall back to model X"), which WO-010's per-model
+   * quota metering made obsolete in both halves of its job. The substitution
+   * half now happens without it: a drained Opus tier no longer removes Sonnet
+   * from the pool, so Sonnet competes and wins on merit through the ordinary
+   * pipeline. The consent half is what was actually left — configuring any
+   * fallback at all was the only thing that unlocked the difficulty-floor
+   * waiver — so it is recorded here as the flag it really is.
+   *
+   * It is not per vendor. It authorizes a routing *behaviour*, and nothing
+   * about that behaviour is vendor-specific once the substituted model's
+   * identity is gone: the router already picks the best below-floor model on
+   * the machine, from whichever vendor is holding it.
+   *
+   * `false` is the default, and it preserves decision #21's spirit: brigadier
+   * tells the user it could not route the slice rather than quietly running it
+   * on something weaker than the work asked for.
+   */
+  readonly allowDegradedRouting: boolean;
 }
 
 /** Raised by `parseConfig` and by every config transform in `init`. */
@@ -85,6 +114,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   "version",
   "vendors",
   "secretsConsent",
+  "allowDegradedRouting",
 ]);
 const VENDOR_KEYS: ReadonlySet<string> = new Set([
   "vendor",
@@ -92,7 +122,6 @@ const VENDOR_KEYS: ReadonlySet<string> = new Set([
   "version",
   "defaultModel",
   "models",
-  "quotaFallbackModel",
 ]);
 const MODEL_KEYS: ReadonlySet<string> = new Set(["id", "effortCeiling"]);
 
@@ -157,16 +186,29 @@ export function parseConfig(value: unknown): BrigadierConfig {
     throw new ConfigValidationError(["config must be a JSON object"]);
   }
 
+  // The version is checked first and thrown on immediately, alone.
+  //
+  // Every other rule below assumes the file is shaped the way this build
+  // expects. A version-1 file is not, and letting it fall through would report
+  // the shape difference as `unknown key "quotaFallbackModel"` once per vendor
+  // — a pile of true statements that names the symptom and hides the cause. One
+  // sentence saying which version was found and what to do about it is the
+  // whole diagnosis. The package is unpublished at 0.0.0, so re-running `init`
+  // is a complete remedy and no migration path is owed.
+  if (root.version !== CONFIG_VERSION) {
+    throw new ConfigValidationError([
+      `config version must be ${CONFIG_VERSION}, received ${JSON.stringify(root.version)}; this file was written by a different version of brigadier — run \`brigadier init\` again to rewrite it`,
+    ]);
+  }
+
   const issues: string[] = [];
   rejectUnknownKeys(root, CONFIG_KEYS, "config", issues);
 
-  if (root.version !== CONFIG_VERSION) {
-    issues.push(
-      `config version must be ${CONFIG_VERSION}, received ${JSON.stringify(root.version)}`,
-    );
-  }
   if (typeof root.secretsConsent !== "boolean") {
     issues.push("secretsConsent must be a boolean");
+  }
+  if (typeof root.allowDegradedRouting !== "boolean") {
+    issues.push("allowDegradedRouting must be a boolean");
   }
   if (!Array.isArray(root.vendors)) {
     issues.push("vendors must be an array");
@@ -189,6 +231,7 @@ export function parseConfig(value: unknown): BrigadierConfig {
     version: CONFIG_VERSION,
     vendors,
     secretsConsent: root.secretsConsent === true,
+    allowDegradedRouting: root.allowDegradedRouting === true,
   };
 }
 
@@ -257,22 +300,12 @@ function parseVendor(
     );
   }
 
-  const fallback = record.quotaFallbackModel;
-  if (fallback !== null && typeof fallback !== "string") {
-    issues.push(`${vendor}: quotaFallbackModel must be a string or null`);
-  } else if (typeof fallback === "string" && !modelIds.has(fallback)) {
-    issues.push(
-      `${vendor}: quota fallback model ${JSON.stringify(fallback)} is not one of this vendor's available models`,
-    );
-  }
-
   return {
     vendor,
     executable,
     version,
     defaultModel: typeof defaultModel === "string" ? defaultModel : "",
     models,
-    quotaFallbackModel: typeof fallback === "string" ? fallback : null,
   };
 }
 

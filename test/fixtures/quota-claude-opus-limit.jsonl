@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"823e4567-e89b-12d3-a456-426614174000","model":"claude-opus-4-6"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1786458000,"rateLimitType":"seven_day_opus","utilization":1,"isUsingOverage":false},"session_id":"823e4567-e89b-12d3-a456-426614174000"}

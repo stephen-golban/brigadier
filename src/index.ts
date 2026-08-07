@@ -60,8 +60,8 @@ export {
   proposeConfig,
   runInit,
   withDefaultModel,
+  withDegradedRouting,
   withEffortCeiling,
-  withQuotaFallback,
   withSecretsConsent,
 } from "./init/index.js";
 export type {

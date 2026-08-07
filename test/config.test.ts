@@ -50,14 +50,14 @@ const CANONICAL: BrigadierConfig = {
         { id: "gpt-5.6-sol", effortCeiling: "high" },
         { id: "gpt-5.6-terra", effortCeiling: "medium" },
       ],
-      quotaFallbackModel: "gpt-5.6-terra",
     },
   ],
   secretsConsent: false,
+  allowDegradedRouting: false,
 };
 
 const CANONICAL_BYTES = `{
-  "version": 1,
+  "version": 2,
   "vendors": [
     {
       "vendor": "codex",
@@ -73,13 +73,34 @@ const CANONICAL_BYTES = `{
           "id": "gpt-5.6-terra",
           "effortCeiling": "medium"
         }
-      ],
-      "quotaFallbackModel": "gpt-5.6-terra"
+      ]
     }
   ],
-  "secretsConsent": false
+  "secretsConsent": false,
+  "allowDegradedRouting": false
 }
 `;
+
+/**
+ * A complete version-1 file, exactly as WO-008B's `init` wrote it: a
+ * `quotaFallbackModel` on the vendor, no `allowDegradedRouting`, and
+ * `"version": 1`. Every one of those three differences is independently
+ * rejectable, which is the reason the version check has to run first and alone.
+ */
+const VERSION_ONE_ON_DISK = {
+  version: 1,
+  vendors: [
+    {
+      vendor: "codex",
+      executable: "/opt/homebrew/bin/codex",
+      version: "0.145.0",
+      defaultModel: "gpt-5.6-sol",
+      models: [{ id: "gpt-5.6-sol", effortCeiling: "high" }],
+      quotaFallbackModel: "gpt-5.6-sol",
+    },
+  ],
+  secretsConsent: false,
+};
 
 describe("config location", () => {
   test("resolves $BRIGADIER_HOME, then $HOME/.brigadier, and never a real home", () => {
@@ -146,23 +167,50 @@ describe("parseConfig", () => {
     expect(serializeConfig(CANONICAL)).toBe(CANONICAL_BYTES);
   });
 
-  test("rejects a quota fallback that is not one of the vendor's models", () => {
-    const doctored = withFallback("gpt-5.6-pro");
-
-    expect(() => parseConfig(doctored)).toThrow(ConfigValidationError);
+  /**
+   * WO-010H bumped the on-disk version because it removed a vendor key and
+   * added a root one. `parseConfig` rejects unknown keys, so a version-1 file
+   * that fell through to the ordinary rules would come back as one
+   * `unknown key "quotaFallbackModel"` per vendor plus a missing-boolean issue:
+   * a pile of true statements, none of which is the problem or the remedy.
+   *
+   * The version check therefore runs first and throws alone. This test pins the
+   * whole issue list, not a substring, because "one actionable error" is the
+   * claim being made and a list of length one is the only way to make it.
+   */
+  test("rejects a version-1 config with one actionable error and nothing else", () => {
+    expect(() => parseConfig(VERSION_ONE_ON_DISK)).toThrow(
+      ConfigValidationError,
+    );
     try {
-      parseConfig(doctored);
-      throw new Error("expected parseConfig to reject the absent model");
+      parseConfig(VERSION_ONE_ON_DISK);
+      throw new Error("expected parseConfig to reject the version-1 config");
     } catch (error) {
       expect(error).toBeInstanceOf(ConfigValidationError);
       const validation = error as ConfigValidationError;
       expect(validation.issues).toEqual([
-        'codex: quota fallback model "gpt-5.6-pro" is not one of this vendor\'s available models',
+        "config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       ]);
       expect(validation.message).toBe(
-        'invalid brigadier config: codex: quota fallback model "gpt-5.6-pro" is not one of this vendor\'s available models',
+        "invalid brigadier config: config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       );
+      // The keys that changed are never named: they are symptoms of the version
+      // difference, and listing them would send the user editing JSON by hand.
+      expect(validation.message).not.toContain("quotaFallbackModel");
+      expect(validation.message).not.toContain("allowDegradedRouting");
     }
+  });
+
+  /**
+   * The version bump is not a licence to accept the old shape. A file claiming
+   * version 2 while still carrying a `quotaFallbackModel` is rejected as an
+   * unknown key, which is what keeps "the config surface is exactly what
+   * `parseConfig` documents" true after the field's removal.
+   */
+  test("rejects a leftover quotaFallbackModel at the current version", () => {
+    expect(() => parseConfig(withVendorKey("quotaFallbackModel"))).toThrow(
+      'invalid brigadier config: codex: unknown key "quotaFallbackModel"',
+    );
   });
 
   test("rejects every shape outside the documented surface", () => {
@@ -176,12 +224,22 @@ describe("parseConfig", () => {
         'invalid brigadier config: config: unknown key "apiKey"',
       ],
       [
-        { ...CANONICAL, version: 2 },
-        "invalid brigadier config: config version must be 1, received 2",
+        { ...CANONICAL, version: 3 },
+        "invalid brigadier config: config version must be 2, received 3; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       ],
       [
         { ...CANONICAL, secretsConsent: "yes" },
         "invalid brigadier config: secretsConsent must be a boolean",
+      ],
+      [
+        { ...CANONICAL, allowDegradedRouting: "yes" },
+        "invalid brigadier config: allowDegradedRouting must be a boolean",
+      ],
+      [
+        // Absent, not merely wrong-typed: an omitted consent must never read as
+        // a granted one, and `undefined` is what an omitted key looks like here.
+        { ...CANONICAL, allowDegradedRouting: undefined },
+        "invalid brigadier config: allowDegradedRouting must be a boolean",
       ],
       [
         {
@@ -199,7 +257,7 @@ describe("parseConfig", () => {
           ...CANONICAL,
           vendors: [{ ...CANONICAL.vendors[0], models: [] }],
         },
-        'invalid brigadier config: codex: models must not be empty; codex: default model "gpt-5.6-sol" is not one of this vendor\'s available models; codex: quota fallback model "gpt-5.6-terra" is not one of this vendor\'s available models',
+        'invalid brigadier config: codex: models must not be empty; codex: default model "gpt-5.6-sol" is not one of this vendor\'s available models',
       ],
       [
         {
@@ -208,7 +266,6 @@ describe("parseConfig", () => {
             {
               ...CANONICAL.vendors[0],
               models: [{ id: "gpt-5.6-sol", effortCeiling: "ultra" }],
-              quotaFallbackModel: null,
             },
           ],
         },
@@ -233,7 +290,6 @@ describe("parseConfig", () => {
                 { id: "gpt-5.6-sol", effortCeiling: "high" },
                 { id: "gpt-5.6-sol", effortCeiling: "high" },
               ],
-              quotaFallbackModel: null,
             },
           ],
         },
@@ -310,14 +366,25 @@ describe("atomic config write", () => {
   test("refuses to write a config it could not read back", async () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
-      const doctored = withFallback("gpt-5.6-pro");
+      const doctored = withVendorKey("apiKey");
 
       await expect(
         writeConfig(path, doctored as BrigadierConfig),
       ).rejects.toThrow(
-        'invalid brigadier config: codex: quota fallback model "gpt-5.6-pro" is not one of this vendor\'s available models',
+        'invalid brigadier config: codex: unknown key "apiKey"',
       );
       expect(await readdir(scratchHome)).toEqual([]);
+    });
+  });
+
+  test("refuses to read back a version-1 file left on disk", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeFile(path, `${JSON.stringify(VERSION_ONE_ON_DISK)}\n`, "utf8");
+
+      await expect(readConfig(path)).rejects.toThrow(
+        "invalid brigadier config: config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+      );
     });
   });
 
@@ -364,11 +431,11 @@ test("no test in the suite resolves $BRIGADIER_HOME to the real home directory",
   }
 });
 
-/** A config identical to CANONICAL except for a quota fallback set by hand. */
-function withFallback(modelId: string): unknown {
+/** CANONICAL with one extra key smuggled onto its vendor entry. */
+function withVendorKey(key: string): unknown {
   return {
     ...CANONICAL,
-    vendors: [{ ...CANONICAL.vendors[0], quotaFallbackModel: modelId }],
+    vendors: [{ ...CANONICAL.vendors[0], [key]: "gpt-5.6-sol" }],
   };
 }
 

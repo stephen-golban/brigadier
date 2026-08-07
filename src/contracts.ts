@@ -6,6 +6,27 @@
  * one unit's implementation. It owns the vendor, effort, and failure
  * vocabulary; token usage; worker spec and environment types; the event and
  * outcome unions; spawn and worker types; and the adapter registry.
+ *
+ * AMENDED ONCE, IN WO-010, AND ONLY IN THE QUOTA TYPES.
+ *
+ * The freeze held byte-identical from WO-000e through nineteen work orders. It
+ * was spent deliberately here because `QuotaWindow` could not represent a fact
+ * both vendors put on the wire: quota is metered per *model tier* as well as
+ * per account. R-11 (`docs/research/R-11-quota-metering.md`) verified that
+ * Claude's `rateLimitType` enumerates `seven_day_opus` and `seven_day_sonnet`
+ * beside the account-wide `five_hour` and `seven_day`, and that OpenAI returns
+ * `rateLimitsByLimitId` — a map of independent buckets, one of which was
+ * observed model-named and at 0% while the account bucket sat at 72%.
+ *
+ * Without a scope on the window, an Opus-only limit had to be reported as
+ * vendor-wide exhaustion, which told brigadier the whole Claude account was
+ * dead while Sonnet and Haiku were still running. That is a correctness defect
+ * in the type, not in a caller, so it could only be fixed here.
+ *
+ * The amendment adds `QuotaScope`, gives `QuotaWindow` a `scope` and its own
+ * `status`, and re-documents `QuotaSnapshot.status` as account-derived. Nothing
+ * else in this file changed: not the worker contract, not the event union, not
+ * the effort ladder, not `Capability`. The freeze is spent, not eroded.
  */
 
 /**
@@ -207,8 +228,22 @@ export interface CodexWorkerSpec extends WorkerSpecBase {
 /** Everything an adapter needs to launch one headless worker process. */
 export type WorkerSpec = ClaudeWorkerSpec | CodexWorkerSpec;
 
+/**
+ * What a quota window meters: the whole account, or one model tier.
+ *
+ * `label` is a normalized tier token such as `"opus"` or `"sonnet"`, never the
+ * vendor's display prose. The vendors ship display strings ("Opus limit") whose
+ * wording is plan-dependent and therefore useless as a matching key; the token
+ * is derived from the stable wire identifier instead.
+ */
+export type QuotaScope =
+  | { readonly kind: "account" }
+  | { readonly kind: "model"; readonly label: string };
+
 export interface QuotaWindow {
   readonly kind: "rolling" | "weekly" | "unknown";
+  readonly scope: QuotaScope;
+  readonly status: "available" | "warning" | "exhausted" | "unknown";
   readonly durationMinutes: number | null;
   readonly remainingFraction: number | null;
   readonly resetsAtMs: number | null;
@@ -217,6 +252,11 @@ export interface QuotaWindow {
 /** A point-in-time, vendor-normalized view of account quota. */
 export interface QuotaSnapshot {
   readonly vendor: Vendor;
+  /**
+   * Derived from ACCOUNT-scoped windows only. A drained model-scoped window must
+   * never make the whole vendor look exhausted — that is the defect this reshape
+   * exists to fix.
+   */
   readonly status: "available" | "warning" | "exhausted" | "unknown";
   readonly observedAtMs: number;
   readonly windows: readonly QuotaWindow[];

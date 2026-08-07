@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"923e4567-e89b-12d3-a456-426614174000","model":"claude-sonnet-5"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786026000,"rateLimitType":"five_hour","utilization":0.82,"isUsingOverage":false},"session_id":"923e4567-e89b-12d3-a456-426614174000"}

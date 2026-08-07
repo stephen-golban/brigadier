@@ -15,7 +15,6 @@ import { join, resolve } from "node:path";
 import packageJson from "../package.json";
 import type { BrigadierConfig } from "../src/config/index.ts";
 import {
-  ConfigValidationError,
   readConfig,
   resolveConfigPath,
   writeConfig,
@@ -27,12 +26,13 @@ import type {
 } from "../src/discovery/contracts.ts";
 import type { InputStream, OutputStream } from "../src/init/index.ts";
 import {
+  DEGRADED_ROUTING_QUESTION,
   EFFORT_CEILING_WARNING,
-  FALLBACK_NONE_LABEL,
   proposeConfig,
   runCli,
   runInit,
-  withQuotaFallback,
+  withDefaultModel,
+  withDegradedRouting,
 } from "../src/init/index.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -90,7 +90,7 @@ const RETIRED: DiscoveredModel = {
   selectable: false,
 };
 
-/** Exactly the two Codex models required by the quota-fallback proof. */
+/** Exactly two Codex models: enough to prove a choice was offered. */
 const CODEX_REPORT: DiscoveryReport = {
   vendors: [
     {
@@ -185,7 +185,7 @@ const BOTH_VENDORS_REPORT: DiscoveryReport = {
 };
 
 const BOTH_VENDORS_CONFIG: BrigadierConfig = {
-  version: 1,
+  version: 2,
   vendors: [
     {
       vendor: "claude",
@@ -198,7 +198,6 @@ const BOTH_VENDORS_CONFIG: BrigadierConfig = {
         { id: "claude-opus-4-6", effortCeiling: "high" },
         { id: "claude-sonnet-4-6", effortCeiling: "high" },
       ],
-      quotaFallbackModel: null,
     },
     {
       vendor: "codex",
@@ -209,10 +208,10 @@ const BOTH_VENDORS_CONFIG: BrigadierConfig = {
         { id: "gpt-5.6-sol", effortCeiling: "high" },
         { id: "gpt-5.6-terra", effortCeiling: "high" },
       ],
-      quotaFallbackModel: null,
     },
   ],
   secretsConsent: false,
+  allowDegradedRouting: false,
 };
 
 describe("brigadier init --yes", () => {
@@ -360,9 +359,10 @@ describe("brigadier init --print-config", () => {
 
       expect(code).toBe(0);
       expect(JSON.parse(stdout.text())).toEqual({
-        version: 1,
+        version: 2,
         vendors: [],
         secretsConsent: false,
+        allowDegradedRouting: false,
       });
     });
   });
@@ -392,17 +392,28 @@ describe("brigadier init --print-config", () => {
   });
 });
 
-describe("quota fallback", () => {
-  test("can be set to gpt-5.6-terra and cannot be set to a model the probe never found", async () => {
+/**
+ * WO-010H replaced the per-vendor quota-fallback prompt — "When codex quota
+ * drains, fall back to:" plus a model list — with one question about the
+ * behaviour the setting actually controls. The prompt's copy is part of the
+ * change and not decoration: the old wording described a substitution that
+ * per-model quota metering had already made the ordinary pipeline perform on
+ * merit, so a user answering it was consenting to one thing while reading
+ * about another.
+ */
+describe("degraded routing", () => {
+  test("is asked once for the whole config, not once per vendor", async () => {
     await withScratchHome(async (scratchHome) => {
       const stdout = collector();
       const code = await runInit({
-        discoverer: fakeDiscoverer(CODEX_REPORT),
+        discoverer: fakeDiscoverer(BOTH_VENDORS_REPORT),
         env: { BRIGADIER_HOME: scratchHome },
         stdout,
         stderr: collector(),
-        // accept default model, no ceiling change, fallback choice 2, secrets no
-        stdin: scriptedInput(["", "", "2", ""]),
+        // claude: accept model, no ceiling change.
+        // codex: accept model, no ceiling change.
+        // then, once: degraded routing yes, secrets no.
+        stdin: scriptedInput(["", "", "", "", "y", ""]),
         assumeYes: false,
         printConfig: false,
       });
@@ -411,38 +422,58 @@ describe("quota fallback", () => {
       const written = await readConfig(
         resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
       );
-      expect(written?.vendors[0]?.vendor).toBe("codex");
-      expect(written?.vendors[0]?.quotaFallbackModel).toBe("gpt-5.6-terra");
+      expect(written?.allowDegradedRouting).toBe(true);
+      expect(written?.secretsConsent).toBe(false);
 
       const transcript = stdout.text();
-      expect(transcript).toContain("When codex quota drains, fall back to:");
-      expect(transcript).toContain("1) gpt-5.6-sol");
-      expect(transcript).toContain("2) gpt-5.6-terra");
-      expect(transcript).toContain(`3) ${FALLBACK_NONE_LABEL}`);
-      // A model the machine does not have is never offered.
-      expect(transcript).not.toContain("gpt-5.6-pro");
-
-      // ...and cannot be recorded by any other route either.
-      const proposal = proposeConfig(CODEX_REPORT, null);
-      expect(() =>
-        withQuotaFallback(proposal.config, "codex", "gpt-5.6-pro"),
-      ).toThrow(ConfigValidationError);
-      expect(() =>
-        withQuotaFallback(proposal.config, "codex", "gpt-5.6-pro"),
-      ).toThrow(
-        'invalid brigadier config: codex: quota fallback model "gpt-5.6-pro" is not one of this vendor\'s available models',
+      expect(transcript).toContain(DEGRADED_ROUTING_QUESTION);
+      expect(DEGRADED_ROUTING_QUESTION).toBe(
+        "If no model on this machine meets a slice's difficulty bar, run the slice on a weaker model instead of failing it?",
       );
-      expect(
-        withQuotaFallback(proposal.config, "codex", "gpt-5.6-terra").vendors[0]
-          ?.quotaFallbackModel,
-      ).toBe("gpt-5.6-terra");
+      // Asked once even though two vendors were configured.
+      expect(transcript.split(DEGRADED_ROUTING_QUESTION).length - 1).toBe(1);
+      // Defaults to No, and says so in the hint.
+      expect(transcript).toContain(`${DEGRADED_ROUTING_QUESTION} [y/N]`);
+      // The prompt this replaced is gone, wording and model list alike.
+      expect(transcript).not.toContain("quota drains");
+      expect(transcript).not.toContain("fall back to");
+      expect(transcript).not.toContain("fail the slice instead");
     });
   });
 
-  test("defaults to none - fail the slice instead - and never invents a downgrade", () => {
+  test("defaults to no, so brigadier never silently substitutes", () => {
     const proposal = proposeConfig(CODEX_REPORT, null);
-    expect(proposal.config.vendors[0]?.quotaFallbackModel).toBeNull();
-    expect(FALLBACK_NONE_LABEL).toBe("none — fail the slice instead");
+    expect(proposal.config.allowDegradedRouting).toBe(false);
+    expect(
+      withDegradedRouting(proposal.config, true).allowDegradedRouting,
+    ).toBe(true);
+    expect(
+      withDegradedRouting(withDegradedRouting(proposal.config, true), false)
+        .allowDegradedRouting,
+    ).toBe(false);
+    // It is a root setting: no vendor entry carries a trace of it.
+    for (const vendor of withDegradedRouting(proposal.config, true).vendors) {
+      expect(JSON.stringify(vendor)).not.toContain("egraded");
+    }
+  });
+
+  test("is rendered in the summary the user confirms", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        assumeYes: true,
+        printConfig: false,
+      });
+      expect(code).toBe(0);
+      expect(stdout.text()).toContain(
+        "run below-difficulty models rather than fail: no",
+      );
+      expect(stdout.text()).not.toContain("quota fallback");
+    });
   });
 });
 
@@ -488,7 +519,7 @@ describe("effort ceilings", () => {
       );
       // The defect this replaces: gpt-5.6-ultraonly was written with
       // effortCeiling "high", an effort that vendor does not accept, and was
-      // then offerable as the quota fallback — failing exactly when needed.
+      // then offerable as a default model — failing exactly when needed.
       expect(written?.vendors[0]?.models).toEqual([
         { id: "gpt-5.6-sol", effortCeiling: "high" },
       ]);
@@ -550,17 +581,17 @@ describe("effort ceilings", () => {
         { id: "gpt-5.6-sol", effortCeiling: "high" },
       ]);
       expect(written?.vendors[0]?.defaultModel).toBe("gpt-5.6-sol");
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
       expect(stdout.text()).toContain(
         'note: codex: model "gpt-5.6-peak" is not being offered because the vendor reports xhigh only, and xhigh is earned on retry after a failed gate — brigadier never predicts it.',
       );
 
-      // It is not reachable as a quota fallback by any route either.
+      // It is not selectable as a default by any route either: `parseConfig`
+      // only knows the models the proposal recorded.
       const proposal = proposeConfig(xhighOnly, null);
       expect(() =>
-        withQuotaFallback(proposal.config, "codex", "gpt-5.6-peak"),
+        withDefaultModel(proposal.config, "codex", "gpt-5.6-peak"),
       ).toThrow(
-        'invalid brigadier config: codex: quota fallback model "gpt-5.6-peak" is not one of this vendor\'s available models',
+        'invalid brigadier config: codex: default model "gpt-5.6-peak" is not one of this vendor\'s available models',
       );
     });
   });
@@ -628,8 +659,8 @@ describe("effort ceilings", () => {
         stdout,
         stderr: collector(),
         // accept model, change ceilings, ceiling choice 1 (medium),
-        // fallback choice 2 (none), secrets no
-        stdin: scriptedInput(["", "y", "1", "2", ""]),
+        // degraded routing no, secrets no
+        stdin: scriptedInput(["", "y", "1", "", ""]),
         assumeYes: false,
         printConfig: false,
       });
@@ -659,8 +690,8 @@ describe("effort ceilings", () => {
         stdout,
         stderr: collector(),
         // accept model, change ceilings, sol -> xhigh, terra -> medium,
-        // fallback none, secrets no
-        stdin: scriptedInput(["", "y", "3", "1", "3", ""]),
+        // degraded routing no, secrets no
+        stdin: scriptedInput(["", "y", "3", "1", "", ""]),
         assumeYes: false,
         printConfig: false,
       });
@@ -673,7 +704,7 @@ describe("effort ceilings", () => {
         { id: "gpt-5.6-sol", effortCeiling: "xhigh" },
         { id: "gpt-5.6-terra", effortCeiling: "medium" },
       ]);
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
+      expect(written?.allowDegradedRouting).toBe(false);
 
       const transcript = stdout.text();
       expect(transcript).toContain(EFFORT_CEILING_WARNING);
@@ -742,9 +773,9 @@ describe("prompt synchronization", () => {
         // "y" yes, change the ceilings
         // "1" sol's ceiling: its only option, medium
         // "2" terra's ceiling: high
-        // "3" quota fallback: "none — fail the slice instead"
+        // ""  degraded routing: no
         // ""  secrets: no
-        stdin: scriptedInput(["", "y", "1", "2", "3", ""]),
+        stdin: scriptedInput(["", "y", "1", "2", "", ""]),
         assumeYes: false,
         printConfig: false,
       });
@@ -755,18 +786,17 @@ describe("prompt synchronization", () => {
       );
 
       // Before the fix: sol's prompt read nothing, terra's prompt ate the "1"
-      // and recorded medium, and the "2" meant for terra landed on the quota
-      // fallback — recording gpt-5.6-terra, a fallback nobody chose.
+      // and recorded medium, and the "2" meant for terra landed on the next
+      // prompt — answering a question nobody was asked.
       expect(written?.vendors[0]?.models).toEqual([
         { id: "gpt-5.6-sol", effortCeiling: "medium" },
         { id: "gpt-5.6-terra", effortCeiling: "high" },
       ]);
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
+      expect(written?.allowDegradedRouting).toBe(false);
       expect(written?.secretsConsent).toBe(false);
 
       const transcript = stdout.text();
       expect(transcript).toContain("only option: medium");
-      expect(transcript).toContain(`3) ${FALLBACK_NONE_LABEL}`);
     });
   });
 
@@ -794,17 +824,20 @@ describe("prompt synchronization", () => {
         warnings: [],
       };
 
-      // Five prompts: default-model confirm ("n" forces the single-option model
+      // Six prompts: default-model confirm ("n" forces the single-option model
       // prompt), the model prompt itself, the ceilings confirm, the single-
-      // option ceiling prompt, the fallback prompt, then secrets. A trailing
-      // sentinel proves nothing over-read: it must remain unconsumed and
-      // therefore cannot influence any answer.
+      // option ceiling prompt, the degraded-routing confirm, then secrets.
+      //
+      // The last two answers disagree on purpose. If any prompt failed to
+      // consume its line, the degraded-routing "y" would land on secrets and
+      // both booleans would come out wrong together — so asserting `true` then
+      // `false` catches a one-line drift that two matching answers would hide.
       const code = await runInit({
         discoverer: fakeDiscoverer(singleModel),
         env: { BRIGADIER_HOME: scratchHome },
         stdout: collector(),
         stderr: collector(),
-        stdin: scriptedInput(["n", "1", "y", "1", "2", "y"]),
+        stdin: scriptedInput(["n", "1", "y", "1", "y", "n"]),
         assumeYes: false,
         printConfig: false,
       });
@@ -817,10 +850,10 @@ describe("prompt synchronization", () => {
       expect(written?.vendors[0]?.models).toEqual([
         { id: "gpt-5.6-sol", effortCeiling: "medium" },
       ]);
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
-      // The final "y" is the secrets answer, and it arrives at the secrets
+      // The final "n" is the secrets answer, and it arrives at the secrets
       // prompt only if every prompt before it consumed exactly one line.
-      expect(written?.secretsConsent).toBe(true);
+      expect(written?.allowDegradedRouting).toBe(true);
+      expect(written?.secretsConsent).toBe(false);
     });
   });
 });
@@ -936,7 +969,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       const prior: BrigadierConfig = {
-        version: 1,
+        version: 2,
         vendors: [
           {
             vendor: "codex",
@@ -947,10 +980,10 @@ describe("re-running init", () => {
               { id: "gpt-5.6-sol", effortCeiling: "xhigh" },
               { id: "gpt-5.6-terra", effortCeiling: "medium" },
             ],
-            quotaFallbackModel: "gpt-5.6-sol",
           },
         ],
         secretsConsent: true,
+        allowDegradedRouting: true,
       };
       await writeConfig(path, prior);
 
@@ -983,6 +1016,11 @@ describe("re-running init", () => {
       expect(stdout.text()).toContain(
         "Allow brigadier to link secret files (for example .env) into worker worktrees? [Y/n]",
       );
+      // A prior `true` becomes the default, so pressing enter keeps it. The
+      // hint is `[Y/n]` rather than the fresh-config `[y/N]`, which is the only
+      // visible difference between "the user said yes last time" and "brigadier
+      // decided for them".
+      expect(stdout.text()).toContain(`${DEGRADED_ROUTING_QUESTION} [Y/n]`);
       expect(await readConfig(path)).toEqual(prior);
     });
   });
@@ -991,7 +1029,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 1,
+        version: 2,
         vendors: [
           {
             vendor: "codex",
@@ -999,10 +1037,10 @@ describe("re-running init", () => {
             version: "0.144.0",
             defaultModel: "gpt-5.6-gone",
             models: [{ id: "gpt-5.6-gone", effortCeiling: "medium" }],
-            quotaFallbackModel: "gpt-5.6-gone",
           },
         ],
         secretsConsent: false,
+        allowDegradedRouting: true,
       });
 
       const stdout = collector();
@@ -1019,13 +1057,12 @@ describe("re-running init", () => {
       expect(stdout.text()).toContain(
         'note: codex: previous default model "gpt-5.6-gone" is no longer installed; proposing "gpt-5.6-sol"',
       );
-      expect(stdout.text()).toContain(
-        'note: codex: previous quota fallback "gpt-5.6-gone" is no longer installed; reset to none',
-      );
       const written = await readConfig(path);
       expect(written?.vendors[0]?.defaultModel).toBe("gpt-5.6-sol");
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
       expect(written?.vendors[0]?.version).toBe("0.145.0");
+      // Resetting a model choice is not a reason to revoke a consent that has
+      // nothing to do with any model.
+      expect(written?.allowDegradedRouting).toBe(true);
     });
   });
 
@@ -1033,7 +1070,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 1,
+        version: 2,
         vendors: [
           {
             vendor: "claude",
@@ -1041,10 +1078,10 @@ describe("re-running init", () => {
             version: "2.0.13",
             defaultModel: "claude-opus-4-6",
             models: [{ id: "claude-opus-4-6", effortCeiling: "xhigh" }],
-            quotaFallbackModel: "claude-opus-4-6",
           },
         ],
         secretsConsent: false,
+        allowDegradedRouting: false,
       });
 
       const stdout = collector();
@@ -1066,14 +1103,10 @@ describe("re-running init", () => {
       expect(stdout.text()).toContain(
         'note: claude: previous default model "claude-opus-4-6" is installed but brigadier cannot drive it (the vendor reports xhigh only, and xhigh is earned on retry after a failed gate — brigadier never predicts it); proposing "claude-sonnet-4-6"',
       );
-      expect(stdout.text()).toContain(
-        'note: claude: previous quota fallback "claude-opus-4-6" is installed but brigadier cannot drive it (the vendor reports xhigh only, and xhigh is earned on retry after a failed gate — brigadier never predicts it); reset to none',
-      );
       expect(stdout.text()).not.toContain("is no longer installed");
 
       const written = await readConfig(path);
       expect(written?.vendors[0]?.defaultModel).toBe("claude-sonnet-4-6");
-      expect(written?.vendors[0]?.quotaFallbackModel).toBeNull();
     });
   });
 
@@ -1081,7 +1114,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 1,
+        version: 2,
         vendors: [
           {
             vendor: "codex",
@@ -1089,10 +1122,10 @@ describe("re-running init", () => {
             version: "0.144.0",
             defaultModel: "gpt-5.6-sol",
             models: [{ id: "gpt-5.6-sol", effortCeiling: "xhigh" }],
-            quotaFallbackModel: null,
           },
         ],
         secretsConsent: false,
+        allowDegradedRouting: false,
       });
 
       const stdout = collector();
@@ -1186,7 +1219,6 @@ describe("proposal", () => {
         "defaultModel",
         "executable",
         "models",
-        "quotaFallbackModel",
         "vendor",
         "version",
       ]);

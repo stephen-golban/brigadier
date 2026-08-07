@@ -86,24 +86,32 @@ export interface RoutedWorker {
    */
   readonly rationale: readonly string[];
   /**
-   * True only when the winner came from a vendor reporting exhausted quota, via
-   * that vendor's configured `quotaFallbackModel`, on the last-resort path
-   * where the difficulty floor was waived.
+   * True only when this slice is running on a model that scored *below* the
+   * floor its own difficulty sets — the last-resort path, reachable only for a
+   * user who set `allowDegradedRouting` in their config.
    *
-   * It is a statement about *where the slice ran*, not about how good the model
-   * is. It does not mean the model is weaker than the slice asked for: a user
-   * whose only vendor is drained and who configured their strongest model as
-   * its own substitution gets that model, above the floor, with this flag set.
-   * Nor does a waived floor imply this flag: when the floor is waived, healthy
-   * models the floor had rejected compete in the same salvage pool, and a
-   * healthy winner leaves this `false` because its work ran on quota brigadier
-   * believes is there.
+   * This is a statement about *how good the model is for this work*, and it is
+   * the only claim of that shape the router can honestly make. It replaces
+   * `usedQuotaFallback`, which claimed something about *where the slice ran* —
+   * "the winner is an exhausted account's configured substitution" — that
+   * per-model quota metering (WO-010B) made unreachable and WO-010H deleted.
+   * A user whose Opus limit ran out and whose slice went to Sonnet is not
+   * running on quota brigadier believes is spent, and the old flag was already
+   * documented as false for them; there is now no case where it would have been
+   * true, so the flag that survives is the one with a subject.
    *
-   * What a caller can rely on: `true` means the run is leaning on the user's
-   * configured substitution for an account that just said it had nothing left,
-   * so retrying the same slice will keep landing there until quota returns.
+   * What a caller can rely on: `true` means the work is being done by a model
+   * the difficulty rule would normally have rejected, so a bad result is a
+   * predictable outcome rather than a surprise, and the fix is more capacity or
+   * a smaller slice rather than a retry. `false` means the winner cleared its
+   * floor on merit — including every case where quota removed a stronger
+   * sibling and a healthy weaker model won the ordinary pipeline outright.
+   *
+   * It says nothing about quota. A slice can waive the floor on a machine with
+   * no quota pressure at all, simply because nothing configured is strong
+   * enough for the work.
    */
-  readonly usedQuotaFallback: boolean;
+  readonly waivedDifficultyFloor: boolean;
 }
 
 export type RoutingFailureReason =
@@ -111,7 +119,7 @@ export type RoutingFailureReason =
   | "NO_CONFIGURED_MODELS"
   /** Models exist, but none survived the capability, competence, or effort stages. */
   | "NO_CAPABLE_MODEL"
-  /** Every model was removed by quota exhaustion, and no fallback was usable. */
+  /** Quota exhaustion removed every model of every configured vendor. */
   | "ALL_VENDORS_EXHAUSTED";
 
 export type RoutingDecision =

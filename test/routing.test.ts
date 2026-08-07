@@ -5,6 +5,7 @@ import type {
   Capability,
   Effort,
   QuotaSnapshot,
+  QuotaWindow,
   Slice,
   Vendor,
 } from "../src/contracts.ts";
@@ -37,24 +38,32 @@ const SLICE: Slice = {
 interface VendorSpec {
   readonly vendor: Vendor;
   readonly models: readonly (readonly [string, Effort])[];
-  readonly fallback?: string | null;
 }
 
 /**
  * Builds fixtures through `parseConfig` rather than as bare literals, so a test
  * can never assert routing behavior against a config the product would reject.
+ *
+ * `allowDegradedRouting` is a positional argument rather than a field on a
+ * vendor spec because that is what it is in the product: one setting for the
+ * whole config, not one per vendor. It defaults to `false`, matching the
+ * config default, so a test that does not name it is asserting the behaviour a
+ * user gets without consenting to anything.
  */
-function makeConfig(specs: readonly VendorSpec[]): BrigadierConfig {
+function makeConfig(
+  specs: readonly VendorSpec[],
+  allowDegradedRouting = false,
+): BrigadierConfig {
   return parseConfig({
     version: CONFIG_VERSION,
     secretsConsent: false,
+    allowDegradedRouting,
     vendors: specs.map((spec) => ({
       vendor: spec.vendor,
       executable: `/usr/local/bin/${spec.vendor}`,
       version: "1.0.0",
       defaultModel: spec.models[0]?.[0] ?? "",
       models: spec.models.map(([id, effortCeiling]) => ({ id, effortCeiling })),
-      quotaFallbackModel: spec.fallback ?? null,
     })),
   });
 }
@@ -104,6 +113,50 @@ function snapshot(
   observedAtMs = 1_700_000_000_000,
 ): QuotaSnapshot {
   return { vendor, status, observedAtMs, windows: [], isUsingOverage: null };
+}
+
+/**
+ * One quota window. `scope` is the whole point of these fixtures, so it is the
+ * first argument and never defaulted.
+ */
+function quotaWindow(
+  scope: QuotaWindow["scope"],
+  status: QuotaWindow["status"],
+  kind: QuotaWindow["kind"] = "weekly",
+): QuotaWindow {
+  return {
+    kind,
+    scope,
+    status,
+    durationMinutes: null,
+    remainingFraction: null,
+    resetsAtMs: null,
+  };
+}
+
+function accountScope(): QuotaWindow["scope"] {
+  return { kind: "account" };
+}
+
+function tierScope(label: string): QuotaWindow["scope"] {
+  return { kind: "model", label };
+}
+
+/**
+ * A snapshot that actually carries windows.
+ *
+ * `status` stays explicit rather than being derived here, because the router
+ * has to keep working for a snapshot whose account status is not reconstructible
+ * from its windows — `normalizeCodexRateLimits` produces exactly that when the
+ * payload reports `rateLimitReachedType` with no account-scoped bucket.
+ */
+function metered(
+  vendor: Vendor,
+  status: QuotaSnapshot["status"],
+  windows: readonly QuotaWindow[],
+  observedAtMs = 1_700_000_000_000,
+): QuotaSnapshot {
+  return { vendor, status, observedAtMs, windows, isUsingOverage: null };
 }
 
 function request(
@@ -239,7 +292,7 @@ describe("competence rank and difficulty floor", () => {
     expect(routed.vendor).toBe("codex");
     expect(routed.model).toBe("gpt-5.6-sol");
     expect(routed.effort).toBe("high");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(false);
   });
 
   test("standard picks the cheapest model clearing floor 60", () => {
@@ -719,7 +772,7 @@ describe("capability filter", () => {
       ),
     );
     expect(routed.model).toBe("gpt-5.6-terra");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(false);
   });
 
   test("a zero-token floor is not a demand and does not exclude unrecorded models", () => {
@@ -786,11 +839,16 @@ describe("quota", () => {
     );
     expect(routed.model).toBe("gpt-5.6-terra");
     expect(routed.rationale[1]).toBe(
-      "quota: claude=unknown (treated as available), codex=warning (kept in the pool)",
+      "quota: claude=no account-wide limit reported (treated as available), codex=account-wide warning (kept in the pool)",
+    );
+    // A warning removes nothing, so it gets its own line rather than a place in
+    // the drop list. The account-wide warning reaches every codex model.
+    expect(routed.rationale[2]).toBe(
+      "quota warning: codex/gpt-5.6-sol (codex reports its account-wide quota warning), codex/gpt-5.6-terra (codex reports its account-wide quota warning) — kept in the pool, since a warning says a window is close, not that it is spent",
     );
   });
 
-  test("an exhausted vendor with a null fallback drops out and routing continues", () => {
+  test("an exhausted vendor drops out and routing continues over what is left", () => {
     const routed = expectRouted(
       route(
         request("standard"),
@@ -799,31 +857,36 @@ describe("quota", () => {
     );
     expect(routed.vendor).toBe("codex");
     expect(routed.model).toBe("gpt-5.6-terra");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(false);
     expect(routed.rationale[1]).toBe(
-      "quota: claude=exhausted, codex=no snapshot (treated as available); dropped 3 model(s) from claude (quota exhausted; a configured fallback is a last resort, consulted only if no healthy model can take the slice)",
+      "quota: claude=account-wide exhausted, codex=no snapshot (treated as available); dropped 3 of 5 model(s) — claude/claude-opus-4-6 (claude reports its account-wide quota exhausted), claude/claude-sonnet-5 (claude reports its account-wide quota exhausted), claude/claude-haiku-5 (claude reports its account-wide quota exhausted) (a model quota removed is out for this slice; routing continues over what is left)",
     );
   });
 
   /**
-   * The defect this file was rewritten around. The router used to hand the
-   * slice to an exhausted vendor's configured fallback the moment quota
-   * drained, which put a `hard` slice on a score-40 model while a score-96
-   * model from a healthy vendor sat idle — the difficulty floor bypassed for no
-   * reason but the order the stages happened to run in.
+   * The defect this file was rewritten around, in its post-WO-010H form. The
+   * router used to hand the slice to an exhausted vendor's configured fallback
+   * the moment quota drained, which put a `hard` slice on a score-40 model
+   * while a score-96 model from a healthy vendor sat idle.
+   *
+   * Degraded routing is switched ON here on purpose. Consent is not a taste for
+   * weak models: while the ordinary pipeline yields anything at all it decides,
+   * the floor stands, and nothing is waived.
    */
-  test("a healthy vendor's model beats an exhausted vendor's configured fallback", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
-    ]);
+  test("a healthy vendor's model takes the slice even with degraded routing allowed", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+        { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard"),
@@ -834,10 +897,10 @@ describe("quota", () => {
       vendor: "codex",
       model: "gpt-5.6-sol",
       effort: "high",
-      usedQuotaFallback: false,
+      waivedDifficultyFloor: false,
       rationale: [
         "pool: 3 model(s) from 2 configured vendor(s) — claude/claude-opus-4-6, claude/claude-haiku-5, codex/gpt-5.6-sol",
-        "quota: claude=exhausted, codex=no snapshot (treated as available); dropped 2 model(s) from claude (quota exhausted; a configured fallback is a last resort, consulted only if no healthy model can take the slice)",
+        "quota: claude=account-wide exhausted, codex=no snapshot (treated as available); dropped 2 of 3 model(s) — claude/claude-opus-4-6 (claude reports its account-wide quota exhausted), claude/claude-haiku-5 (claude reports its account-wide quota exhausted) (a model quota removed is out for this slice; routing continues over what is left)",
         "capability: slice requires nothing; 1 of 1 model(s) passed",
         "competence: hard difficulty sets a floor of 90; eligible codex/gpt-5.6-sol=96; picked codex/gpt-5.6-sol — deepest Codex reasoning tier: cross-cutting refactors and subtle debugging (lowest score clearing the floor wins, so the slice costs no more than it has to)",
         'effort: base "high" from hard difficulty; no clamp applied; final "high"',
@@ -845,58 +908,79 @@ describe("quota", () => {
     });
   });
 
-  test("the only vendor exhausted routes to its fallback and says the floor was waived", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-    ]);
-    const routed = expectRouted(
+  /**
+   * Consent waives the difficulty floor. It does not create quota.
+   *
+   * Every model on the machine is drained, so the salvage pool is empty and the
+   * waiver has nothing to admit. `ALL_VENDORS_EXHAUSTED` is the honest answer;
+   * the alternative burns a worktree and a process spawn to rediscover a limit
+   * the vendor already reported.
+   */
+  test("a fully drained account cannot be salvaged, consent or not", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    const failure = expectFailure(
       route(
         request("hard"),
         input(config, [], [snapshot("claude", "exhausted")]),
       ),
     );
-    expect(routed).toEqual({
-      vendor: "claude",
-      model: "claude-haiku-5",
-      effort: "high",
-      usedQuotaFallback: true,
-      rationale: [
-        "pool: 2 model(s) from 1 configured vendor(s) — claude/claude-opus-4-6, claude/claude-haiku-5",
-        "quota: claude=exhausted; dropped 2 model(s) from claude (quota exhausted; a configured fallback is a last resort, consulted only if no healthy model can take the slice)",
-        "capability: slice requires nothing; claude/claude-haiku-5 passed",
-        'competence: the hard difficulty floor of 90 was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40 (quota-drained); picked claude/claude-haiku-5 at an actual competence score of 40, quota-drained, because it is exhausted vendor claude\'s configured quota fallback (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)',
-        'effort: base "high" from hard difficulty; no clamp applied; final "high"',
-      ],
-    });
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
+    );
+    // Two entries, one per pooled model, and no third entry for a substitution
+    // that was consulted: there is no substitution to consult any more. The
+    // reason names the one fact that decides the user's next move — the vendor
+    // is empty, so waiting is the remedy and re-running is not.
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+      {
+        vendor: "claude",
+        model: "claude-haiku-5",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+    ]);
   });
 
   /**
-   * The defect the previous shape cornered into a narrower case. Waiving the
-   * floor only for the exhausted vendors' fallbacks meant a `hard` slice with
-   * nothing at 90 went to a drained account's score-40 `claude-haiku-5` while a
-   * healthy score-70 `gpt-5.6-terra` sat idle — the same preemption mistake the
-   * last-resort rule was written to kill, one layer down. The waiver applies to
-   * the whole salvage pool, and the healthy 70 wins.
+   * The salvage pool holds only models quota left standing. A `hard` slice with
+   * nothing at 90 must not reach a drained account's score-40 `claude-haiku-5`
+   * while a healthy score-70 `gpt-5.6-terra` sits idle — and after WO-010H the
+   * drained model is not merely outranked, it is not a candidate at all.
    */
-  test("a healthy model below the floor beats a drained vendor's fallback", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-      { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
-    ]);
+  test("a healthy below-floor model is salvaged and a drained one is not", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard"),
@@ -906,55 +990,58 @@ describe("quota", () => {
     expect(routed.vendor).toBe("codex");
     expect(routed.model).toBe("gpt-5.6-terra");
     expect(routed.effort).toBe("high");
-    // The winner is on healthy quota, so this is not a quota fallback run,
-    // however drained the rest of the machine is.
-    expect(routed.usedQuotaFallback).toBe(false);
+    // A score of 70 took a slice whose floor is 90, and the caller is told so.
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    // The drained claude models are not in the pool to lose: quota removed them
+    // and the waiver does not put them back.
     expect(routed.rationale[3]).toBe(
-      'competence: the hard difficulty floor of 90 was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40 (quota-drained), codex/gpt-5.6-terra=70 (healthy); picked codex/gpt-5.6-terra at an actual competence score of 70, healthy, because it is on a healthy vendor and was eliminated only by the floor (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)',
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: codex/gpt-5.6-terra=70; picked codex/gpt-5.6-terra at an actual competence score of 70 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
     );
   });
 
   /**
-   * The other direction, so "healthy wins" is not read as a rule of its own:
-   * health is a tie-break, not a trump. A drained vendor's substitution that
-   * outranks everything healthy still takes the slice — that is precisely the
-   * case the user configured it for.
+   * A drained model does not enter the salvage pool however good it is.
+   *
+   * `claude-opus-4-6` scores 100 against `gpt-5.6-terra`'s 70 and loses anyway:
+   * `claude` reported its account exhausted, which is a statement about Opus
+   * too. A score of 100 on an account with no quota left is worth nothing, and
+   * the weaker healthy model is the one that can do the work.
    */
-  test("a drained fallback that outranks every healthy model still wins", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [["claude-opus-4-6", "high"]],
-        fallback: "claude-opus-4-6",
-      },
-      { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
-    ]);
+  test("a drained model never outranks a healthy one, however good it is", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard"),
         input(config, [], [snapshot("claude", "exhausted")]),
       ),
     );
-    expect(routed.vendor).toBe("claude");
-    expect(routed.model).toBe("claude-opus-4-6");
-    expect(routed.usedQuotaFallback).toBe(true);
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-terra");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
     expect(routed.rationale[3]).toBe(
-      'competence: the hard difficulty floor of 90 was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-opus-4-6=100 (quota-drained), codex/gpt-5.6-terra=70 (healthy); picked claude/claude-opus-4-6 at an actual competence score of 100, quota-drained, because it is exhausted vendor claude\'s configured quota fallback (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)',
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: codex/gpt-5.6-terra=70; picked codex/gpt-5.6-terra at an actual competence score of 70 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
     );
   });
 
-  test("an equal-scoring healthy model outranks a drained vendor's fallback", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [["claude-sonnet-5", "high"]],
-        fallback: "claude-sonnet-5",
-      },
-      { vendor: "codex", models: [["codex-sonnet-clone", "high"]] },
-    ]);
-    // Both match /sonnet/i and score 74, both are below the hard floor of 90,
-    // and the drained one is first in config order — so only the healthy tie
-    // break can pick codex here.
+  test("an equal-scoring healthy model beats a drained one despite config order", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-sonnet-5", "high"]] },
+        { vendor: "codex", models: [["codex-sonnet-clone", "high"]] },
+      ],
+      true,
+    );
+    // Both match /sonnet/i and score 74, both sit below the hard floor of 90,
+    // and the drained one is first in config order — so a config-order tie-break
+    // over the whole machine would pick it. The drained model never reaches the
+    // salvage pool at all, so codex wins by being the only candidate in it.
     const routed = expectRouted(
       route(
         request("hard"),
@@ -963,61 +1050,85 @@ describe("quota", () => {
     );
     expect(routed.vendor).toBe("codex");
     expect(routed.model).toBe("codex-sonnet-clone");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(true);
   });
 
   /**
-   * Fix 6's counterexample, pinned. `usedQuotaFallback` is a statement about
-   * *where* the slice ran, not about the model being weaker than the slice
-   * asked for: this winner scores 100 against a floor of 90.
+   * A drained model strong enough to clear the floor on its own is still not
+   * usable. Competence was never what stopped it; quota was, and consent waives
+   * the floor and nothing else.
+   *
+   * One configured model, drained, with degraded routing allowed: the smallest
+   * possible statement of the rule.
    */
-  test("usedQuotaFallback is true even when the substitute clears the floor", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [["claude-opus-4-6", "high"]],
-        fallback: "claude-opus-4-6",
-      },
-    ]);
-    const routed = expectRouted(
+  test("a drained model that clears the floor is still refused", () => {
+    const config = makeConfig(
+      [{ vendor: "claude", models: [["claude-opus-4-6", "high"]] }],
+      true,
+    );
+    const failure = expectFailure(
       route(
         request("hard"),
         input(config, [], [snapshot("claude", "exhausted")]),
       ),
     );
-    expect(routed.model).toBe("claude-opus-4-6");
-    expect(routed.usedQuotaFallback).toBe(true);
-    expect(routed.rationale[3]).toBe(
-      'competence: the hard difficulty floor of 90 was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-opus-4-6=100 (quota-drained); picked claude/claude-opus-4-6 at an actual competence score of 100, quota-drained, because it is exhausted vendor claude\'s configured quota fallback (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)',
-    );
-  });
-
-  test("the fallback waives the competence floor but not the effort ceiling", () => {
-    const config = makeConfig([
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.rejected).toEqual([
       {
         vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "medium"],
-        ],
-        fallback: "claude-haiku-5",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
     ]);
+  });
+
+  /**
+   * The waiver waives the difficulty floor and nothing else. A salvage winner
+   * still runs at an effort its configured ceiling permits, because the ceiling
+   * answers "what can this model actually be asked to do", which no amount of
+   * consent to degrade changes.
+   *
+   * Only the Opus tier is drained here, so `claude-haiku-5` is an ordinary
+   * pooled model that the hard floor of 90 rejected and the waiver readmits.
+   */
+  test("the waived floor does not waive the effort ceiling", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "medium"],
+          ],
+        },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard"),
-        input(config, [], [snapshot("claude", "exhausted")]),
+        input(
+          config,
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
+        ),
       ),
     );
     expect(routed.model).toBe("claude-haiku-5");
     expect(routed.effort).toBe("medium");
-    expect(routed.usedQuotaFallback).toBe(true);
+    expect(routed.waivedDifficultyFloor).toBe(true);
     expect(routed.rationale[4]).toBe(
       'effort: base "high" from hard difficulty; clamped down by the configured effort ceiling "medium"; final "medium"',
     );
   });
 
-  test("the only vendor exhausted with a null fallback is ALL_VENDORS_EXHAUSTED", () => {
+  test("the only vendor exhausted is ALL_VENDORS_EXHAUSTED", () => {
     const config = makeConfig([
       { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
     ]);
@@ -1029,7 +1140,7 @@ describe("quota", () => {
     );
     expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
     expect(failure.message).toBe(
-      "every configured vendor (claude) reports its quota exhausted, and none has a usable quota fallback configured",
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
     );
     expect(failure.rejected).toEqual([
       {
@@ -1037,22 +1148,31 @@ describe("quota", () => {
         model: "claude-opus-4-6",
         stage: "quota",
         reason:
-          "claude reports its quota exhausted and no quota fallback model is configured for it",
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
     ]);
   });
 
-  test("a fallback that fails the capability filter fails the run instead of routing", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-    ]);
+  /**
+   * Quota is asked before capability, and the trace says so. `claude-haiku-5`
+   * here is both drained and unable to read images; only the quota verdict is
+   * recorded, because a model quota has removed is gone and grading it on image
+   * support afterwards would state a verdict about a run that was never going
+   * to happen.
+   */
+  test("a drained model is rejected on quota before its capability is graded", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
     const failure = expectFailure(
       route(
         request("hard", { requires: { imageInput: true } }),
@@ -1070,134 +1190,66 @@ describe("quota", () => {
     );
     expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
     expect(failure.message).toBe(
-      "every configured vendor (claude) reports its quota exhausted, and none has a usable quota fallback configured",
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
     );
-    // The quota lines say a fallback exists and did not work; the capability
-    // line is the only place the trace says *what was wrong with it*. Losing
-    // that entry is losing the answer to "why didn't brigadier use the fallback
-    // I configured?", which is the question this trace is printed for.
+    // Exactly two entries, and no `"capability"` entry among them.
     expect(failure.rejected).toEqual([
       {
         vendor: "claude",
         model: "claude-opus-4-6",
         stage: "quota",
         reason:
-          'claude reports its quota exhausted and its configured fallback "claude-haiku-5" cannot take this slice',
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
       {
         vendor: "claude",
         model: "claude-haiku-5",
         stage: "quota",
         reason:
-          'claude reports its quota exhausted and its configured fallback "claude-haiku-5" cannot take this slice',
-      },
-      {
-        vendor: "claude",
-        model: "claude-haiku-5",
-        stage: "capability",
-        reason:
-          "as claude's configured quota fallback, claude/claude-haiku-5 does not support image input",
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
     ]);
   });
 
-  test("a fallback with no runnable effort fails the run and names the effort stage", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-    ]);
+  /**
+   * The effort clamp is not waived on the salvage path either, and a candidate
+   * with no runnable rung is dropped from the pool rather than carried into it
+   * and skipped later. `claude-haiku-5` is healthy here — only the Opus tier is
+   * drained — so it is an ordinary below-floor salvage candidate, and the empty
+   * `supportedEfforts` list is the only thing standing between it and the slice.
+   *
+   * The consequence has to be a failure, not a routed worker at an effort the
+   * model does not accept. `NO_CAPABLE_MODEL` rather than `ALL_VENDORS_EXHAUSTED`,
+   * because claude still has a healthy model standing and quota is not what
+   * stopped this run.
+   */
+  test("a salvage candidate with no runnable effort is dropped, not routed", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
     const failure = expectFailure(
       route(
         request("hard"),
         input(
           config,
           [capability("claude", "claude-haiku-5", { supportedEfforts: [] })],
-          [snapshot("claude", "exhausted")],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
         ),
       ),
     );
-    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
-    expect(failure.rejected.length).toBe(3);
-    expect(failure.rejected[2]).toEqual({
-      vendor: "claude",
-      model: "claude-haiku-5",
-      stage: "effort",
-      reason:
-        'as claude\'s configured quota fallback, no effort at or below "high" survives its ceiling "high" and its supported efforts (none reported)',
-    });
-  });
-
-  /**
-   * `parseConfig` rejects a `quotaFallbackModel` the vendor does not list, so
-   * this config cannot come out of the parser — but `route` accepts a
-   * `BrigadierConfig` from any caller, and the alternative to a rejection here
-   * is the configured fallback vanishing from the trace with no explanation.
-   * Built as a literal deliberately, which is why it does not use `makeConfig`.
-   */
-  test("a fallback naming a model the vendor does not list is recorded, not skipped", () => {
-    const config: BrigadierConfig = {
-      version: CONFIG_VERSION,
-      secretsConsent: false,
-      vendors: [
-        {
-          vendor: "claude",
-          executable: "/usr/local/bin/claude",
-          version: "1.0.0",
-          defaultModel: "claude-opus-4-6",
-          models: [{ id: "claude-opus-4-6", effortCeiling: "high" }],
-          quotaFallbackModel: "claude-haiku-5",
-        },
-      ],
-    };
-    const failure = expectFailure(
-      route(
-        request("hard"),
-        input(config, [], [snapshot("claude", "exhausted")]),
-      ),
-    );
-    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
-    expect(failure.rejected).toEqual([
-      {
-        vendor: "claude",
-        model: "claude-opus-4-6",
-        stage: "quota",
-        reason:
-          'claude reports its quota exhausted and its configured fallback "claude-haiku-5" cannot take this slice',
-      },
-      {
-        vendor: "claude",
-        model: "claude-haiku-5",
-        stage: "quota",
-        reason:
-          'claude configures "claude-haiku-5" as its quota fallback, but that model is not among its configured models',
-      },
-    ]);
-  });
-
-  test("a healthy vendor below the floor with no fallback anywhere is NO_CAPABLE_MODEL", () => {
-    const config = makeConfig([
-      { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
-      { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
-    ]);
-    const failure = expectFailure(
-      route(
-        request("hard"),
-        input(config, [], [snapshot("claude", "exhausted")]),
-      ),
-    );
-    // codex is healthy and merely too weak for a hard slice, so exhaustion is
-    // not what stopped this run and the failure must not claim that it was.
-    //
-    // This also pins the salvage gate. codex/gpt-5.6-terra is exactly the kind
-    // of below-floor healthy model the waived-floor pool admits — but no
-    // exhausted vendor here configured a fallback, so nothing consented to
-    // degrading and `null` still means "fail" (decision #21).
     expect(failure.reason).toBe("NO_CAPABLE_MODEL");
     expect(failure.message).toBe(
       'no configured model can take slice "slice-1" at hard difficulty; 2 model(s) were eliminated',
@@ -1208,7 +1260,50 @@ describe("quota", () => {
         model: "claude-opus-4-6",
         stage: "quota",
         reason:
-          "claude reports its quota exhausted and no quota fallback model is configured for it",
+          'claude reports its weekly window for the "opus" model tier exhausted, so this model cannot run; claude\'s other configured model(s) are unaffected',
+      },
+      {
+        vendor: "claude",
+        model: "claude-haiku-5",
+        stage: "competence",
+        reason: "competence score 40 is below the hard floor of 90",
+      },
+    ]);
+  });
+
+  /**
+   * Bar (a): without consent, a slice nothing can reach fails rather than
+   * routing. `codex/gpt-5.6-terra` is healthy and scores 70 against a hard floor
+   * of 90 — exactly the candidate the waived-floor pool would admit — and
+   * `allowDegradedRouting` is off, so it is not admitted and the run fails.
+   *
+   * `NO_CAPABLE_MODEL` and not `ALL_VENDORS_EXHAUSTED`: codex is healthy and
+   * merely too weak for the work, so exhaustion is not what stopped this run
+   * and the failure must not claim that it was.
+   */
+  test("a below-floor healthy model is not routed without degraded-routing consent", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
+      { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+    ]);
+    expect(config.allowDegradedRouting).toBe(false);
+    const failure = expectFailure(
+      route(
+        request("hard"),
+        input(config, [], [snapshot("claude", "exhausted")]),
+      ),
+    );
+    expect(failure.reason).toBe("NO_CAPABLE_MODEL");
+    expect(failure.message).toBe(
+      'no configured model can take slice "slice-1" at hard difficulty; 2 model(s) were eliminated',
+    );
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
       {
         vendor: "codex",
@@ -1219,18 +1314,106 @@ describe("quota", () => {
     ]);
   });
 
-  test("a fallback is never consulted while a healthy model can take the slice", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
-    ]);
+  /**
+   * Bar (b): the same machine, the same slice, the flag flipped. One boolean is
+   * the entire difference between the failure above and this routed worker, so
+   * the flag is the gate and nothing else is.
+   */
+  test("the same slice routes below the floor once degraded routing is allowed", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(config, [], [snapshot("claude", "exhausted")]),
+      ),
+    );
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-terra");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    expect(routed.rationale[3]).toBe(
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: codex/gpt-5.6-terra=70; picked codex/gpt-5.6-terra at an actual competence score of 70 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
+    );
+  });
+
+  /**
+   * The waiver is a last resort on a healthy machine too. No quota is drained
+   * here at all: `claude-haiku-5` scores 40 and `gpt-5.6-terra` scores 70,
+   * neither clears the hard floor of 90, and the strongest of them takes the
+   * slice. The flag is not about quota, and this is the case that shows it.
+   */
+  test("degraded routing waives the floor with no quota pressure at all", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-haiku-5", "high"]] },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
+    const routed = expectRouted(route(request("hard"), input(config, [], [])));
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-terra");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    expect(routed.rationale[3]).toBe(
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40, codex/gpt-5.6-terra=70; picked codex/gpt-5.6-terra at an actual competence score of 70 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
+    );
+  });
+
+  /** Equal below-floor scores break on config order, as everywhere else. */
+  test("a salvage tie breaks on config order", () => {
+    const first = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-sonnet-4-5", "high"],
+            ["claude-sonnet-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    expect(expectRouted(route(request("hard"), input(first))).model).toBe(
+      "claude-sonnet-4-5",
+    );
+
+    const swapped = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-sonnet-5", "high"],
+            ["claude-sonnet-4-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    expect(expectRouted(route(request("hard"), input(swapped))).model).toBe(
+      "claude-sonnet-5",
+    );
+  });
+
+  test("degraded routing is not consulted while a healthy model can take the slice", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+        { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard", { requires: { imageInput: true } }),
@@ -1249,21 +1432,23 @@ describe("quota", () => {
     );
     expect(routed.vendor).toBe("codex");
     expect(routed.model).toBe("gpt-5.6-sol");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(false);
   });
 
-  test("an unrunnable fallback changes nothing while a healthy model exists", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
-    ]);
+  test("a model with no runnable effort changes nothing while a healthy model exists", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+        { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+      ],
+      true,
+    );
     const routed = expectRouted(
       route(
         request("hard"),
@@ -1275,10 +1460,10 @@ describe("quota", () => {
       ),
     );
     expect(routed.vendor).toBe("codex");
-    expect(routed.usedQuotaFallback).toBe(false);
+    expect(routed.waivedDifficultyFloor).toBe(false);
   });
 
-  test("every vendor exhausted with no usable fallback is ALL_VENDORS_EXHAUSTED", () => {
+  test("every vendor exhausted is ALL_VENDORS_EXHAUSTED", () => {
     const failure = expectFailure(
       route(
         request("standard"),
@@ -1291,7 +1476,7 @@ describe("quota", () => {
     );
     expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
     expect(failure.message).toBe(
-      "every configured vendor (claude, codex) reports its quota exhausted, and none has a usable quota fallback configured",
+      "every configured vendor (claude, codex) reports its quota exhausted, so no model is left to run this slice",
     );
     expect(failure.rejected.length).toBe(5);
     expect(failure.rejected[4]).toEqual({
@@ -1299,7 +1484,7 @@ describe("quota", () => {
       model: "gpt-5.6-terra",
       stage: "quota",
       reason:
-        "codex reports its quota exhausted and no quota fallback model is configured for it",
+        "codex reports its account-wide quota exhausted, and every model configured for codex reports the same, so codex has nothing left to run this slice",
     });
   });
 
@@ -1325,7 +1510,7 @@ describe("quota", () => {
         model: "claude-opus-4-6",
         stage: "quota",
         reason:
-          "claude reports its quota exhausted and no quota fallback model is configured for it",
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
       {
         vendor: "codex",
@@ -1336,26 +1521,34 @@ describe("quota", () => {
     ]);
   });
 
-  test("two exhausted vendors: the higher-competence fallback takes the slice", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["claude-opus-4-6", "high"],
-          ["claude-haiku-5", "high"],
-        ],
-        fallback: "claude-haiku-5",
-      },
-      {
-        vendor: "codex",
-        models: [
-          ["gpt-5.6-sol", "high"],
-          ["gpt-5.6-terra", "high"],
-        ],
-        fallback: "gpt-5.6-terra",
-      },
-    ]);
-    const routed = expectRouted(
+  /**
+   * Two drained accounts and nothing to salvage, with degraded routing allowed.
+   * Consent moves the difficulty floor and nothing else, so a machine with no
+   * quota anywhere fails the same way it would without consent — and the trace
+   * is exactly one entry per pooled model, with no extra entries for
+   * substitutions that no longer exist.
+   */
+  test("two exhausted vendors salvage nothing, consent or not", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+        {
+          vendor: "codex",
+          models: [
+            ["gpt-5.6-sol", "high"],
+            ["gpt-5.6-terra", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    const failure = expectFailure(
       route(
         request("standard"),
         input(
@@ -1365,57 +1558,96 @@ describe("quota", () => {
         ),
       ),
     );
-    // Salvage, not cost: among two models the user hand-picked as substitutes,
-    // the 70 beats the 40 even though the cost stage would invert that ordering
-    // for any healthy candidate.
-    expect(routed.vendor).toBe("codex");
-    expect(routed.model).toBe("gpt-5.6-terra");
-    expect(routed.usedQuotaFallback).toBe(true);
-    expect(routed.rationale[3]).toBe(
-      'competence: the standard difficulty floor of 60 was WAIVED — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40 (quota-drained), codex/gpt-5.6-terra=70 (quota-drained); picked codex/gpt-5.6-terra at an actual competence score of 70, quota-drained, because it is exhausted vendor codex\'s configured quota fallback (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; a healthy vendor breaks a tie)',
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude, codex) reports its quota exhausted, so no model is left to run this slice",
     );
+    // Four pooled models removed by quota, and nothing after them.
+    expect(failure.rejected.length).toBe(4);
+    expect(failure.rejected[3]).toEqual({
+      vendor: "codex",
+      model: "gpt-5.6-terra",
+      stage: "quota",
+      reason:
+        "codex reports its account-wide quota exhausted, and every model configured for codex reports the same, so codex has nothing left to run this slice",
+    });
   });
 
-  test("a fallback below the floor still wins when it is the highest-scoring one", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [["claude-sonnet-5", "high"]],
-        fallback: "claude-sonnet-5",
-      },
-      {
-        vendor: "codex",
-        models: [["gpt-5.6-terra", "high"]],
-        fallback: "gpt-5.6-terra",
-      },
-    ]);
-    // hard sets floor 90: neither substitute would ever clear it, so the choice
-    // between them is settled by competence alone.
-    const routed = expectRouted(
+  /**
+   * WO-010G's reproduction, kept because the wall it hit is still there.
+   *
+   * One vendor, one account-scoped weekly window reporting `exhausted`, and a
+   * `routine` slice — the easiest work brigadier routes, so nothing but quota
+   * can be what stops it. The router used to answer `claude/claude-sonnet-5`
+   * because a configured fallback named it, sending a worker into a weekly
+   * limit the vendor had already reported. There is no fallback to name any
+   * more, and consent is switched on here to prove the waiver does not reopen
+   * that door: the floor is not what removed Sonnet, quota is.
+   */
+  test("an account-wide weekly limit removes every model, consent included", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-sonnet-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    const failure = expectFailure(
       route(
-        request("hard"),
+        request("routine"),
         input(
           config,
           [],
-          [snapshot("claude", "exhausted"), snapshot("codex", "exhausted")],
+          [
+            metered("claude", "exhausted", [
+              quotaWindow(accountScope(), "exhausted"),
+            ]),
+          ],
         ),
       ),
     );
-    expect(routed.vendor).toBe("claude");
-    expect(routed.model).toBe("claude-sonnet-5");
-    expect(routed.usedQuotaFallback).toBe(true);
-  });
-
-  test("an exhausted vendor with no configured fallback offers no candidate", () => {
-    const config = makeConfig([
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
+    );
+    expect(failure.rejected).toEqual([
       {
         vendor: "claude",
-        models: [["claude-haiku-5", "high"]],
-        fallback: "claude-haiku-5",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide weekly window exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
       },
-      { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide weekly window exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
     ]);
-    const routed = expectRouted(
+  });
+
+  /**
+   * Both vendors are drained, one holding a model far below the floor and the
+   * other a model that would have cleared it. Neither contributes a salvage
+   * candidate, because quota removed both, so the two paths meet at the same
+   * answer and both vendors appear in the message.
+   */
+  test("an exhausted vendor offers no salvage candidate", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-haiku-5", "high"]] },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
+    const failure = expectFailure(
       route(
         request("standard"),
         input(
@@ -1425,9 +1657,26 @@ describe("quota", () => {
         ),
       ),
     );
-    expect(routed.vendor).toBe("claude");
-    expect(routed.model).toBe("claude-haiku-5");
-    expect(routed.usedQuotaFallback).toBe(true);
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude, codex) reports its quota exhausted, so no model is left to run this slice",
+    );
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-haiku-5",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+      {
+        vendor: "codex",
+        model: "gpt-5.6-terra",
+        stage: "quota",
+        reason:
+          "codex reports its account-wide quota exhausted, and every model configured for codex reports the same, so codex has nothing left to run this slice",
+      },
+    ]);
   });
 
   test("the latest snapshot per vendor decides, not array position", () => {
@@ -1476,7 +1725,7 @@ describe("quota", () => {
     expect(reversed.model).toBe("gpt-5.6-terra");
     expect(forward).toEqual(reversed);
     expect(forward.rationale[1]).toBe(
-      "quota: claude=exhausted, codex=no snapshot (treated as available); dropped 3 model(s) from claude (quota exhausted; a configured fallback is a last resort, consulted only if no healthy model can take the slice)",
+      "quota: claude=account-wide exhausted, codex=no snapshot (treated as available); dropped 3 of 5 model(s) — claude/claude-opus-4-6 (claude reports its account-wide quota exhausted), claude/claude-sonnet-5 (claude reports its account-wide quota exhausted), claude/claude-haiku-5 (claude reports its account-wide quota exhausted) (a model quota removed is out for this slice; routing continues over what is left)",
     );
   });
 
@@ -1496,7 +1745,7 @@ describe("quota", () => {
       );
       expect(routed.model).toBe("claude-haiku-5");
       expect(routed.rationale[1]).toBe(
-        "quota: claude=warning (kept in the pool), codex=no snapshot (treated as available)",
+        "quota: claude=account-wide warning (kept in the pool), codex=no snapshot (treated as available)",
       );
     }
 
@@ -1544,6 +1793,512 @@ describe("quota", () => {
   });
 });
 
+/* -------------------- stage 1: quota, scoped per model ------------------- */
+
+/**
+ * WO-010B. WO-010A gave `QuotaWindow` a scope and made `QuotaSnapshot.status`
+ * account-derived, which was right and which left the router reading the wrong
+ * field: with only `snapshot.status` in hand, an Opus-only weekly limit was
+ * invisible and a `hard` slice routed straight into the drained tier.
+ *
+ * Every test here is about which *model* quota removed, not which vendor.
+ */
+describe("per-model quota", () => {
+  /** claude: opus 100 / sonnet 74. Degraded routing is off unless asked for. */
+  function opusAndSonnet(allowDegradedRouting = false) {
+    return makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-sonnet-5", "high"],
+          ],
+        },
+      ],
+      allowDegradedRouting,
+    );
+  }
+
+  /**
+   * The flagship case of WO-010, and the one WO-010H must not regress.
+   *
+   * `claude` is healthy as an account, `claude-opus-4-6` is drained, and
+   * `claude-sonnet-5` is fine. Nothing special happens: Sonnet was never
+   * removed from the pool, so it competes and wins in the ordinary pipeline on
+   * merit, the floor is not waived, and `waivedDifficultyFloor` is false.
+   *
+   * Degraded routing is OFF here, and that is the whole proof. This is the case
+   * `quotaFallbackModel` claimed to exist for — "when claude's quota drains,
+   * fall back to Sonnet" — and it happens with no fallback configured, no
+   * consent given, and no substitution looked up. The field's stated job had
+   * already moved into the pipeline; there was nothing left for it to do.
+   */
+  test("an Opus-only weekly limit routes a standard slice to Sonnet on merit", () => {
+    const config = opusAndSonnet();
+    expect(config.allowDegradedRouting).toBe(false);
+    const routed = expectRouted(
+      route(
+        request("standard"),
+        input(
+          config,
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.vendor).toBe("claude");
+    expect(routed.model).toBe("claude-sonnet-5");
+    expect(routed.effort).toBe("high");
+    // Nothing was degraded and no consent was spent, so the caller is not told
+    // its work ran below the bar. It did not.
+    expect(routed.waivedDifficultyFloor).toBe(false);
+    // The trace names the tier, not the vendor. Telling a user their whole
+    // claude account is spent while Sonnet is sitting there ready is the exact
+    // failure the reshape was done to end.
+    expect(routed.rationale[1]).toBe(
+      'quota: claude=no account-wide limit reported (treated as available); dropped 1 of 2 model(s) — claude/claude-opus-4-6 (claude reports its weekly window for the "opus" model tier exhausted) (a model quota removed is out for this slice; routing continues over what is left)',
+    );
+    expect(routed.rationale[3]).toBe(
+      "competence: standard difficulty sets a floor of 60; eligible claude/claude-sonnet-5=74; picked claude/claude-sonnet-5 — balanced Anthropic tier: well-specified multi-file edits (lowest score clearing the floor wins, so the slice costs no more than it has to)",
+    );
+  });
+
+  /**
+   * The same drained tier at a difficulty Sonnet cannot clear on its own:
+   * Sonnet's 74 against the hard floor of 90 that Opus's 100 would have met.
+   * Before WO-010B this routed to `claude/claude-opus-4-6` — into the wall.
+   *
+   * This one genuinely is a degraded run, so it needs consent and it says so.
+   * The distinction between this test and the one above is the whole reason
+   * `waivedDifficultyFloor` is a better flag than `usedQuotaFallback`: both
+   * slices ran on Sonnet while Opus was drained, and only one of them settled
+   * for less than the work asked for.
+   */
+  test("an Opus-only weekly limit routes a hard slice to Sonnet, not into Opus", () => {
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          opusAndSonnet(true),
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.vendor).toBe("claude");
+    expect(routed.model).toBe("claude-sonnet-5");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    expect(routed.rationale[3]).toBe(
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-sonnet-5=74; picked claude/claude-sonnet-5 at an actual competence score of 74 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
+    );
+  });
+
+  /**
+   * The consent gate survives per-model metering. The same drained Opus tier
+   * without consent fails rather than quietly running the slice under the floor
+   * — decision #21's spirit, carried into the flag that replaced it.
+   */
+  test("a drained tier without degraded-routing consent leaves the floor in place", () => {
+    const failure = expectFailure(
+      route(
+        request("hard"),
+        input(
+          opusAndSonnet(),
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    // Not ALL_VENDORS_EXHAUSTED: claude still has a healthy tier standing, and
+    // the message would be a lie about what stopped the run.
+    expect(failure.reason).toBe("NO_CAPABLE_MODEL");
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          'claude reports its weekly window for the "opus" model tier exhausted, so this model cannot run; claude\'s other configured model(s) are unaffected',
+      },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "competence",
+        reason: "competence score 74 is below the hard floor of 90",
+      },
+    ]);
+  });
+
+  /**
+   * The other direction, so per-model is not read as "model windows only": an
+   * ACCOUNT-scoped exhaustion still takes every model of that vendor with it.
+   */
+  test("an account-scoped exhaustion removes every model of the vendor", () => {
+    const failure = expectFailure(
+      route(
+        request("routine"),
+        input(
+          opusAndSonnet(),
+          [],
+          [
+            metered("claude", "exhausted", [
+              quotaWindow(accountScope(), "exhausted", "rolling"),
+              quotaWindow(tierScope("opus"), "available"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
+    );
+    // Opus's own tier window says `available`; the account window overrules it,
+    // because most-severe wins and an account limit constrains every model.
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide rolling window exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide rolling window exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+    ]);
+  });
+
+  /**
+   * A vendor is exhausted only when EVERY tier it offers is. Two model-scoped
+   * windows covering both configured models add up to the same thing an account
+   * window would have said, and `ALL_VENDORS_EXHAUSTED` must stay true of its
+   * own message when it is returned.
+   */
+  test("every tier drained separately still adds up to an exhausted vendor", () => {
+    const failure = expectFailure(
+      route(
+        request("routine"),
+        input(
+          opusAndSonnet(),
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+              quotaWindow(tierScope("sonnet"), "exhausted", "rolling"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          'claude reports its weekly window for the "opus" model tier exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice',
+      },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "quota",
+        reason:
+          'claude reports its rolling window for the "sonnet" model tier exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice',
+      },
+    ]);
+  });
+
+  /**
+   * Absence of information is not evidence of exhaustion. A snapshot that
+   * reports `unknown` everywhere — no account limit, an Opus window brigadier
+   * cannot read — changes nothing about the routing.
+   */
+  test("unknown windows are treated as available and drop nothing", () => {
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          opusAndSonnet(),
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "unknown"),
+              quotaWindow(accountScope(), "unknown"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.model).toBe("claude-opus-4-6");
+    expect(routed.waivedDifficultyFloor).toBe(false);
+    expect(routed.rationale[1]).toBe(
+      "quota: claude=no account-wide limit reported (treated as available)",
+    );
+  });
+
+  /**
+   * R-11 §2b: Codex hands out opaque bucket codenames. Brigadier refuses to
+   * guess which model `codex_bengalfox` meters, and the honest consequence of
+   * not guessing is a window that constrains nobody — never a window promoted
+   * to account scope, which is the defect the reshape removed.
+   */
+  test("a model-scoped label that matches nothing constrains nobody", () => {
+    const config = makeConfig([
+      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+    ]);
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          config,
+          [],
+          [
+            metered("codex", "unknown", [
+              quotaWindow(tierScope("codex_bengalfox"), "exhausted"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.model).toBe("gpt-5.6-sol");
+    expect(routed.rationale[1]).toBe(
+      "quota: codex=no account-wide limit reported (treated as available)",
+    );
+  });
+
+  /**
+   * The floor under the window reading. `normalizeCodexRateLimits` reports
+   * `status: "exhausted"` from a bare `rateLimitReachedType` when the payload
+   * carried no account-scoped window at all, so a router that read windows
+   * alone would route straight into a refusal the oracle had already seen.
+   */
+  test("an account status with no window behind it still removes every model", () => {
+    const failure = expectFailure(
+      route(
+        request("routine"),
+        input(opusAndSonnet(), [], [metered("claude", "exhausted", [])]),
+      ),
+    );
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+    ]);
+  });
+
+  /**
+   * The equal-timestamp rule, now that "more cautious" is a question asked once
+   * per model. Two readings of the same instant can each be the pessimistic one
+   * for a different tier, so keeping only the single more cautious snapshot
+   * would silently discard the other tier's limit. Both are kept, and the
+   * answer must not depend on which the caller concatenated second.
+   */
+  test("equal timestamps take the most cautious reading of each tier", () => {
+    const opusDrained = metered(
+      "claude",
+      "unknown",
+      [quotaWindow(tierScope("opus"), "exhausted")],
+      1_000,
+    );
+    const sonnetDrained = metered(
+      "claude",
+      "unknown",
+      [quotaWindow(tierScope("sonnet"), "exhausted", "rolling")],
+      1_000,
+    );
+
+    for (const order of [
+      [opusDrained, sonnetDrained],
+      [sonnetDrained, opusDrained],
+    ]) {
+      const failure = expectFailure(
+        route(request("routine"), input(opusAndSonnet(), [], order)),
+      );
+      expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+      expect(failure.rejected).toEqual([
+        {
+          vendor: "claude",
+          model: "claude-opus-4-6",
+          stage: "quota",
+          reason:
+            'claude reports its weekly window for the "opus" model tier exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice',
+        },
+        {
+          vendor: "claude",
+          model: "claude-sonnet-5",
+          stage: "quota",
+          reason:
+            'claude reports its rolling window for the "sonnet" model tier exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice',
+        },
+      ]);
+    }
+  });
+
+  /**
+   * A strictly later reading still wins outright, per tier. Caution settles a
+   * tie; it does not keep a stale limit alive after the window reset.
+   */
+  test("a later reading clears a tier limit an earlier one reported", () => {
+    const drained = metered(
+      "claude",
+      "unknown",
+      [quotaWindow(tierScope("opus"), "exhausted")],
+      1_000,
+    );
+    const recovered = metered(
+      "claude",
+      "unknown",
+      [quotaWindow(tierScope("opus"), "available")],
+      1_001,
+    );
+    const routed = expectRouted(
+      route(request("hard"), input(opusAndSonnet(), [], [recovered, drained])),
+    );
+    expect(routed.model).toBe("claude-opus-4-6");
+    expect(routed.waivedDifficultyFloor).toBe(false);
+  });
+
+  /**
+   * A tier-scoped warning is reported and removes nothing. The line names the
+   * tier, so a user who sees a slice slow down can tell which bucket is close.
+   */
+  test("a tier-scoped warning names the tier and keeps the model", () => {
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          opusAndSonnet(),
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "warning"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.model).toBe("claude-opus-4-6");
+    expect(routed.rationale[2]).toBe(
+      'quota warning: claude/claude-opus-4-6 (claude reports its weekly window for the "opus" model tier warning) — kept in the pool, since a warning says a window is close, not that it is spent',
+    );
+  });
+
+  /**
+   * WO-010G narrowed what disqualifies a salvage candidate to `exhausted` and
+   * nothing else. A `warning` says a window is close, not that it is spent, so a
+   * model carrying one stays in the pool, stays eligible for the waived-floor
+   * salvage pool, and can take the slice.
+   */
+  test("a tier-scoped warning does not disqualify a model from salvage", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-haiku-5", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          config,
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+              quotaWindow(tierScope("haiku"), "warning"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.model).toBe("claude-haiku-5");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    expect(routed.rationale[2]).toBe(
+      'quota warning: claude/claude-haiku-5 (claude reports its weekly window for the "haiku" model tier warning) — kept in the pool, since a warning says a window is close, not that it is spent',
+    );
+    expect(routed.rationale[4]).toBe(
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40; picked claude/claude-haiku-5 at an actual competence score of 40 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
+    );
+  });
+
+  /**
+   * A drained tier on one vendor does not stop a healthy vendor from taking the
+   * slice on merit, and no floor is waived when the ordinary pipeline still
+   * yields something — degraded routing allowed or not.
+   */
+  test("a drained tier never preempts a healthy vendor's model", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["claude-opus-4-6", "high"],
+            ["claude-sonnet-5", "high"],
+          ],
+        },
+        { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+      ],
+      true,
+    );
+    const routed = expectRouted(
+      route(
+        request("hard"),
+        input(
+          config,
+          [],
+          [
+            metered("claude", "unknown", [
+              quotaWindow(tierScope("opus"), "exhausted"),
+            ]),
+          ],
+        ),
+      ),
+    );
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-sol");
+    expect(routed.waivedDifficultyFloor).toBe(false);
+  });
+});
+
 /* ------------------------------ stage 0 + trace -------------------------- */
 
 describe("pool and trace", () => {
@@ -1575,5 +2330,97 @@ describe("pool and trace", () => {
     const first = route(request("hard"), input(twoVendorConfig()));
     const second = route(request("hard"), input(twoVendorConfig()));
     expect(first).toEqual(second);
+  });
+
+  /**
+   * `src/routing/contracts.ts` states purity as a contract — "no subprocess, no
+   * network call, no clock" — and the test above cannot enforce it. Two calls in
+   * the same millisecond agree whatever the body does, so `void Date.now()`,
+   * `readFileSync`, or a `spawnSync` inside `route` all leave it green. It is
+   * kept because a decision that varied between two identical calls would still
+   * be a defect; it is simply not the proof it looked like.
+   *
+   * This one proves half the property structurally: nothing `route` imports can
+   * reach a clock, a filesystem, or a subprocess. The list is pinned as an exact
+   * array rather than a predicate, so adding `node:fs`, `node:child_process`,
+   * `node:perf_hooks`, or a transitively impure sibling module fails here and
+   * has to be argued for in a diff. It follows the shape of the same proof over
+   * `src/plan/validate.ts` in `test/plan.test.ts` — one technique, so a reader
+   * who understands one understands the other.
+   *
+   * Every specifier below is a type-only or pure-data module: two lines from
+   * `../config/contracts.js` (the types and `EFFORT_LADDER`), the frozen root
+   * contracts, the quota reader `modelQuotaStatus`, the competence table, and
+   * the routing vocabulary. None of them imports anything with an effect.
+   */
+  test("the router imports nothing that can reach a clock, a file, or a process", async () => {
+    const source = await Bun.file(
+      new URL("../src/routing/router.ts", import.meta.url),
+    ).text();
+    const importSpecifiers = [
+      ...source.matchAll(/^import(?:[\s\S]*?\sfrom)?\s*["']([^"']+)["'];$/gm),
+    ].map((match) => match[1]);
+
+    expect(importSpecifiers).toEqual([
+      "../config/contracts.js",
+      "../config/contracts.js",
+      "../contracts.js",
+      "../quota/contracts.js",
+      "./competence.js",
+      "./contracts.js",
+    ]);
+  });
+
+  /**
+   * The other half, and the half an import list cannot see: `Date` is a global,
+   * so reading the clock needs no import at all.
+   *
+   * `route` is synchronous and takes every observation it uses as data —
+   * `QuotaSnapshot.observedAtMs` arrives in `RoutingInput` — so a decision must
+   * be a function of its arguments alone. The clock is replaced by a proxy that
+   * counts every read and every construction, moved by thirty years between the
+   * two calls, and both decisions must come back byte-identical with the counter
+   * still at zero.
+   *
+   * The counter is what makes this a real proof rather than another tautology.
+   * Byte-equality alone would still pass for a `route` that read the clock and
+   * ignored the value; a zero read count fails the moment `route` so much as
+   * touches `Date`, which is exactly the mutation the previous test survived.
+   */
+  test("routing reads no clock, so a moving Date cannot change a decision", () => {
+    const realDate = globalThis.Date;
+    let clockReads = 0;
+    let fakeNow = 1_700_000_000_000;
+    const spyDate = new Proxy(realDate, {
+      get(target, property, receiver) {
+        if (property === "now") {
+          return (): number => {
+            clockReads += 1;
+            return fakeNow;
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      construct(target, args) {
+        clockReads += 1;
+        return Reflect.construct(target, args);
+      },
+    });
+
+    let first: RoutingDecision;
+    let second: RoutingDecision;
+    try {
+      globalThis.Date = spyDate;
+      first = route(request("hard"), input(twoVendorConfig()));
+      // Thirty years pass between the two calls.
+      fakeNow = 2_646_000_000_000;
+      second = route(request("hard"), input(twoVendorConfig()));
+    } finally {
+      globalThis.Date = realDate;
+    }
+
+    expect(clockReads).toBe(0);
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+    expect(expectRouted(first).model).toBe("gpt-5.6-sol");
   });
 });
