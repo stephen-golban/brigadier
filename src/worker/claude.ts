@@ -3,15 +3,22 @@ import {
   type ClaudeWorkerSpec,
   createIdleTimeoutMs,
   type LaunchedWorkerOutcome,
-  type QuotaSnapshot,
   type SpawnedWorker,
   type TokenUsage,
   type Worker,
   type WorkerEvent,
   type WorkerFailure,
 } from "../contracts.ts";
+import { normalizeClaudeRateLimitEvent } from "../quota/claude.ts";
 import { readNdjson } from "../shared/ndjson.ts";
+import {
+  collectBoundedText,
+  type DetachedProcess,
+  spawnDetachedProcess,
+  waitForProcessExit,
+} from "../shared/process.ts";
 import { AsyncQueue } from "./async-queue.ts";
+import { type ShutdownProcess, WorkerLifecycle } from "./lifecycle.ts";
 import {
   cancellationFailure,
   classifyHttpFailure,
@@ -26,7 +33,6 @@ import {
   numberValue,
   stringValue,
   successfulOutcome,
-  terminateProcessGroup,
   workerEnvironment,
   writePromptAndClose,
 } from "./shared.ts";
@@ -48,24 +54,27 @@ export class ClaudeWorker implements Worker<"claude"> {
   readonly vendor = "claude" as const;
   readonly processCompletion = "signals-then-must-be-killed" as const;
 
+  constructor(private readonly shutdown?: ShutdownProcess) {}
+
   async spawn(spec: ClaudeWorkerSpec): Promise<SpawnedWorker> {
     createIdleTimeoutMs(spec.idleTimeoutMs);
     const startedAtMs = performance.now();
     const events = new AsyncQueue<WorkerEvent>();
-    let processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">;
+    let processHandle: DetachedProcess;
 
     try {
-      processHandle = Bun.spawn(buildClaudeCommand(spec), {
-        cwd: spec.cwd,
-        detached: true,
-        env: {
-          ...workerEnvironment(spec),
-          CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+      const command = buildClaudeCommand(spec);
+      processHandle = await spawnDetachedProcess(
+        command[0] ?? "claude",
+        command.slice(1),
+        {
+          cwd: spec.cwd,
+          env: {
+            ...workerEnvironment(spec),
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+          },
         },
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      );
     } catch (error) {
       events.close();
       const message = error instanceof Error ? error.message : String(error);
@@ -90,65 +99,37 @@ export class ClaudeWorker implements Worker<"claude"> {
       };
     }
 
-    const completion = Promise.withResolvers<LaunchedWorkerOutcome>();
-    let settled = false;
     let rejectedByQuota = false;
-    let idleTimer: ReturnType<typeof setTimeout>;
-    let totalTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearTimers = (): void => {
-      clearTimeout(idleTimer);
-      if (totalTimer !== undefined) {
-        clearTimeout(totalTimer);
-      }
-    };
-    const settle = (outcome: LaunchedWorkerOutcome): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimers();
-      completion.resolve(outcome);
-    };
-    const cancel = async (
-      reason: Parameters<SpawnedWorker["cancel"]>[0],
-    ): Promise<void> => {
-      if (settled) {
-        return;
-      }
-      terminateProcessGroup(processHandle);
-      settle(
-        failureOutcome(cancellationFailure(reason), startedAtMs, processHandle),
+    let turns = 0;
+    let terminalOutcome: LaunchedWorkerOutcome | null = null;
+    const unexpectedFailureOutcome = (error: unknown): LaunchedWorkerOutcome =>
+      failureOutcome(
+        failure(
+          "UNKNOWN_FAILURE",
+          error instanceof Error ? error.message : String(error),
+          false,
+          null,
+        ),
+        startedAtMs,
+        processHandle,
       );
-    };
-    const resetIdleTimer = (): void => {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        void cancel({
-          kind: "timeout",
-          message: `worker produced no output for ${spec.idleTimeoutMs} ms`,
-        });
-      }, spec.idleTimeoutMs);
-      idleTimer.unref();
-    };
+    const lifecycle = new WorkerLifecycle({
+      processHandle,
+      idleTimeoutMs: spec.idleTimeoutMs,
+      timeoutMs: spec.timeoutMs,
+      cancellationOutcome: (reason) =>
+        failureOutcome(cancellationFailure(reason), startedAtMs, processHandle),
+      unexpectedFailureOutcome,
+      ...(this.shutdown === undefined ? {} : { shutdown: this.shutdown }),
+    });
 
-    idleTimer = setTimeout(() => {}, spec.idleTimeoutMs);
-    resetIdleTimer();
-    if (spec.timeoutMs !== null) {
-      totalTimer = setTimeout(() => {
-        void cancel({
-          kind: "timeout",
-          message: `worker exceeded ${spec.timeoutMs} ms`,
-        });
-      }, spec.timeoutMs);
-      totalTimer.unref();
-    }
-
-    const stderr = new Response(processHandle.stderr).text();
+    const stderr = collectBoundedText(processHandle.stderr, 64 * 1_024).catch(
+      () => "",
+    );
     const reader = (async (): Promise<void> => {
       try {
         for await (const raw of readNdjson(processHandle.stdout, {
-          onActivity: resetIdleTimer,
+          onActivity: lifecycle.resetIdleTimer,
         })) {
           const mapped = mapClaudeEvent(raw);
           for (const event of mapped) {
@@ -157,33 +138,40 @@ export class ClaudeWorker implements Worker<"claude"> {
           if (isQuotaRejection(raw)) {
             rejectedByQuota = true;
           }
+          if (isObject(raw) && raw.type === "assistant") {
+            turns += 1;
+            if (spec.maxTurns !== null && turns > spec.maxTurns) {
+              terminalOutcome = failureOutcome(
+                failure(
+                  "TURN_LIMIT",
+                  `Claude worker exceeded the ${spec.maxTurns}-turn limit`,
+                  false,
+                  null,
+                ),
+                startedAtMs,
+                processHandle,
+              );
+              await lifecycle.finish(terminalOutcome);
+              break;
+            }
+          }
           if (isClaudeResult(raw)) {
             // Claude's result record is the completion signal. Kill the session
             // immediately; waiting for process exit deadlocks on real one-shot runs.
-            terminateProcessGroup(processHandle);
-            settle(
-              claudeOutcome(raw, rejectedByQuota, startedAtMs, processHandle),
+            terminalOutcome = claudeOutcome(
+              raw,
+              rejectedByQuota,
+              startedAtMs,
+              processHandle,
             );
+            await lifecycle.finish(terminalOutcome);
           }
         }
         events.close();
       } catch (error) {
         events.fail(error);
-        if (!settled) {
-          terminateProcessGroup(processHandle);
-          settle(
-            failureOutcome(
-              failure(
-                "UNKNOWN_FAILURE",
-                error instanceof Error ? error.message : String(error),
-                false,
-                null,
-              ),
-              startedAtMs,
-              processHandle,
-            ),
-          );
-        }
+        terminalOutcome = unexpectedFailureOutcome(error);
+        await lifecycle.finish(terminalOutcome);
       }
     })();
 
@@ -191,43 +179,31 @@ export class ClaudeWorker implements Worker<"claude"> {
       try {
         await writePromptAndClose(processHandle.stdin, spec.prompt);
       } catch (error) {
-        if (!settled) {
-          terminateProcessGroup(processHandle);
-          settle(
-            failureOutcome(
-              failure(
-                "UNKNOWN_FAILURE",
-                error instanceof Error ? error.message : String(error),
-                false,
-                null,
-              ),
-              startedAtMs,
-              processHandle,
-            ),
-          );
-        }
+        terminalOutcome = unexpectedFailureOutcome(error);
+        await lifecycle.finish(terminalOutcome);
       }
     })();
 
     void (async () => {
-      const exitCode = await processHandle.exited;
-      await reader;
-      if (!settled) {
-        settle(
+      const exited = await waitForProcessExit(processHandle);
+      await lifecycle.finishWith(async () => {
+        await reader;
+        return (
+          terminalOutcome ??
           failureOutcome(
-            exitFailure("claude", exitCode, await stderr),
+            exitFailure("claude", exited.exitCode, await stderr),
             startedAtMs,
             processHandle,
-          ),
+          )
         );
-      }
+      });
     })();
 
     return {
       pid: processHandle.pid,
       events,
-      completion: completion.promise,
-      cancel,
+      completion: lifecycle.completion,
+      cancel: (reason) => lifecycle.cancel(reason),
     };
   }
 }
@@ -235,6 +211,9 @@ export class ClaudeWorker implements Worker<"claude"> {
 export const claudeWorker: Worker<"claude"> = new ClaudeWorker();
 
 export function buildClaudeCommand(spec: ClaudeWorkerSpec): string[] {
+  if (spec.maxTurns !== null) {
+    validateMaxTurns(spec.maxTurns);
+  }
   const command = [
     "claude",
     "-p",
@@ -253,11 +232,11 @@ export function buildClaudeCommand(spec: ClaudeWorkerSpec): string[] {
   if (spec.maxBudgetUsd !== null) {
     command.push("--max-budget-usd", String(spec.maxBudgetUsd));
   }
-
   command.push("--tools", spec.tools.join(","));
-  const editRules = spec.sandbox.filesystem.editablePaths.map(
-    (path) => `Edit(${path})`,
-  );
+  const editRules =
+    spec.sandbox.filesystem.workspaceAccess === "edit"
+      ? spec.sandbox.filesystem.editablePaths.map((path) => `Edit(${path})`)
+      : [];
   if (editRules.length > 0) {
     command.push("--allowedTools", editRules.join(","));
   }
@@ -314,7 +293,10 @@ function mapClaudeEvent(raw: unknown): WorkerEvent[] {
     ];
   }
   if (raw.type === "rate_limit_event") {
-    return [{ type: "quota", snapshot: claudeQuota(raw), raw }];
+    const snapshot = normalizeClaudeRateLimitEvent(raw, Date.now());
+    return snapshot === null
+      ? [{ type: "other", description: describeRaw(raw), raw }]
+      : [{ type: "quota", snapshot, raw }];
   }
   if (raw.type === "assistant" && isObject(raw.message)) {
     const events: WorkerEvent[] = [];
@@ -385,50 +367,11 @@ function isQuotaRejection(raw: unknown): boolean {
   );
 }
 
-function claudeQuota(raw: Record<string, unknown>): QuotaSnapshot {
-  const info = isObject(raw.rate_limit_info) ? raw.rate_limit_info : {};
-  const vendorStatus = stringValue(info.status);
-  const resetsAt = numberValue(info.resetsAt);
-  const rateLimitType = stringValue(info.rateLimitType);
-  return {
-    vendor: "claude",
-    status:
-      vendorStatus === "rejected"
-        ? "exhausted"
-        : vendorStatus === "allowed_warning"
-          ? "warning"
-          : vendorStatus === "allowed"
-            ? "available"
-            : "unknown",
-    observedAtMs: Date.now(),
-    windows: [
-      {
-        kind:
-          rateLimitType === "five_hour"
-            ? "rolling"
-            : rateLimitType === "seven_day"
-              ? "weekly"
-              : "unknown",
-        durationMinutes:
-          rateLimitType === "five_hour"
-            ? 300
-            : rateLimitType === "seven_day"
-              ? 10_080
-              : null,
-        remainingFraction: null,
-        resetsAtMs: resetsAt === null ? null : resetsAt * 1_000,
-      },
-    ],
-    isUsingOverage:
-      typeof info.isUsingOverage === "boolean" ? info.isUsingOverage : null,
-  };
-}
-
 function claudeOutcome(
   raw: Record<string, unknown>,
   rejectedByQuota: boolean,
   startedAtMs: number,
-  processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">,
+  processHandle: DetachedProcess,
 ): LaunchedWorkerOutcome {
   const output = stringValue(raw.result) ?? "";
   const usage = claudeUsage(raw);
@@ -450,6 +393,12 @@ function claudeOutcome(
     ...common,
     failure: classifyClaudeFailure(raw, rejectedByQuota, output),
   };
+}
+
+function validateMaxTurns(maxTurns: number): void {
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
+    throw new RangeError("maxTurns must be null or a positive whole number");
+  }
 }
 
 function classifyClaudeFailure(

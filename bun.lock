@@ -14,7 +14,6 @@
         "@stephen-golban/brigadier-darwin-x64": "0.0.0",
         "@stephen-golban/brigadier-linux-arm64": "0.0.0",
         "@stephen-golban/brigadier-linux-x64": "0.0.0",
-        "@stephen-golban/brigadier-win32-x64": "0.0.0",
       },
     },
   },

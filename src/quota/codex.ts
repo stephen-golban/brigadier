@@ -1,5 +1,12 @@
 import type { QuotaSnapshot, QuotaWindow } from "../contracts.js";
 import { consumeNdjson } from "../shared/ndjson.js";
+import {
+  collectBoundedText,
+  type DetachedProcess,
+  shutdownProcessGroup,
+  spawnDetachedProcess,
+  writeToProcess,
+} from "../shared/process.js";
 import type { CodexQuotaOracle as CodexQuotaOracleContract } from "./contracts.js";
 
 type JsonObject = Record<string, unknown>;
@@ -7,27 +14,36 @@ type JsonObject = Record<string, unknown>;
 interface PendingRequest {
   readonly resolve: (response: JsonObject) => void;
   readonly reject: (error: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
 }
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const MAX_STDERR_BYTES = 64 * 1_024;
 
 export interface CodexQuotaOracleOptions {
   readonly executable?: string;
   readonly cwd?: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly now?: () => number;
+  readonly requestTimeoutMs?: number;
 }
 
-function spawnAppServer(options: CodexQuotaOracleOptions) {
-  return Bun.spawn([options.executable ?? "codex", "app-server", "--stdio"], {
-    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    detached: true,
-    ...(options.environment === undefined ? {} : { env: options.environment }),
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+function spawnAppServer(
+  options: CodexQuotaOracleOptions,
+): Promise<DetachedProcess> {
+  return spawnDetachedProcess(
+    options.executable ?? "codex",
+    ["app-server", "--stdio"],
+    {
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.environment === undefined
+        ? {}
+        : { env: { ...options.environment } }),
+    },
+  );
 }
 
-type AppServerProcess = ReturnType<typeof spawnAppServer>;
+type AppServerProcess = DetachedProcess;
 
 /** One long-lived Codex JSON-RPC app-server quota source. */
 export class CodexQuotaOracle implements CodexQuotaOracleContract {
@@ -37,8 +53,11 @@ export class CodexQuotaOracle implements CodexQuotaOracleContract {
   private readonly pending = new Map<number, PendingRequest>();
   private nextRequestId = 1;
   private processHandle: AppServerProcess | null = null;
+  private processStartTask: Promise<AppServerProcess> | null = null;
   private readerTask: Promise<void> | null = null;
   private stderrTask: Promise<string> | null = null;
+  private shutdownTask: Promise<void> | null = null;
+  private permanentFailure: Error | null = null;
   private disposed = false;
   private disposeTask: Promise<void> | null = null;
 
@@ -78,57 +97,93 @@ export class CodexQuotaOracle implements CodexQuotaOracleContract {
   }
 
   private async request(method: string): Promise<JsonObject> {
-    const processHandle = this.ensureProcess();
+    if (this.permanentFailure !== null) {
+      throw this.permanentFailure;
+    }
+    const processHandle = await this.ensureProcess();
     const id = this.nextRequestId++;
+    const timeoutMs = requestTimeoutMs(this.options.requestTimeoutMs);
     const response = new Promise<JsonObject>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.failProcess(
+          new Error(`Codex quota request timed out after ${timeoutMs} ms`),
+          processHandle,
+        );
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
     });
 
-    try {
-      processHandle.stdin.write(
-        `${JSON.stringify({ jsonrpc: "2.0", id, method })}\n`,
+    void writeToProcess(
+      processHandle.stdin,
+      `${JSON.stringify({ jsonrpc: "2.0", id, method })}\n`,
+    ).catch((error: unknown) => {
+      this.failProcess(
+        new Error("Failed to write to Codex quota app-server", {
+          cause: error,
+        }),
+        processHandle,
       );
-      processHandle.stdin.flush();
-    } catch (error) {
-      this.pending.delete(id);
-      throw new Error("Failed to write to Codex quota app-server", {
-        cause: error,
-      });
-    }
+    });
     return response;
   }
 
-  private ensureProcess(): AppServerProcess {
+  private async ensureProcess(): Promise<AppServerProcess> {
     if (this.processHandle !== null) {
       return this.processHandle;
+    }
+    if (this.processStartTask !== null) {
+      return this.processStartTask;
     }
     if (this.disposed) {
       throw new Error("Codex quota oracle is disposed");
     }
+    if (this.permanentFailure !== null) {
+      throw this.permanentFailure;
+    }
 
-    const processHandle = spawnAppServer(this.options);
-    this.processHandle = processHandle;
-    this.stderrTask = new Response(processHandle.stderr).text();
-    this.readerTask = consumeNdjson(
-      processHandle.stdout,
-      (record) => {
-        this.receive(record);
-      },
-      {
-        parseErrorContext: "Codex app-server emitted invalid JSON",
-        validate: requireJsonObject,
-      },
-    ).then(
-      () => {
-        this.rejectPending(new Error("Codex quota app-server closed stdout"));
-      },
-      (error: unknown) => {
-        this.rejectPending(
-          asError(error, "Codex quota response reader failed"),
+    this.processStartTask = spawnAppServer(this.options).then(
+      async (processHandle) => {
+        if (this.disposed) {
+          this.processHandle = processHandle;
+          await this.beginShutdown(processHandle);
+          throw new Error("Codex quota oracle is disposed");
+        }
+        this.processHandle = processHandle;
+        this.stderrTask = collectBoundedText(
+          processHandle.stderr,
+          MAX_STDERR_BYTES,
+        ).catch(() => "");
+        this.readerTask = consumeNdjson(
+          processHandle.stdout,
+          (record) => {
+            this.receive(record);
+          },
+          {
+            parseErrorContext: "Codex app-server emitted invalid JSON",
+            validate: requireJsonObject,
+          },
+        ).then(
+          () => {
+            this.failProcess(
+              new Error("Codex quota app-server closed stdout"),
+              processHandle,
+            );
+          },
+          (error: unknown) => {
+            this.failProcess(
+              asError(error, "Codex quota response reader failed"),
+              processHandle,
+            );
+          },
         );
+        return processHandle;
       },
     );
-    return processHandle;
+    try {
+      return await this.processStartTask;
+    } finally {
+      this.processStartTask = null;
+    }
   }
 
   private receive(response: JsonObject): void {
@@ -141,28 +196,53 @@ export class CodexQuotaOracle implements CodexQuotaOracleContract {
       return;
     }
     this.pending.delete(id);
+    clearTimeout(request.timer);
     request.resolve(response);
   }
 
   private rejectPending(error: Error): void {
     for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
       request.reject(error);
     }
     this.pending.clear();
   }
 
   private async disposeOwnedProcess(): Promise<void> {
-    const processHandle = this.processHandle;
+    const startedProcess = await this.processStartTask?.catch(() => null);
+    const processHandle = this.processHandle ?? startedProcess ?? null;
     if (processHandle === null) {
+      if (this.shutdownTask !== null) {
+        await this.shutdownTask;
+      }
       return;
     }
 
     this.rejectPending(new Error("Codex quota oracle was disposed"));
     processHandle.stdin.end();
-    signalProcessGroup(processHandle.pid, "SIGTERM");
-    await processHandle.exited;
-    await this.readerTask;
-    await this.stderrTask;
+    await this.beginShutdown(processHandle);
+    processHandle.stdin.destroy();
+    processHandle.stdout.destroy();
+    processHandle.stderr.destroy();
+    await Promise.all([
+      settleTask(this.readerTask),
+      settleTask(this.stderrTask),
+    ]);
+  }
+
+  private failProcess(error: Error, processHandle: AppServerProcess): void {
+    if (this.processHandle !== processHandle || this.disposed) {
+      return;
+    }
+    this.permanentFailure ??= error;
+    this.rejectPending(this.permanentFailure);
+    processHandle.stdin.end();
+    void this.beginShutdown(processHandle).catch(() => {});
+  }
+
+  private beginShutdown(processHandle: AppServerProcess): Promise<void> {
+    this.shutdownTask ??= shutdownProcessGroup(processHandle.pid);
+    return this.shutdownTask;
   }
 }
 
@@ -288,17 +368,31 @@ function describeRpcError(value: unknown): string {
   }`;
 }
 
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal);
-  } catch (error) {
-    const code = asObject(error)?.code;
-    if (code !== "ESRCH") {
-      throw error;
-    }
-  }
-}
-
 function asError(value: unknown, fallback: string): Error {
   return value instanceof Error ? value : new Error(fallback, { cause: value });
+}
+
+function requestTimeoutMs(configured: number | undefined): number {
+  const timeoutMs = configured ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new RangeError("requestTimeoutMs must be a positive whole number");
+  }
+  return timeoutMs;
+}
+
+async function settleTask(task: Promise<unknown> | null): Promise<void> {
+  if (task === null) {
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      task.catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 100);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

@@ -86,6 +86,10 @@ describe("shared NDJSON splitter", () => {
       collect(readNdjson(streamFromChunks([new Uint8Array([0xff, 0x0a])]))),
     ).rejects.toThrow();
   });
+
+  test("ignores whitespace-only content at EOF", async () => {
+    expect(await collect(readNdjson(streamFromText(" \t\r")))).toEqual([]);
+  });
 });
 
 type JsonObject = Record<string, unknown>;

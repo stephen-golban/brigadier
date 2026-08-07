@@ -9,7 +9,10 @@ export interface LinkedSecretsPolicy {
   readonly linkedPaths: readonly string[];
   /** Separate, explicit consent to make the files visible in worker worktrees. */
   readonly consentToLink?: boolean;
-  /** Additional exact values to redact in addition to values parsed from linked files. */
+  /**
+   * Additional exact values to redact. Use this for formats the best-effort
+   * raw/dotenv/JSON/YAML inventory cannot interpret reliably.
+   */
   readonly redactionValues?: readonly string[];
 }
 
@@ -40,7 +43,11 @@ export interface WorktreeSpec {
   readonly slice: number;
   /** Required for isolated worktrees and ignored for unsafe in-place work. */
   readonly path?: string;
-  /** Leaves the user's checkout in place and commits through a temporary index. */
+  /**
+   * Uses the source checkout directly. This exposes every file already visible
+   * there, including dependencies and linked-secret files, regardless of the
+   * isolated-worktree consent/seeding policy.
+   */
   readonly unsafeInPlace?: boolean;
 }
 
@@ -94,8 +101,10 @@ export interface WorktreeEngineOptions {
  * Git-backed isolation and integration. Implementations never push and only
  * write commits to the `brigadier/<slug>/**` refs they create.
  *
- * Redaction replaces exact, verbatim secret values. It cannot detect encoded,
- * transformed, truncated, or otherwise derived versions of a secret.
+ * Redaction replaces inventoried exact, verbatim secret values. Inventory is
+ * best-effort; it cannot detect encoded, transformed, truncated, derived, or
+ * values hidden in unsupported file syntax. Supply explicit redactionValues
+ * for values that cannot be inventoried reliably.
  */
 export interface WorktreeEngine {
   prepare(spec: WorktreeSessionSpec): Promise<WorktreeSession>;

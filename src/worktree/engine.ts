@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import {
+  cp,
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -10,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
+  delimiter,
   dirname,
   isAbsolute,
   join,
@@ -18,6 +21,8 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type {
   CommitResult,
   CommitSpec,
@@ -34,6 +39,8 @@ import type {
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
 const REDACTION_MARKER = "[REDACTED]";
+const LFS_UNSUPPORTED_MESSAGE =
+  "Git LFS is unsupported: remove filter=lfs attributes and unset filter.lfs.clean before using Brigadier";
 
 interface GitResult {
   readonly exitCode: number;
@@ -54,7 +61,8 @@ interface SessionState {
   readonly dependencyPaths: readonly string[];
   readonly linkedSecretPaths: readonly string[];
   readonly consentToLinkSecrets: boolean;
-  readonly redactionValues: readonly string[];
+  readonly explicitRedactionValues: readonly string[];
+  redactionValues: readonly string[];
   readonly sliceHeads: Map<string, string>;
   readonly activeWorktrees: Set<CreatedWorktree>;
   integrationMaterialized: boolean;
@@ -134,8 +142,10 @@ export class GitWorktreeEngine implements WorktreeEngine {
       spec.secrets.linkedPaths,
       "linked secret",
     );
-    const overlap = dependencyPaths.filter((path) =>
-      linkedSecretPaths.includes(path),
+    const overlap = await findOverlappingPaths(
+      repositoryPath,
+      dependencyPaths,
+      linkedSecretPaths,
     );
     if (overlap.length > 0) {
       throw new Error(
@@ -143,10 +153,15 @@ export class GitWorktreeEngine implements WorktreeEngine {
       );
     }
 
+    const explicitRedactionValues = Object.freeze(
+      [...(spec.secrets.redactionValues ?? [])].filter(
+        (value) => value.length > 0,
+      ),
+    );
     const redactionValues = await collectRedactionValues(
       repositoryPath,
       linkedSecretPaths,
-      spec.secrets.redactionValues ?? [],
+      explicitRedactionValues,
     );
     const baseRef = spec.baseRef ?? "HEAD";
     const head = await this.#revParse(
@@ -180,41 +195,12 @@ export class GitWorktreeEngine implements WorktreeEngine {
       );
     }
 
-    const tree = await this.#withTemporaryIndex(async (indexPath) => {
-      const env = { GIT_INDEX_FILE: indexPath };
-      await this.#git(["read-tree", head], {
-        cwd: repositoryPath,
-        env,
-        redactionValues,
-      });
-      await this.#git(["add", "-A", "--", "."], {
-        cwd: repositoryPath,
-        env,
-        redactionValues,
-      });
-      const indexedPaths = splitNul(
-        (
-          await this.#git(["ls-files", "-z"], {
-            cwd: repositoryPath,
-            env,
-            redactionValues,
-          })
-        ).stdout,
-      );
-      this.#refuseLinkedSecrets(indexedPaths, linkedSecretPaths);
-      await this.#redactIndexBlobs(
-        repositoryPath,
-        env,
-        indexedPaths,
-        redactionValues,
-      );
-      const result = await this.#git(["write-tree"], {
-        cwd: repositoryPath,
-        env,
-        redactionValues,
-      });
-      return result.stdout.toString("utf8").trim();
-    });
+    const tree = await this.#stageSanitizedTree(
+      repositoryPath,
+      head,
+      redactionValues,
+      linkedSecretPaths,
+    );
 
     const message = redactText(
       `brigadier: capture ${spec.slug} base`,
@@ -245,6 +231,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       dependencyPaths,
       linkedSecretPaths,
       consentToLinkSecrets: spec.secrets.consentToLink === true,
+      explicitRedactionValues,
       redactionValues,
       sliceHeads: new Map(),
       activeWorktrees: new Set(),
@@ -258,6 +245,18 @@ export class GitWorktreeEngine implements WorktreeEngine {
     if (!Number.isSafeInteger(spec.slice) || spec.slice <= 0) {
       throw new RangeError("slice must be a positive whole number");
     }
+    await this.#refreshRedactionValues(sessionState);
+    const unsafeInPlace = spec.unsafeInPlace === true;
+    const worktreePath = unsafeInPlace
+      ? spec.session.repositoryPath
+      : resolveRequiredWorktreePath(spec.path, spec.session.repositoryPath);
+    if (!unsafeInPlace) {
+      await assertAvailableWorktreePath(
+        worktreePath,
+        sessionState.redactionValues,
+      );
+    }
+
     const branch = `brigadier/${spec.session.slug}/slice-${spec.slice}`;
     const branchRef = `refs/heads/${branch}`;
     await this.#assertBranchDoesNotExist(
@@ -274,10 +273,6 @@ export class GitWorktreeEngine implements WorktreeEngine {
       },
     );
 
-    const unsafeInPlace = spec.unsafeInPlace === true;
-    const worktreePath = unsafeInPlace
-      ? spec.session.repositoryPath
-      : resolveRequiredWorktreePath(spec.path, spec.session.repositoryPath);
     try {
       if (!unsafeInPlace) {
         await this.#git(["worktree", "add", "--quiet", worktreePath, branch], {
@@ -287,18 +282,21 @@ export class GitWorktreeEngine implements WorktreeEngine {
         await this.#seedWorktree(sessionState, worktreePath);
       }
     } catch (error) {
-      if (!unsafeInPlace) {
-        await this.#discardWorktree(
-          spec.session.repositoryPath,
-          worktreePath,
-          sessionState,
-        );
+      try {
+        if (!unsafeInPlace) {
+          await this.#discardWorktree(
+            spec.session.repositoryPath,
+            worktreePath,
+            sessionState,
+          );
+        }
+      } finally {
+        await this.#git(["update-ref", "-d", branchRef], {
+          cwd: spec.session.repositoryPath,
+          redactionValues: sessionState.redactionValues,
+          allowedExitCodes: [0, 1],
+        });
       }
-      await this.#git(["update-ref", "-d", branchRef], {
-        cwd: spec.session.repositoryPath,
-        redactionValues: sessionState.redactionValues,
-        allowedExitCodes: [0, 1],
-      });
       throw error;
     }
 
@@ -317,6 +315,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
   async commit(spec: CommitSpec): Promise<CommitResult> {
     const state = this.#worktreeState(spec.worktree);
+    await this.#refreshRedactionValues(state.sessionState);
     const { redactionValues, linkedSecretPaths } = state.sessionState;
     if (state.sessionState.integrationMaterialized) {
       throw new Error("slice commits are closed after integration begins");
@@ -354,40 +353,13 @@ export class GitWorktreeEngine implements WorktreeEngine {
       this.#refuseLinkedSecrets(stagedPaths, linkedSecretPaths);
     }
 
-    const result = await this.#withTemporaryIndex(async (indexPath) => {
-      const env = { GIT_INDEX_FILE: indexPath };
-      await this.#git(["read-tree", parent], {
-        cwd: spec.worktree.path,
-        env,
-        redactionValues,
-      });
-      await this.#git(["add", "-A", "--", "."], {
-        cwd: spec.worktree.path,
-        env,
-        redactionValues,
-      });
-      const changedPaths = await this.#changedPaths(
+    const result = await (async () => {
+      const tree = await this.#stageSanitizedTree(
         spec.worktree.path,
         parent,
-        env,
         redactionValues,
+        linkedSecretPaths,
       );
-      this.#refuseLinkedSecrets(changedPaths, linkedSecretPaths);
-      await this.#redactIndexBlobs(
-        spec.worktree.path,
-        env,
-        changedPaths,
-        redactionValues,
-      );
-      const tree = (
-        await this.#git(["write-tree"], {
-          cwd: spec.worktree.path,
-          env,
-          redactionValues,
-        })
-      ).stdout
-        .toString("utf8")
-        .trim();
       const parentTree = await this.#revParse(
         spec.worktree.repositoryPath,
         `${parent}^{tree}`,
@@ -410,7 +382,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       });
       state.sessionState.sliceHeads.set(spec.worktree.branch, commit);
       return { commit, message };
-    });
+    })();
 
     if (spec.worktree.isolated) {
       await this.#git(["reset", "--mixed", "--quiet", result.commit], {
@@ -423,6 +395,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
   async merge(spec: MergeSpec): Promise<MergeResult> {
     const state = this.#worktreeState(spec.worktree);
+    await this.#refreshRedactionValues(state.sessionState);
     const { session, redactionValues } = state.sessionState;
     const repositoryPath = session.repositoryPath;
     const integrationRef = `refs/heads/${session.integrationBranch}`;
@@ -490,11 +463,14 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
   redact(worktree: CreatedWorktree, artifact: string): string {
     const state = this.#worktreeState(worktree);
+    // This synchronous API uses the inventory refreshed by the latest async
+    // operation. commit(), where persistence happens, always re-reads files.
     return redactText(artifact, state.sessionState.redactionValues);
   }
 
   async remove(worktree: CreatedWorktree): Promise<void> {
     const state = this.#worktreeState(worktree);
+    await this.#refreshRedactionValues(state.sessionState);
     if (worktree.isolated) {
       await this.#discardWorktree(
         worktree.repositoryPath,
@@ -662,59 +638,210 @@ export class GitWorktreeEngine implements WorktreeEngine {
     }
   }
 
-  async #redactIndexBlobs(
+  async #stageSanitizedTree(
     cwd: string,
-    env: Readonly<Record<string, string>>,
-    paths: readonly string[],
+    parent: string,
+    redactionValues: readonly string[],
+    linkedSecretPaths: readonly string[],
+  ): Promise<string> {
+    await this.#assertLfsIsNotEnabled(cwd, redactionValues);
+    return await this.#withTemporaryStagingStore(
+      cwd,
+      redactionValues,
+      async ({ scratchEnv, realEnv }) => {
+        // Git owns worktree conversion, modes, and gitlinks. Git objects are
+        // quarantined here; side-storage filters such as Git LFS are refused.
+        await this.#git(["read-tree", parent], {
+          cwd,
+          env: scratchEnv,
+          redactionValues,
+        });
+        await this.#git(["add", "-A", "--", "."], {
+          cwd,
+          env: scratchEnv,
+          redactionValues,
+        });
+        const changedPaths = await this.#changedPaths(
+          cwd,
+          parent,
+          scratchEnv,
+          redactionValues,
+        );
+        this.#refuseLinkedSecrets(changedPaths, linkedSecretPaths);
+
+        const entries = parseStageEntries(
+          (
+            await this.#git(["ls-files", "--stage", "-z"], {
+              cwd,
+              env: scratchEnv,
+              redactionValues,
+            })
+          ).stdout,
+        );
+        const destinations = new Map<string, string>();
+        for (const path of entries.keys()) {
+          const destination = redactText(path, redactionValues);
+          const existing = destinations.get(destination);
+          if (existing !== undefined && existing !== path) {
+            throw new Error(
+              `redaction makes multiple repository paths collide at ${destination}`,
+            );
+          }
+          destinations.set(destination, path);
+        }
+
+        for (const [path, entry] of entries) {
+          const destination = redactText(path, redactionValues);
+          // Gitlinks carry an object id but no superproject blob content.
+          const objectId =
+            entry.mode === "160000"
+              ? entry.objectId
+              : await promoteGitBlob(
+                  entry.objectId,
+                  cwd,
+                  scratchEnv,
+                  realEnv,
+                  redactionValues,
+                  this.#commandTimeoutMs,
+                );
+          if (destination !== path) {
+            await this.#git(["update-index", "--force-remove", "--", path], {
+              cwd,
+              env: scratchEnv,
+              redactionValues,
+            });
+          }
+          if (objectId !== entry.objectId || destination !== path) {
+            await this.#git(
+              [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                entry.mode,
+                objectId,
+                destination,
+              ],
+              { cwd, env: scratchEnv, redactionValues },
+            );
+          }
+        }
+
+        // Every blob now exists in the real ODB and every path is sanitized,
+        // so tree creation can safely target the real store.
+        const result = await this.#git(["write-tree"], {
+          cwd,
+          env: realEnv,
+          redactionValues,
+        });
+        return result.stdout.toString("utf8").trim();
+      },
+    );
+  }
+
+  async #withTemporaryStagingStore<T>(
+    cwd: string,
+    redactionValues: readonly string[],
+    operation: (store: {
+      readonly scratchEnv: Readonly<Record<string, string>>;
+      readonly realEnv: Readonly<Record<string, string>>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    const commonDirectoryPath = (
+      await this.#git(["rev-parse", "--git-common-dir"], {
+        cwd,
+        redactionValues,
+      })
+    ).stdout
+      .toString("utf8")
+      .trim();
+    const commonDirectory = await realpath(resolve(cwd, commonDirectoryPath));
+    const realObjectDirectory = await realpath(
+      join(commonDirectory, "objects"),
+    );
+    const directory = await mkdtemp(join(tmpdir(), "brigadier-staging-"));
+    const scratchObjectDirectory = join(directory, "objects");
+    const indexPath = join(directory, "index");
+    try {
+      await mkdir(scratchObjectDirectory);
+      return await operation({
+        scratchEnv: {
+          GIT_INDEX_FILE: indexPath,
+          GIT_OBJECT_DIRECTORY: scratchObjectDirectory,
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: [
+            realObjectDirectory,
+            process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES,
+          ]
+            .filter(
+              (path): path is string => path !== undefined && path.length > 0,
+            )
+            .join(delimiter),
+        },
+        realEnv: {
+          GIT_INDEX_FILE: indexPath,
+          GIT_OBJECT_DIRECTORY: realObjectDirectory,
+        },
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  async #refreshRedactionValues(state: SessionState): Promise<void> {
+    const current = await collectRedactionValues(
+      state.session.repositoryPath,
+      state.linkedSecretPaths,
+      state.explicitRedactionValues,
+    );
+    // Retain previously observed values after rotation: old values can remain
+    // in worker output even after the source secret file has changed.
+    state.redactionValues = normalizeRedactionValues([
+      ...state.redactionValues,
+      ...current,
+    ]);
+  }
+
+  async #assertLfsIsNotEnabled(
+    cwd: string,
     redactionValues: readonly string[],
   ): Promise<void> {
-    if (redactionValues.length === 0) {
-      return;
+    const configuredCleanFilter = await this.#git(
+      ["config", "--get-all", "filter.lfs.clean"],
+      { cwd, redactionValues, allowedExitCodes: [0, 1] },
+    );
+    if (configuredCleanFilter.exitCode === 0) {
+      throw new Error(LFS_UNSUPPORTED_MESSAGE);
     }
-    for (const path of paths) {
-      const entry = await this.#git(["ls-files", "--stage", "-z", "--", path], {
-        cwd,
-        env,
-        redactionValues,
-      });
-      const match = /^(\d+) ([0-9a-f]+) 0\t/.exec(
-        entry.stdout.toString("utf8"),
-      );
-      if (match?.[1] === undefined || match[2] === undefined) {
-        continue;
+
+    const attributeFiles = splitNul(
+      (
+        await this.#git(
+          [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".gitattributes",
+            ":(glob)**/.gitattributes",
+          ],
+          { cwd, redactionValues },
+        )
+      ).stdout,
+    );
+    for (const path of attributeFiles) {
+      let contents: string;
+      try {
+        contents = await readFile(resolve(cwd, path), "utf8");
+      } catch (error) {
+        if (isMissingFileError(error)) {
+          continue;
+        }
+        throw error;
       }
-      if (!match[1].startsWith("100") && match[1] !== "120000") {
-        continue;
+      if (declaresLfsFilter(contents)) {
+        throw new Error(LFS_UNSUPPORTED_MESSAGE);
       }
-      const original = (
-        await this.#git(["cat-file", "blob", match[2]], {
-          cwd,
-          env,
-          redactionValues,
-        })
-      ).stdout;
-      const redacted = redactBuffer(original, redactionValues);
-      if (redacted.equals(original)) {
-        continue;
-      }
-      const objectId = (
-        await this.#git(["hash-object", "-w", "--stdin"], {
-          cwd,
-          env,
-          input: redacted,
-          redactionValues,
-        })
-      ).stdout
-        .toString("utf8")
-        .trim();
-      await this.#git(
-        ["update-index", "--cacheinfo", match[1], objectId, path],
-        {
-          cwd,
-          env,
-          redactionValues,
-        },
-      );
     }
   }
 
@@ -755,17 +882,27 @@ export class GitWorktreeEngine implements WorktreeEngine {
     worktreePath: string,
   ): Promise<void> {
     for (const path of state.dependencyPaths) {
-      await seedDependency(
-        state.session.repositoryPath,
-        worktreePath,
-        path,
-        this.#commandTimeoutMs,
-      );
+      await this.#revalidateLinkedSecretConsent(state);
+      await seedDependency(state.session.repositoryPath, worktreePath, path);
     }
     if (state.consentToLinkSecrets) {
       for (const path of state.linkedSecretPaths) {
+        await this.#revalidateLinkedSecretConsent(state);
         await seedSymlink(state.session.repositoryPath, worktreePath, path);
       }
+    }
+  }
+
+  async #revalidateLinkedSecretConsent(state: SessionState): Promise<void> {
+    const overlap = await findOverlappingPaths(
+      state.session.repositoryPath,
+      state.dependencyPaths,
+      state.linkedSecretPaths,
+    );
+    if (overlap.length > 0) {
+      throw new Error(
+        `paths cannot be both dependencies and linked secrets: ${overlap.join(", ")}`,
+      );
     }
   }
 
@@ -774,27 +911,36 @@ export class GitWorktreeEngine implements WorktreeEngine {
     worktreePath: string,
     state: SessionState,
   ): Promise<void> {
+    const registeredPaths = await this.#registeredWorktreePaths(
+      repositoryPath,
+      state.redactionValues,
+    );
+    if (!registeredPaths.includes(worktreePath)) {
+      return;
+    }
     await this.#git(["worktree", "remove", "--force", worktreePath], {
       cwd: repositoryPath,
       redactionValues: state.redactionValues,
-      allowedExitCodes: [0, 128],
     });
-    await rm(worktreePath, { recursive: true, force: true });
     await this.#git(["worktree", "prune", "--expire", "now"], {
       cwd: repositoryPath,
       redactionValues: state.redactionValues,
     });
   }
 
-  async #withTemporaryIndex<T>(
-    operation: (indexPath: string) => Promise<T>,
-  ): Promise<T> {
-    const directory = await mkdtemp(join(tmpdir(), "brigadier-index-"));
-    try {
-      return await operation(join(directory, "index"));
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
+  async #registeredWorktreePaths(
+    repositoryPath: string,
+    redactionValues: readonly string[],
+  ): Promise<readonly string[]> {
+    const result = await this.#git(["worktree", "list", "--porcelain"], {
+      cwd: repositoryPath,
+      redactionValues,
+    });
+    return result.stdout
+      .toString("utf8")
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length));
   }
 
   async #git(args: readonly string[], options: GitOptions): Promise<GitResult> {
@@ -807,22 +953,221 @@ export class GitWorktreeEngine implements WorktreeEngine {
   }
 }
 
+async function promoteGitBlob(
+  objectId: string,
+  cwd: string,
+  sourceEnv: Readonly<Record<string, string>>,
+  destinationEnv: Readonly<Record<string, string>>,
+  redactionValues: readonly string[],
+  timeoutMs: number,
+): Promise<string> {
+  const source = spawn("git", ["cat-file", "blob", objectId], {
+    cwd,
+    detached: true,
+    env: gitEnvironment(sourceEnv),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const destination = spawn("git", ["hash-object", "-w", "--stdin"], {
+    cwd,
+    detached: true,
+    env: gitEnvironment(destinationEnv),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  source.stdin.end();
+
+  const sourceError: Buffer[] = [];
+  const destinationOutput: Buffer[] = [];
+  const destinationError: Buffer[] = [];
+  let diagnosticBytes = 0;
+  let outputExceeded = false;
+  let timedOut = false;
+  const kill = () => {
+    killProcess(source);
+    killProcess(destination);
+  };
+  const collect = (target: Buffer[], chunk: Buffer) => {
+    diagnosticBytes += chunk.length;
+    if (diagnosticBytes > MAX_COMMAND_OUTPUT_BYTES) {
+      outputExceeded = true;
+      kill();
+      return;
+    }
+    target.push(chunk);
+  };
+  source.stderr.on("data", (chunk: Buffer) => collect(sourceError, chunk));
+  destination.stdout.on("data", (chunk: Buffer) =>
+    collect(destinationOutput, chunk),
+  );
+  destination.stderr.on("data", (chunk: Buffer) =>
+    collect(destinationError, chunk),
+  );
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill();
+  }, timeoutMs);
+  timer.unref();
+  const transforms = redactionValues.map(
+    (value) => new ByteReplacementTransform(Buffer.from(value)),
+  );
+  const pipe = pipeline([source.stdout, ...transforms, destination.stdin]).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  try {
+    const [sourceExit, destinationExit, pipeError] = await Promise.all([
+      waitForProcess(source),
+      waitForProcess(destination),
+      pipe,
+    ]);
+    if (timedOut) {
+      throw new Error(`git blob promotion timed out after ${timeoutMs} ms`);
+    }
+    if (outputExceeded) {
+      throw new Error("git blob promotion exceeded the output limit");
+    }
+    if (sourceExit !== 0) {
+      throw gitStreamError(
+        "cat-file",
+        sourceExit,
+        sourceError,
+        redactionValues,
+      );
+    }
+    if (destinationExit !== 0) {
+      throw gitStreamError(
+        "hash-object",
+        destinationExit,
+        destinationError,
+        redactionValues,
+      );
+    }
+    if (pipeError !== undefined) {
+      throw pipeError;
+    }
+    const promoted = Buffer.concat(destinationOutput).toString("utf8").trim();
+    if (!/^[0-9a-f]{40,64}$/.test(promoted)) {
+      throw new Error("git hash-object did not return a valid object id");
+    }
+    return promoted;
+  } finally {
+    clearTimeout(timer);
+    kill();
+  }
+}
+
+class ByteReplacementTransform extends Transform {
+  readonly #search: Buffer;
+  #pending = Buffer.alloc(0);
+
+  constructor(search: Buffer) {
+    super();
+    this.#search = search;
+  }
+
+  override _transform(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    try {
+      const source = Buffer.concat([this.#pending, chunk]);
+      const cutoff = Math.max(0, source.length - (this.#search.length - 1));
+      let cursor = 0;
+      let match = source.indexOf(this.#search, cursor);
+      while (match !== -1 && match < cutoff) {
+        this.push(source.subarray(cursor, match));
+        this.push(REDACTION_MARKER);
+        cursor = match + this.#search.length;
+        match = source.indexOf(this.#search, cursor);
+      }
+      if (cursor < cutoff) {
+        this.push(source.subarray(cursor, cutoff));
+        cursor = cutoff;
+      }
+      this.#pending = source.subarray(cursor);
+      callback();
+    } catch (error) {
+      callback(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  override _flush(callback: (error?: Error | null) => void): void {
+    try {
+      this.push(
+        replaceBytes(
+          this.#pending,
+          this.#search,
+          Buffer.from(REDACTION_MARKER),
+        ),
+      );
+      callback();
+    } catch (error) {
+      callback(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+}
+
+function gitEnvironment(
+  env: Readonly<Record<string, string>>,
+): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...env,
+    GIT_TERMINAL_PROMPT: "0",
+    LC_ALL: "C",
+  };
+}
+
+function waitForProcess(
+  child: ReturnType<typeof spawn>,
+): Promise<number | null> {
+  return new Promise((resolvePromise, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => resolvePromise(code));
+  });
+}
+
+function killProcess(child: ReturnType<typeof spawn>): void {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  if (child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // The process may have exited between the check and this signal.
+    }
+  }
+  child.kill("SIGKILL");
+}
+
+function gitStreamError(
+  command: string,
+  exitCode: number | null,
+  stderr: readonly Buffer[],
+  redactionValues: readonly string[],
+): Error {
+  const detail = redactText(
+    Buffer.concat(stderr).toString("utf8").trim(),
+    redactionValues,
+  );
+  return new Error(
+    `git ${command} failed (${exitCode ?? "signal"}): ${detail || "no diagnostic output"}`,
+  );
+}
+
 async function runGit(
   args: readonly string[],
   options: GitOptions,
   timeoutMs: number,
 ): Promise<GitResult> {
   return await new Promise((resolvePromise, reject) => {
-    const detached = process.platform !== "win32";
     const child = spawn("git", args, {
       cwd: options.cwd,
-      detached,
-      env: {
-        ...process.env,
-        ...options.env,
-        GIT_TERMINAL_PROMPT: "0",
-        LC_ALL: "C",
-      },
+      detached: true,
+      env: gitEnvironment(options.env ?? {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
@@ -831,7 +1176,7 @@ async function runGit(
     let settled = false;
 
     const kill = () => {
-      if (detached && child.pid !== undefined) {
+      if (child.pid !== undefined) {
         try {
           process.kill(-child.pid, "SIGKILL");
           return;
@@ -923,6 +1268,19 @@ function normalizeUniquePaths(
   return Object.freeze(normalized);
 }
 
+function declaresLfsFilter(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const trimmed = line.trimStart();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+      return false;
+    }
+    return trimmed
+      .split(/[\t ]+/)
+      .slice(1)
+      .some((attribute) => attribute === "filter=lfs");
+  });
+}
+
 function normalizeRepositoryPath(path: string, label: string): string {
   if (path.length === 0 || isAbsolute(path) || path.includes("\\")) {
     throw new Error(
@@ -940,6 +1298,171 @@ function normalizeRepositoryPath(path: string, label: string): string {
   return normalized.replace(/^\.\//, "");
 }
 
+async function findOverlappingPaths(
+  repositoryPath: string,
+  dependencyPaths: readonly string[],
+  linkedSecretPaths: readonly string[],
+): Promise<readonly string[]> {
+  const secrets = await Promise.all(
+    linkedSecretPaths.map(async (path) => ({
+      path,
+      resolved: await resolveThroughExistingAncestor(
+        resolve(repositoryPath, path),
+      ),
+    })),
+  );
+  const overlap: string[] = [];
+  for (const path of dependencyPaths) {
+    const dependency = {
+      path,
+      resolved: await resolveDependencyTarget(
+        resolve(repositoryPath, path),
+        path,
+      ),
+    };
+    for (const secret of secrets) {
+      if (
+        pathsContainEachOther(dependency.path, secret.path, posix.sep) ||
+        pathsContainEachOther(dependency.resolved, secret.resolved, sep)
+      ) {
+        overlap.push(`${dependency.path} ↔ ${secret.path}`);
+      }
+    }
+    await inspectDependencyTree(
+      repositoryPath,
+      resolve(repositoryPath, path),
+      path,
+      path,
+      secrets,
+      new Set(),
+      overlap,
+    );
+  }
+  return [...new Set(overlap)];
+}
+
+async function inspectDependencyTree(
+  repositoryPath: string,
+  absolutePath: string,
+  displayPath: string,
+  dependencyPath: string,
+  secrets: readonly { readonly path: string; readonly resolved: string }[],
+  visitedDirectories: Set<string>,
+  overlap: string[],
+): Promise<void> {
+  let pathStat: Awaited<ReturnType<typeof lstat>>;
+  try {
+    pathStat = await lstat(absolutePath);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return;
+    }
+    throw error;
+  }
+
+  let traversalPath = absolutePath;
+  if (pathStat.isSymbolicLink()) {
+    traversalPath = await resolveDependencyTarget(absolutePath, displayPath);
+    if (
+      traversalPath !== repositoryPath &&
+      !isWithin(repositoryPath, traversalPath)
+    ) {
+      throw new Error(`dependency symlink escapes repository: ${displayPath}`);
+    }
+    for (const secret of secrets) {
+      if (pathsContainEachOther(traversalPath, secret.resolved, sep)) {
+        overlap.push(
+          `${dependencyPath} descendant ${displayPath} ↔ ${secret.path}`,
+        );
+      }
+    }
+    try {
+      pathStat = await lstat(traversalPath);
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return;
+      }
+      throw error;
+    }
+  }
+  if (!pathStat.isDirectory()) {
+    return;
+  }
+
+  const resolvedDirectory = await resolveDependencyTarget(
+    traversalPath,
+    displayPath,
+  );
+  if (
+    resolvedDirectory !== repositoryPath &&
+    !isWithin(repositoryPath, resolvedDirectory)
+  ) {
+    throw new Error(`dependency path escapes repository: ${displayPath}`);
+  }
+  if (visitedDirectories.has(resolvedDirectory)) {
+    return;
+  }
+  visitedDirectories.add(resolvedDirectory);
+  const children = await readdir(resolvedDirectory);
+  for (const child of children) {
+    await inspectDependencyTree(
+      repositoryPath,
+      join(resolvedDirectory, child),
+      posix.join(displayPath, child),
+      dependencyPath,
+      secrets,
+      visitedDirectories,
+      overlap,
+    );
+  }
+}
+
+async function resolveDependencyTarget(
+  path: string,
+  displayPath: string,
+): Promise<string> {
+  try {
+    return await resolveThroughExistingAncestor(path);
+  } catch (error) {
+    if (isFileSystemError(error, "ELOOP")) {
+      throw new Error(`dependency symlink loop at ${displayPath}`);
+    }
+    throw error;
+  }
+}
+
+function pathsContainEachOther(
+  left: string,
+  right: string,
+  separator: string,
+): boolean {
+  return (
+    left === right ||
+    left.startsWith(`${right}${separator}`) ||
+    right.startsWith(`${left}${separator}`)
+  );
+}
+
+async function resolveThroughExistingAncestor(path: string): Promise<string> {
+  let cursor = path;
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      return resolve(await realpath(cursor), ...suffix.toReversed());
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) {
+        throw error;
+      }
+      suffix.push(relative(parent, cursor));
+      cursor = parent;
+    }
+  }
+}
+
 function resolveRequiredWorktreePath(
   path: string | undefined,
   repositoryPath: string,
@@ -954,6 +1477,26 @@ function resolveRequiredWorktreePath(
     );
   }
   return resolved;
+}
+
+async function assertAvailableWorktreePath(
+  path: string,
+  redactionValues: readonly string[],
+): Promise<void> {
+  let pathStat: Awaited<ReturnType<typeof lstat>>;
+  try {
+    pathStat = await lstat(path);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return;
+    }
+    throw error;
+  }
+  if (!pathStat.isDirectory() || (await readdir(path)).length > 0) {
+    throw new Error(
+      `isolated worktree path already exists and is not an empty directory: ${redactText(path, redactionValues)}`,
+    );
+  }
 }
 
 function isWithin(parent: string, candidate: string): boolean {
@@ -983,8 +1526,14 @@ async function collectRedactionValues(
       }
       throw error;
     }
-    values.push(...parseEnvValues(contents));
+    values.push(...parseSecretValues(contents));
   }
+  return normalizeRedactionValues(values);
+}
+
+function normalizeRedactionValues(
+  values: readonly string[],
+): readonly string[] {
   return Object.freeze(
     [...new Set(values)]
       .filter((value) => value.length > 0)
@@ -992,9 +1541,29 @@ async function collectRedactionValues(
   );
 }
 
-function parseEnvValues(contents: string): readonly string[] {
+/**
+ * Best-effort inventory for exact, verbatim values in raw-token, dotenv,
+ * JSON, and common YAML scalar files. This is deliberately not advertised as
+ * semantic secret detection: custom encodings, YAML features outside this
+ * small lexer, and encoded/transformed/truncated values require callers to
+ * supply explicit redactionValues and cannot be guaranteed automatically.
+ */
+function parseSecretValues(contents: string): readonly string[] {
+  const trimmedContents = contents.trim();
   const values: string[] = [];
-  for (const line of contents.split(/\r?\n/)) {
+  if (trimmedContents.length > 0) {
+    values.push(trimmedContents);
+  }
+
+  try {
+    collectJsonStringValues(JSON.parse(contents), values);
+  } catch {
+    // Non-JSON files continue through the dotenv/YAML lexical inventory.
+  }
+
+  const lines = contents.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     const trimmed = line.trim();
     if (trimmed.length === 0 || trimmed.startsWith("#")) {
       continue;
@@ -1007,12 +1576,87 @@ function parseEnvValues(contents: string): readonly string[] {
       continue;
     }
     let value = assignment.slice(equals + 1).trim();
-    if (
+    const quote = value.startsWith('"')
+      ? '"'
+      : value.startsWith("'")
+        ? "'"
+        : undefined;
+    if (quote !== undefined && !value.slice(1).includes(quote)) {
+      const continuation: string[] = [value.slice(1)];
+      while (index + 1 < lines.length) {
+        index += 1;
+        const next = lines[index] ?? "";
+        const closing = next.indexOf(quote);
+        if (closing >= 0) {
+          continuation.push(next.slice(0, closing));
+          value = continuation.join("\n");
+          break;
+        }
+        continuation.push(next);
+      }
+    } else if (
+      quote !== undefined &&
       value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
+      value.endsWith(quote)
     ) {
       value = value.slice(1, -1);
+    }
+    if (value.length > 0) {
+      values.push(value);
+    }
+  }
+
+  values.push(...parseYamlScalarValues(lines));
+  return values;
+}
+
+function collectJsonStringValues(value: unknown, values: string[]): void {
+  if (typeof value === "string") {
+    if (value.length > 0) {
+      values.push(value);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectJsonStringValues(item, values);
+    }
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      collectJsonStringValues(item, values);
+    }
+  }
+}
+
+function parseYamlScalarValues(lines: readonly string[]): readonly string[] {
+  const values: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const match = /^(\s*)[^#:\s][^:]*:\s*(.*?)\s*$/.exec(line);
+    if (match?.[1] === undefined || match[2] === undefined) {
+      continue;
+    }
+    const indentation = match[1].length;
+    let value = match[2];
+    if (value === "|" || value === ">") {
+      const block: string[] = [];
+      while (index + 1 < lines.length) {
+        const next = lines[index + 1] ?? "";
+        const nextIndentation = /^\s*/.exec(next)?.[0].length ?? 0;
+        if (next.trim().length > 0 && nextIndentation <= indentation) {
+          break;
+        }
+        index += 1;
+        block.push(next.slice(Math.min(next.length, indentation + 2)));
+      }
+      while (block.at(-1) === "") {
+        block.pop();
+      }
+      value = value === "|" ? block.join("\n") : block.join(" ");
+    } else {
+      value = stripMatchingQuotes(value.replace(/\s+#.*$/, "").trim());
     }
     if (value.length > 0) {
       values.push(value);
@@ -1021,30 +1665,23 @@ function parseEnvValues(contents: string): readonly string[] {
   return values;
 }
 
+function stripMatchingQuotes(value: string): string {
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 function redactText(value: string, redactionValues: readonly string[]): string {
   let redacted = value;
   for (const secret of redactionValues) {
     if (secret.length > 0) {
       redacted = redacted.split(secret).join(REDACTION_MARKER);
     }
-  }
-  return redacted;
-}
-
-function redactBuffer(
-  value: Buffer,
-  redactionValues: readonly string[],
-): Buffer {
-  let redacted = value;
-  for (const secret of redactionValues) {
-    if (secret.length === 0) {
-      continue;
-    }
-    redacted = replaceBytes(
-      redacted,
-      Buffer.from(secret),
-      Buffer.from(REDACTION_MARKER),
-    );
   }
   return redacted;
 }
@@ -1069,6 +1706,26 @@ function replaceBytes(
   return Buffer.concat(chunks);
 }
 
+function parseStageEntries(
+  value: Buffer,
+): ReadonlyMap<string, { readonly mode: string; readonly objectId: string }> {
+  const entries = new Map<
+    string,
+    { readonly mode: string; readonly objectId: string }
+  >();
+  for (const record of splitNul(value)) {
+    const match = /^(\d+) ([0-9a-f]+) 0\t([\s\S]+)$/.exec(record);
+    if (
+      match?.[1] !== undefined &&
+      match[2] !== undefined &&
+      match[3] !== undefined
+    ) {
+      entries.set(match[3], { mode: match[1], objectId: match[2] });
+    }
+  }
+  return entries;
+}
+
 function splitNul(value: Buffer): readonly string[] {
   return value
     .toString("utf8")
@@ -1080,57 +1737,20 @@ async function seedDependency(
   repositoryPath: string,
   worktreePath: string,
   path: string,
-  timeoutMs: number,
 ): Promise<void> {
   const source = resolve(repositoryPath, path);
   const destination = resolve(worktreePath, path);
-  const sourceStat = await lstat(source);
   if (await pathExists(destination)) {
     return;
   }
   await mkdir(dirname(destination), { recursive: true });
-  if (process.platform === "darwin") {
-    const copied = await runCopyOnWrite(source, destination, timeoutMs);
-    if (copied) {
-      return;
-    }
-    await rm(destination, { recursive: true, force: true });
-  }
-  await symlink(source, destination, sourceStat.isDirectory() ? "dir" : "file");
-}
-
-async function runCopyOnWrite(
-  source: string,
-  destination: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  return await new Promise((resolvePromise) => {
-    const child = spawn("/bin/cp", ["-cR", source, destination], {
-      stdio: "ignore",
-    });
-    let settled = false;
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      if (!settled) {
-        settled = true;
-        resolvePromise(false);
-      }
-    }, timeoutMs);
-    timer.unref();
-    child.on("error", () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        resolvePromise(false);
-      }
-    });
-    child.on("close", (code) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        resolvePromise(code === 0);
-      }
-    });
+  // Dereferencing while copying makes the seed a snapshot: the isolated
+  // worktree cannot follow later mutations in the source dependency tree.
+  await cp(source, destination, {
+    dereference: true,
+    errorOnExist: true,
+    force: false,
+    recursive: true,
   });
 }
 
@@ -1162,10 +1782,14 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 function isMissingFileError(error: unknown): boolean {
+  return isFileSystemError(error, "ENOENT");
+}
+
+function isFileSystemError(error: unknown, code: string): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
     "code" in error &&
-    (error as { readonly code?: unknown }).code === "ENOENT"
+    (error as { readonly code?: unknown }).code === code
   );
 }

@@ -56,14 +56,13 @@ export function normalizeClaudeRateLimitEvent(
     return null;
   }
   const info = asObject(event.rate_limit_info);
-  const status = normalizeStatus(info?.status);
-  if (info === null || status === null) {
+  if (info === null) {
     return null;
   }
 
   return {
     vendor: "claude",
-    status,
+    status: normalizeStatus(info.status),
     observedAtMs,
     windows: [normalizeWindow(info)],
     isUsingOverage:
@@ -71,7 +70,7 @@ export function normalizeClaudeRateLimitEvent(
   };
 }
 
-function normalizeStatus(value: unknown): QuotaSnapshot["status"] | null {
+function normalizeStatus(value: unknown): QuotaSnapshot["status"] {
   switch (value) {
     case "allowed":
       return "available";
@@ -80,7 +79,7 @@ function normalizeStatus(value: unknown): QuotaSnapshot["status"] | null {
     case "rejected":
       return "exhausted";
     default:
-      return null;
+      return "unknown";
   }
 }
 

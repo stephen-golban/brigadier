@@ -4,6 +4,11 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 
+if (process.platform === "win32") {
+  console.error("brigadier: Windows is not supported");
+  process.exit(1);
+}
+
 const require = createRequire(import.meta.url);
 const platformPackage =
   {
@@ -11,7 +16,6 @@ const platformPackage =
     "darwin-x64": "@stephen-golban/brigadier-darwin-x64",
     "linux-arm64": "@stephen-golban/brigadier-linux-arm64",
     "linux-x64": "@stephen-golban/brigadier-linux-x64",
-    "win32-x64": "@stephen-golban/brigadier-win32-x64",
   }[`${process.platform}-${process.arch}`] ?? null;
 
 const optionalBinary = resolveOptionalBinary(platformPackage);

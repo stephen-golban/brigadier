@@ -85,15 +85,34 @@ describe("ClaudeWorker", () => {
 
     const outcome = await within(
       spawned.completion,
-      500,
+      1_000,
       "Claude terminal result",
     );
     expect(outcome.ok).toBeTrue();
     expect(outcome.output).toBe("completed before exit");
-    expect(canSignal(spawned.pid)).toBeTrue();
+    expect(canSignal(spawned.pid)).toBeFalse();
 
-    await within(waitUntilGone(spawned.pid), 2_500, "Claude group teardown");
     await within(collect(spawned.events), 2_000, "Claude event EOF");
+  });
+
+  test("a shutdown throw still settles completion", async () => {
+    const worker = new ClaudeWorker(async () => {
+      throw new Error("injected shutdown failure");
+    });
+    const spawned = await worker.spawn(claudeSpec("success"));
+    if (spawned.pid === null) {
+      throw new Error("shutdown-throw Claude failed to launch");
+    }
+
+    expect(
+      await within(spawned.completion, 1_000, "shutdown-throw completion"),
+    ).toMatchObject({
+      ok: false,
+      failure: {
+        kind: "UNKNOWN_FAILURE",
+        message: "injected shutdown failure",
+      },
+    });
   });
 
   test("kills the process group so a grandchild-held stdout pipe closes", async () => {
@@ -261,6 +280,10 @@ describe("CodexWorker", () => {
     expect(command.at(-1)).toBe("-");
     expect(command).not.toContain("--effort");
     expect(command).toContain("model_reasoning_effort=xhigh");
+    expect(command).toContain('default_permissions="brigadier_lane"');
+    expect(command).toContain(
+      'permissions.brigadier_lane={filesystem={":root"="read",":workspace_roots"={"."="read","src/worker/**"="write"}},network={enabled=false}}',
+    );
     const spawned = await within(
       new CodexWorker().spawn(spec),
       2_000,
@@ -309,6 +332,44 @@ describe("CodexWorker", () => {
     expect(outcome.output).toBe("");
   });
 
+  test("Codex natural completion kills a grandchild holding stdout", async () => {
+    const temporaryBin = await createGrandchildCodex();
+    const base = codexSpec("unused");
+    const spec = {
+      ...base,
+      environment: {
+        ...base.environment,
+        PATH: `${temporaryBin}:${requiredPath()}`,
+      },
+      timeoutMs: null,
+    } as const satisfies CodexWorkerSpec;
+    const spawned = await new CodexWorker().spawn(spec);
+    if (spawned.pid === null) {
+      throw new Error("grandchild Codex failed to launch");
+    }
+
+    try {
+      const [outcome, events] = await within(
+        Promise.all([spawned.completion, collect(spawned.events)]),
+        1_000,
+        "Codex grandchild completion",
+      );
+      expect(outcome).toMatchObject({
+        ok: true,
+        output: "grandchild complete",
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "message",
+          text: "grandchild complete",
+        }),
+      );
+      expect(canSignalProcessGroup(spawned.pid)).toBeFalse();
+    } finally {
+      await forceKillProcessTree(spawned.pid);
+    }
+  });
+
   test("classifies Codex turn failure from its native payload", async () => {
     const spec = codexSpec("failure");
     const spawned = await within(
@@ -330,6 +391,123 @@ describe("CodexWorker", () => {
         statusCode: 400,
       },
     });
+  });
+});
+
+test("Claude argv is an absolute contract for mandatory flags and edit lanes", () => {
+  expect(buildClaudeCommand(claudeSpec("success"))).toEqual([
+    "claude",
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "claude-test-model",
+    "--effort",
+    "high",
+    "--exclude-dynamic-system-prompt-sections",
+    "--permission-mode",
+    "dontAsk",
+    "--max-budget-usd",
+    "1.5",
+    "--tools",
+    "Read,Edit",
+    "--allowedTools",
+    "Edit(src/worker/**)",
+    "--disallowedTools",
+    "Write,WebFetch,WebSearch",
+    "--setting-sources",
+    "",
+    "--add-dir",
+    "/workspace/shared",
+    "--mcp-config",
+    "/workspace/mcp.json",
+    "--strict-mcp-config",
+  ]);
+});
+
+test("read-only specs emit no edit permissions in either adapter", () => {
+  const claude = claudeSpec("success");
+  const readOnlyClaude = {
+    ...claude,
+    sandbox: {
+      ...claude.sandbox,
+      filesystem: {
+        ...claude.sandbox.filesystem,
+        workspaceAccess: "read",
+      },
+    },
+  } as const satisfies ClaudeWorkerSpec;
+  expect(buildClaudeCommand(readOnlyClaude)).not.toContain("--allowedTools");
+
+  const codex = codexSpec("success");
+  const readOnlyCodex = {
+    ...codex,
+    sandbox: {
+      ...codex.sandbox,
+      filesystem: {
+        ...codex.sandbox.filesystem,
+        workspaceAccess: "read",
+      },
+    },
+  } as const satisfies CodexWorkerSpec;
+  expect(buildCodexCommand(readOnlyCodex)).toContain(
+    'permissions.brigadier_lane={filesystem={":root"="read",":workspace_roots"={"."="read"}},network={enabled=false}}',
+  );
+
+  const withoutUserInstructions = {
+    ...codex,
+    instructionFiles: { ...codex.instructionFiles, user: "exclude" },
+  } as const satisfies CodexWorkerSpec;
+  expect(buildCodexCommand(withoutUserInstructions)).toContain(
+    "--ignore-user-config",
+  );
+});
+
+test("adapters validate maxTurns at their one-shot launch boundaries", () => {
+  expect(() =>
+    buildClaudeCommand({ ...claudeSpec("success"), maxTurns: 0 }),
+  ).toThrow("maxTurns must be null or a positive whole number");
+  expect(() =>
+    buildCodexCommand({ ...codexSpec("success"), maxTurns: 0 }),
+  ).toThrow("maxTurns must be null or a positive whole number");
+});
+
+test("Claude maxTurns succeeds at the limit and fails only over the limit", async () => {
+  const atLimitSpec = withExpectedArgv(
+    { ...claudeSpec("success"), maxTurns: 1 },
+    buildClaudeCommand({ ...claudeSpec("success"), maxTurns: 1 }),
+  );
+  const atLimit = await new ClaudeWorker().spawn(atLimitSpec);
+  expect(
+    await within<WorkerOutcome>(
+      atLimit.completion,
+      1_000,
+      "Claude at-limit completion",
+    ),
+  ).toMatchObject({ ok: true, output: "ok" });
+
+  const temporaryBin = await createTwoTurnClaude();
+  const overLimitBase = {
+    ...claudeSpec("unused", {
+      PATH: `${temporaryBin}:${requiredPath()}`,
+    }),
+    maxTurns: 1,
+  } as const satisfies ClaudeWorkerSpec;
+  const overLimitSpec = withExpectedArgv(
+    overLimitBase,
+    buildClaudeCommand(overLimitBase),
+  );
+  const overLimit = await new ClaudeWorker().spawn(overLimitSpec);
+  expect(
+    await within<WorkerOutcome>(
+      overLimit.completion,
+      1_000,
+      "Claude over-limit completion",
+    ),
+  ).toMatchObject({
+    ok: false,
+    failure: { kind: "TURN_LIMIT" },
   });
 });
 
@@ -510,6 +688,42 @@ while :; do sleep 60; done
   return directory;
 }
 
+async function createTwoTurnClaude(): Promise<string> {
+  const directory = await mkdtemp(resolve(tmpdir(), "brigadier-claude-turns-"));
+  temporaryDirectories.push(directory);
+  const executable = resolve(directory, "claude");
+  await Bun.write(
+    executable,
+    `#!/bin/sh
+IFS= read -r received
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"one"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"two"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","api_error_status":null,"result":"two turns","duration_ms":5,"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"modelUsage":{}}'
+`,
+  );
+  await chmod(executable, 0o755);
+  return directory;
+}
+
+async function createGrandchildCodex(): Promise<string> {
+  const directory = await mkdtemp(resolve(tmpdir(), "brigadier-codex-child-"));
+  temporaryDirectories.push(directory);
+  const executable = resolve(directory, "codex");
+  await Bun.write(
+    executable,
+    `#!/bin/sh
+IFS= read -r received
+printf '%s\n' '{"type":"thread.started","thread_id":"grandchild-thread"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"grandchild complete"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
+/bin/sh -c "trap '' TERM; while :; do sleep 60; done" &
+exit 0
+`,
+  );
+  await chmod(executable, 0o755);
+  return directory;
+}
+
 function canSignal(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -519,8 +733,26 @@ function canSignal(pid: number): boolean {
   }
 }
 
-async function waitUntilGone(pid: number): Promise<void> {
-  while (canSignal(pid)) {
-    await Bun.sleep(10);
+function canSignalProcessGroup(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function forceKillProcessTree(pid: number): Promise<void> {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    if (
+      typeof error !== "object" ||
+      error === null ||
+      !("code" in error) ||
+      error.code !== "ESRCH"
+    ) {
+      throw error;
+    }
   }
 }

@@ -12,7 +12,7 @@ export interface NdjsonOptions<T = unknown> {
  * TextDecoder's streaming mode preserves partial UTF-8 sequences.
  */
 export async function* readNdjson<T = unknown>(
-  stream: ReadableStream<Uint8Array>,
+  stream: AsyncIterable<Uint8Array>,
   options: NdjsonOptions<T> = {},
 ): AsyncGenerator<T> {
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -40,7 +40,7 @@ export async function* readNdjson<T = unknown>(
 
   buffered += decoder.decode();
   const finalLine = buffered.replace(/\r$/, "");
-  if (finalLine.length > 0) {
+  if (finalLine.trim().length > 0) {
     lineNumber += 1;
     yield parseLine(finalLine, lineNumber, options);
   }
@@ -48,7 +48,7 @@ export async function* readNdjson<T = unknown>(
 
 /** Consumes the shared generator for callback-oriented callers. */
 export async function consumeNdjson<T>(
-  stream: ReadableStream<Uint8Array>,
+  stream: AsyncIterable<Uint8Array>,
   onRecord: (record: T) => void,
   options: NdjsonOptions<T>,
 ): Promise<void> {

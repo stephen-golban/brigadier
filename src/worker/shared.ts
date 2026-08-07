@@ -7,6 +7,8 @@ import type {
   WorkerFailure,
   WorkerSpec,
 } from "../contracts.ts";
+import type { DetachedProcess } from "../shared/process.ts";
+import { writeAndEnd } from "../shared/process.ts";
 
 export const EMPTY_USAGE: TokenUsage = {
   input: { total: 0, uncached: 0, cacheRead: 0, cacheWrite: 0 },
@@ -40,26 +42,6 @@ export function describeRaw(raw: unknown): string {
   return "unrecognized vendor payload";
 }
 
-export function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal);
-  } catch (error) {
-    if (!isNoSuchProcess(error) && !isOperationNotPermitted(error)) {
-      throw error;
-    }
-  }
-}
-
-export function terminateProcessGroup(
-  processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">,
-): void {
-  killProcessGroup(processHandle.pid, "SIGTERM");
-  const escalation = setTimeout(() => {
-    killProcessGroup(processHandle.pid, "SIGKILL");
-  }, 1_000);
-  escalation.unref();
-}
-
 export function cancellationFailure(reason: CancelReason): WorkerFailure {
   return {
     kind: "CANCELLED",
@@ -72,7 +54,7 @@ export function cancellationFailure(reason: CancelReason): WorkerFailure {
 export function failureOutcome(
   failure: WorkerFailure,
   startedAtMs: number,
-  processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">,
+  processHandle: DetachedProcess,
   output = "",
   usage: TokenUsage = EMPTY_USAGE,
 ): FailedLaunchedWorkerOutcome {
@@ -98,13 +80,12 @@ export function workerEnvironment(spec: WorkerSpec): Record<string, string> {
 }
 
 export async function writePromptAndClose(
-  sink: Bun.FileSink,
+  sink: DetachedProcess["stdin"],
   prompt: string,
 ): Promise<void> {
   // Both adapters are one-shot. Closing stdin avoids adopting Claude's
   // bidirectional control protocol, which is outside the frozen Worker API.
-  await sink.write(prompt);
-  await sink.end();
+  await writeAndEnd(sink, prompt);
 }
 
 export function parseEmbeddedError(message: string): JsonObject | null {
@@ -157,7 +138,7 @@ export function failure(
 
 export function exitFailure(
   vendor: "claude" | "codex",
-  exitCode: number,
+  exitCode: number | null,
   stderr: string,
 ): WorkerFailure & { readonly kind: Exclude<FailureKind, "LAUNCH_FAILURE"> } {
   const message = stderr.trim() || `${vendor} exited with code ${exitCode}`;
@@ -174,14 +155,6 @@ export function successfulOutcome(
   fields: Omit<Extract<LaunchedWorkerOutcome, { readonly ok: true }>, "ok">,
 ): LaunchedWorkerOutcome {
   return { ok: true, ...fields };
-}
-
-function isNoSuchProcess(error: unknown): boolean {
-  return isObject(error) && error.code === "ESRCH";
-}
-
-function isOperationNotPermitted(error: unknown): boolean {
-  return isObject(error) && error.code === "EPERM";
 }
 
 function cancellationMessage(kind: CancelReason["kind"]): string {

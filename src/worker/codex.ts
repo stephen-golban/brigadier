@@ -9,7 +9,14 @@ import {
   type WorkerFailure,
 } from "../contracts.ts";
 import { readNdjson } from "../shared/ndjson.ts";
+import {
+  collectBoundedText,
+  type DetachedProcess,
+  spawnDetachedProcess,
+  waitForProcessExit,
+} from "../shared/process.ts";
 import { AsyncQueue } from "./async-queue.ts";
+import { type ShutdownProcess, WorkerLifecycle } from "./lifecycle.ts";
 import {
   cancellationFailure,
   classifyHttpFailure,
@@ -25,7 +32,6 @@ import {
   parseEmbeddedError,
   stringValue,
   successfulOutcome,
-  terminateProcessGroup,
   workerEnvironment,
   writePromptAndClose,
 } from "./shared.ts";
@@ -34,21 +40,24 @@ export class CodexWorker implements Worker<"codex"> {
   readonly vendor = "codex" as const;
   readonly processCompletion = "self-exits" as const;
 
+  constructor(private readonly shutdown?: ShutdownProcess) {}
+
   async spawn(spec: CodexWorkerSpec): Promise<SpawnedWorker> {
     createIdleTimeoutMs(spec.idleTimeoutMs);
     const startedAtMs = performance.now();
     const events = new AsyncQueue<WorkerEvent>();
-    let processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">;
+    let processHandle: DetachedProcess;
 
     try {
-      processHandle = Bun.spawn(buildCodexCommand(spec), {
-        cwd: spec.cwd,
-        detached: true,
-        env: workerEnvironment(spec),
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      const command = buildCodexCommand(spec);
+      processHandle = await spawnDetachedProcess(
+        command[0] ?? "codex",
+        command.slice(1),
+        {
+          cwd: spec.cwd,
+          env: workerEnvironment(spec),
+        },
+      );
     } catch (error) {
       events.close();
       const message = error instanceof Error ? error.message : String(error);
@@ -73,37 +82,28 @@ export class CodexWorker implements Worker<"codex"> {
       };
     }
 
-    const completion = Promise.withResolvers<LaunchedWorkerOutcome>();
-    let settled = false;
     let output = "";
     let usage: TokenUsage = EMPTY_USAGE;
     let terminalFailure: WorkerFailure | null = null;
     let streamFailure: WorkerFailure | null = null;
-    let idleTimer: ReturnType<typeof setTimeout>;
-    let totalTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearTimers = (): void => {
-      clearTimeout(idleTimer);
-      if (totalTimer !== undefined) {
-        clearTimeout(totalTimer);
-      }
-    };
-    const settle = (outcome: LaunchedWorkerOutcome): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimers();
-      completion.resolve(outcome);
-    };
-    const cancel = async (
-      reason: Parameters<SpawnedWorker["cancel"]>[0],
-    ): Promise<void> => {
-      if (settled) {
-        return;
-      }
-      terminateProcessGroup(processHandle);
-      settle(
+    const unexpectedFailureOutcome = (error: unknown): LaunchedWorkerOutcome =>
+      failureOutcome(
+        failure(
+          "UNKNOWN_FAILURE",
+          error instanceof Error ? error.message : String(error),
+          false,
+          null,
+        ),
+        startedAtMs,
+        processHandle,
+        output,
+        usage,
+      );
+    const lifecycle = new WorkerLifecycle({
+      processHandle,
+      idleTimeoutMs: spec.idleTimeoutMs,
+      timeoutMs: spec.timeoutMs,
+      cancellationOutcome: (reason) =>
         failureOutcome(
           cancellationFailure(reason),
           startedAtMs,
@@ -111,36 +111,17 @@ export class CodexWorker implements Worker<"codex"> {
           output,
           usage,
         ),
-      );
-    };
-    const resetIdleTimer = (): void => {
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        void cancel({
-          kind: "timeout",
-          message: `worker produced no output for ${spec.idleTimeoutMs} ms`,
-        });
-      }, spec.idleTimeoutMs);
-      idleTimer.unref();
-    };
+      unexpectedFailureOutcome,
+      ...(this.shutdown === undefined ? {} : { shutdown: this.shutdown }),
+    });
 
-    idleTimer = setTimeout(() => {}, spec.idleTimeoutMs);
-    resetIdleTimer();
-    if (spec.timeoutMs !== null) {
-      totalTimer = setTimeout(() => {
-        void cancel({
-          kind: "timeout",
-          message: `worker exceeded ${spec.timeoutMs} ms`,
-        });
-      }, spec.timeoutMs);
-      totalTimer.unref();
-    }
-
-    const stderr = new Response(processHandle.stderr).text();
+    const stderr = collectBoundedText(processHandle.stderr, 64 * 1_024).catch(
+      () => "",
+    );
     const reader = (async (): Promise<void> => {
       try {
         for await (const raw of readNdjson(processHandle.stdout, {
-          onActivity: resetIdleTimer,
+          onActivity: lifecycle.resetIdleTimer,
         })) {
           events.push(mapCodexEvent(raw));
           if (!isObject(raw)) {
@@ -171,7 +152,7 @@ export class CodexWorker implements Worker<"codex"> {
           false,
           null,
         );
-        terminateProcessGroup(processHandle);
+        await lifecycle.finish(unexpectedFailureOutcome(error));
       }
     })();
 
@@ -179,69 +160,60 @@ export class CodexWorker implements Worker<"codex"> {
       try {
         await writePromptAndClose(processHandle.stdin, spec.prompt);
       } catch (error) {
-        if (!settled) {
-          terminateProcessGroup(processHandle);
-          settle(
-            failureOutcome(
-              failure(
-                "UNKNOWN_FAILURE",
-                error instanceof Error ? error.message : String(error),
-                false,
-                null,
-              ),
-              startedAtMs,
-              processHandle,
-              output,
-              usage,
-            ),
-          );
-        }
+        await lifecycle.finish(unexpectedFailureOutcome(error));
       }
     })();
 
     void (async () => {
-      const exitCode = await processHandle.exited;
-      await reader;
-      const stderrText = await stderr;
-      if (settled) {
-        return;
-      }
-      const common = {
-        output,
-        usage,
-        durationMs: elapsedMs(startedAtMs),
-        exitCode: processHandle.exitCode ?? exitCode,
-        signal: processHandle.signalCode,
-      };
-      const detectedFailure =
-        streamFailure ??
-        terminalFailure ??
-        (exitCode === 0 ? null : exitFailure("codex", exitCode, stderrText));
-      if (detectedFailure === null) {
-        settle(successfulOutcome(common));
-      } else {
-        settle({
+      const exited = await waitForProcessExit(processHandle);
+      await lifecycle.finishWith(async () => {
+        await reader;
+        const stderrText = await stderr;
+        const common = {
+          output,
+          usage,
+          durationMs: elapsedMs(startedAtMs),
+          exitCode: processHandle.exitCode ?? exited.exitCode,
+          signal: processHandle.signalCode ?? exited.signal,
+        };
+        const detectedFailure =
+          streamFailure ??
+          terminalFailure ??
+          (exited.exitCode === 0
+            ? null
+            : exitFailure("codex", exited.exitCode, stderrText));
+        if (detectedFailure === null) {
+          return successfulOutcome(common);
+        }
+        return {
           ok: false,
           ...common,
           failure: detectedFailure as WorkerFailure & {
             readonly kind: Exclude<WorkerFailure["kind"], "LAUNCH_FAILURE">;
           },
-        });
-      }
+        };
+      });
     })();
 
     return {
       pid: processHandle.pid,
       events,
-      completion: completion.promise,
-      cancel,
+      completion: lifecycle.completion,
+      cancel: (reason) => lifecycle.cancel(reason),
     };
   }
 }
 
 export const codexWorker: Worker<"codex"> = new CodexWorker();
 
+/**
+ * Codex 0.145.0 can suppress project `AGENTS.md` through
+ * `project_doc_max_bytes=0`. Its `--ignore-user-config` flag suppresses only
+ * `$CODEX_HOME/config.toml`; global `$CODEX_HOME/AGENTS.md` remains ambient.
+ */
 export function buildCodexCommand(spec: CodexWorkerSpec): string[] {
+  validateMaxTurns(spec.maxTurns);
+  const laneProfile = codexLaneProfile(spec);
   const command = [
     "codex",
     "exec",
@@ -250,13 +222,13 @@ export function buildCodexCommand(spec: CodexWorkerSpec): string[] {
     spec.model,
     "-c",
     `model_reasoning_effort=${spec.effort}`,
-    "--sandbox",
-    spec.sandbox.filesystem.workspaceAccess === "edit"
-      ? "workspace-write"
-      : "read-only",
+    "-c",
+    'default_permissions="brigadier_lane"',
+    "-c",
+    `permissions.brigadier_lane=${laneProfile}`,
   ];
-  if (spec.sandbox.filesystem.workspaceAccess === "edit") {
-    command.push("-c", "sandbox_workspace_write.network_access=false");
+  if (spec.instructionFiles.user === "exclude") {
+    command.push("--ignore-user-config");
   }
   if (spec.instructionFiles.project === "exclude") {
     command.push("-c", "project_doc_max_bytes=0");
@@ -265,6 +237,23 @@ export function buildCodexCommand(spec: CodexWorkerSpec): string[] {
   // separate positional prompt as a synthetic <stdin> block.
   command.push("-");
   return command;
+}
+
+function codexLaneProfile(spec: CodexWorkerSpec): string {
+  const permissions: string[] = ['"."="read"'];
+  if (spec.sandbox.filesystem.workspaceAccess === "edit") {
+    for (const path of new Set(spec.sandbox.filesystem.editablePaths)) {
+      permissions.push(`${JSON.stringify(path)}="write"`);
+    }
+  }
+  return `{filesystem={":root"="read",":workspace_roots"={${permissions.join(",")}}},network={enabled=false}}`;
+}
+
+function validateMaxTurns(maxTurns: number | null): void {
+  if (maxTurns !== null && (!Number.isSafeInteger(maxTurns) || maxTurns < 1)) {
+    throw new RangeError("maxTurns must be null or a positive whole number");
+  }
+  // `codex exec` is one-shot and therefore cannot exceed any positive cap.
 }
 
 function mapCodexEvent(raw: unknown): WorkerEvent {
