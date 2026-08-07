@@ -29,6 +29,7 @@ const PUBLIC_API: readonly string[] = [
   "ConfigValidationError",
   "DEFAULT_EFFORT_CEILING",
   "DEFAULT_IDLE_TIMEOUT_MS",
+  "DIFFICULTY_FLOORS",
   "EFFORT_LADDER",
   "FAILURE_KINDS",
   "GitWorktreeEngine",
@@ -55,8 +56,10 @@ const PUBLIC_API: readonly string[] = [
   "readNdjson",
   "resolveConfigHome",
   "resolveConfigPath",
+  "route",
   "runInit",
   "serializeConfig",
+  "validatePlan",
   "withDefaultModel",
   "withEffortCeiling",
   "withQuotaFallback",
@@ -68,7 +71,7 @@ test("root barrel exposes exactly the curated public surface", () => {
   const exports = Object.keys(packageApi).sort();
 
   expect(exports).toEqual([...PUBLIC_API]);
-  expect(exports).toHaveLength(46);
+  expect(exports).toHaveLength(49);
 });
 
 test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {
@@ -109,12 +112,20 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     "EFFORT_CEILING_WARNING",
     "ROUTER_NOTE",
     "FALLBACK_NONE_LABEL",
+    // Routing internals. `COMPETENCE_TABLE` and `DIFFICULTY_FLOORS` are API
+    // because decision #7 promises the ranking is auditable data; the scoring
+    // path that reads them is how the router and `init` stay in agreement, and
+    // exporting it would freeze the table's shape rather than its contents.
+    "matchCompetenceRule",
+    "scoreModelId",
+    "UNRANKED_RATIONALE",
+    "UNRANKED_SCORE",
   ];
 
   for (const name of mustNotLeak) {
     expect(exports).not.toContain(name);
   }
-  expect(mustNotLeak).toHaveLength(29);
+  expect(mustNotLeak).toHaveLength(33);
 });
 
 test("built dist output executes the Codex quota oracle under Node", () => {

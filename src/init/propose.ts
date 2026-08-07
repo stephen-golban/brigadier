@@ -2,11 +2,16 @@
  * Turning a `DiscoveryReport` into a proposed config, plus the pure transforms
  * `init` applies when a user overrides a proposal.
  *
- * The competence table below *ranks* model ids brigadier has exercised; it
- * never *asserts* that a model exists. Every option offered anywhere in `init`
- * comes from the discovery report, filtered to `selectable: true`, so the week
- * a vendor ships a new model the flow still offers it (unranked, below the
- * known tiers) instead of pretending it is absent.
+ * The competence table lives in `src/routing/competence.ts` — the router is the
+ * component whose correctness depends on it, and `init` is a reader. It is
+ * re-exported here because it was part of this module's surface before the move
+ * and `init`'s barrel and the package barrel both publish it from this path.
+ *
+ * That table *ranks* model ids brigadier has exercised; it never *asserts* that
+ * a model exists. Every option offered anywhere in `init` comes from the
+ * discovery report, filtered to `selectable: true`, so the week a vendor ships a
+ * new model the flow still offers it (unranked, below the known tiers) instead
+ * of pretending it is absent.
  */
 
 import type {
@@ -27,53 +32,14 @@ import type {
   DiscoveredVendor,
   DiscoveryReport,
 } from "../discovery/contracts.js";
+import { scoreModelId } from "../routing/competence.js";
 
-/** A model-id pattern with the competence tier brigadier has observed for it. */
-export interface CompetenceRule {
-  readonly pattern: RegExp;
-  readonly score: number;
-  readonly rationale: string;
-}
-
-export const UNRANKED_SCORE = 0;
-export const UNRANKED_RATIONALE =
-  "not in brigadier's competence table; offered because the probe found it, ranked below the tiers brigadier has exercised";
-
-/**
- * Ranks by demonstrated competence, not by vendor. Two models from different
- * vendors compete on the same scale, which is what keeps decision #7 honest:
- * the proposal never says "use vendor V", only "this model outranks that one".
- */
-export const COMPETENCE_TABLE: readonly CompetenceRule[] = [
-  {
-    pattern: /opus/i,
-    score: 100,
-    rationale:
-      "deepest Anthropic reasoning tier: architecture and ambiguous specs",
-  },
-  {
-    pattern: /gpt-5\.6-sol/i,
-    score: 96,
-    rationale:
-      "deepest Codex reasoning tier: cross-cutting refactors and subtle debugging",
-  },
-  {
-    pattern: /sonnet/i,
-    score: 74,
-    rationale: "balanced Anthropic tier: well-specified multi-file edits",
-  },
-  {
-    pattern: /gpt-5\.6-terra/i,
-    score: 70,
-    rationale:
-      "fast Codex tier: mechanical volume, scaffolding, and boilerplate",
-  },
-  {
-    pattern: /haiku/i,
-    score: 40,
-    rationale: "smallest Anthropic tier: lookups and single-file transcription",
-  },
-];
+export type { CompetenceRule } from "../routing/competence.js";
+export {
+  COMPETENCE_TABLE,
+  UNRANKED_RATIONALE,
+  UNRANKED_SCORE,
+} from "../routing/competence.js";
 
 export interface RankedModel {
   readonly model: DiscoveredModel;
@@ -394,12 +360,17 @@ export function rankModels(
     }));
 }
 
+/**
+ * Scores through the router's `scoreModelId` rather than reading the table
+ * directly, so the ordering a user sees at setup and the ordering that later
+ * routes their work cannot drift apart.
+ */
 function score(model: DiscoveredModel): RankedModel {
-  const rule = COMPETENCE_TABLE.find((entry) => entry.pattern.test(model.id));
+  const ranking = scoreModelId(model.id);
   return {
     model,
-    score: rule?.score ?? UNRANKED_SCORE,
-    rationale: rule?.rationale ?? UNRANKED_RATIONALE,
+    score: ranking.score,
+    rationale: ranking.rationale,
     allowedEfforts: narrowEfforts(model.supportedEfforts),
   };
 }
