@@ -11,6 +11,8 @@
  * bare `import`, so it cannot also be an importable module for tests.
  */
 
+import { readFile } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import type {
   BrigadierConfig,
   ConfigEnvironment,
@@ -24,8 +26,31 @@ import {
   serializeConfig,
   writeConfig,
 } from "../config/index.js";
-import type { Effort, Vendor } from "../contracts.js";
+import type { AnyWorker, Effort, Vendor } from "../contracts.js";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
+import { createClaudeQuotaOracle } from "../quota/index.js";
+import type { RoutedWorker } from "../routing/index.js";
+import type {
+  LaunchEnv,
+  RunnerDependencies,
+  RunReport,
+  RunRequest,
+  SliceAttempt,
+  SliceResult,
+  SliceRunner,
+  SupervisorPorts,
+} from "../supervisor/index.js";
+import {
+  buildCapabilities,
+  createRunner,
+  createSliceRunner,
+  PlanDocumentError,
+  parsePlanDocument,
+  requireLaunchEnv,
+} from "../supervisor/index.js";
+import { createClaudeWorker, createCodexWorker } from "../worker/index.js";
+import type { MergeResult, WorktreeEngine } from "../worktree/index.js";
+import { GitWorktreeEngine } from "../worktree/index.js";
 import type { InputStream, OutputStream, PromptIo } from "./prompt.js";
 import { confirmPrompt, LineReader, selectPrompt } from "./prompt.js";
 import type {
@@ -427,21 +452,47 @@ export interface CliOptions {
   /** Injected in tests; production loads the discovery module on demand. */
   readonly discoverer?: Discoverer;
   readonly io?: ConfigIo;
+  /** The repository `run` operates on. Defaults to `process.cwd()`. */
+  readonly cwd?: string;
+  /** Injected in tests so `run` touches neither git nor a subprocess. */
+  readonly harness?: RunHarness;
 }
 
 export const USAGE = `Usage: brigadier <command> [options]
 
 Commands:
   init                 scan for installed worker CLIs and write a config
+  run                  run a plan: route every slice, spawn a worker for each,
+                       commit what it produced, and merge the lot
 
 Options for init:
   -y, --yes            accept every proposed default without prompting
       --print-config   print the resolved config as JSON and exit without writing
   -h, --help           print this message
 
+Options for run:
+      --plan <file>    the plan JSON to run; "-" reads the plan from stdin
+      --max-workers <n>
+                       slices to run at once (default 1; fan-out is earned)
+      --slug <name>    names this run's branches (default: from the plan id)
+      --dry-run        route every slice and report it; create no worktree,
+                       spawn no worker, write no commit
+      --unsafe-in-place
+                       run workers in this checkout instead of isolated
+                       worktrees; every file here becomes visible to every worker
+  -h, --help           print this message
+
 Options:
   -V, --version        print the brigadier version
   -h, --help           print this message
+
+Exit codes:
+  0  the command succeeded
+  1  brigadier could not start the run: no config, an unreadable or invalid
+     plan file, or an environment with no HOME, PATH, or USER
+  2  usage error
+  3  the run started and did not succeed; the "run failed:" line names which
+     stage stopped it, and each slice's line names what happened to it
 `;
 
 /** Parses argv and dispatches; resolves the process exit code. */
@@ -456,6 +507,22 @@ export async function runCli(options: CliOptions): Promise<number> {
   if (argv.length === 1 && (command === "--help" || command === "-h")) {
     stdout.write(USAGE);
     return 0;
+  }
+  if (command === "run") {
+    return runPlan({
+      argv: argv.slice(1),
+      env: options.env,
+      // The one `process.cwd()` read in the system, and it lives here for the
+      // same reason the one `process.env` read does: a run operates on the
+      // repository the user is standing in, and nothing deeper should have to
+      // know which one that is.
+      cwd: options.cwd ?? process.cwd(),
+      stdout,
+      stderr,
+      ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+      ...(options.io === undefined ? {} : { io: options.io }),
+      ...(options.harness === undefined ? {} : { harness: options.harness }),
+    });
   }
   if (command !== "init") {
     stderr.write(
@@ -520,6 +587,696 @@ export async function runCli(options: CliOptions): Promise<number> {
 async function loadDiscoverer(): Promise<Discoverer> {
   const discovery = await import("../discovery/index.js");
   return discovery.createDiscoverer();
+}
+
+/* ------------------------------------------------------------------------ */
+/* run                                                                       */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * `brigadier run` — the composition root.
+ *
+ * Everything under `src/supervisor` is a pure function of its inputs or reaches
+ * the outside world through `SupervisorPorts`. This is where those inputs are
+ * produced and those ports are built, and it is deliberately the only place in
+ * the product that reads the ambient environment or the working directory.
+ *
+ * THE EXIT CODES, which are an interface a CI step branches on:
+ *
+ *   0  the run succeeded.
+ *   1  brigadier could not start the run at all — no config, an unreadable or
+ *      malformed plan file, or an environment missing any of HOME, PATH, or
+ *      USER, all three of which `requireLaunchEnv` demands. Nothing was
+ *      created, and the fix is outside the plan.
+ *   2  usage error: an unknown option, a missing `--plan`, a bad `--slug` or
+ *      `--max-workers`, or a bare positional argument.
+ *   3  the run started and did not succeed. This is a report, not a crash: the
+ *      slices that landed are on the integration branch and the summary names
+ *      which stage stopped the rest.
+ *
+ * They are three codes rather than one per `RunFailureReason` because a caller
+ * that needs the finer answer has it printed: the reason is on the
+ * `run failed:` line by name. What a script can usefully branch on is whether
+ * the run happened at all, and that is exactly the 1/3 split.
+ */
+const RUN_OK = 0;
+const RUN_NOT_STARTED = 1;
+const RUN_USAGE_ERROR = 2;
+const RUN_FAILED = 3;
+
+/** The engine's own rule (`validateSlug`), applied before any ref is written. */
+const SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * A future `brigadier run "<task>"` will hand the description to a planner and
+ * run what comes back. That planner does not exist, so the positional form is
+ * refused rather than quietly reinterpreted — and refused with the sentence
+ * that says which half is missing, because "unknown argument" would send a user
+ * looking for a typo in a command they spelled correctly.
+ */
+const PLANNER_NOT_IMPLEMENTED =
+  "brigadier run: planning a task description is not implemented yet, so a bare argument cannot be turned into a plan. Pass a plan file with `--plan <file>`, or `--plan -` to read the plan from stdin.";
+
+/** Everything `brigadier run` decides from argv alone, before it touches disk. */
+interface RunInvocation {
+  /** A path, or `-` for stdin. */
+  readonly planSource: string;
+  /** Null means "derive it from the plan id". */
+  readonly slug: string | null;
+  readonly maxWorkers: number;
+  readonly dryRun: boolean;
+  readonly unsafeInPlace: boolean;
+}
+
+type RunArguments =
+  | { readonly kind: "run"; readonly invocation: RunInvocation }
+  | { readonly kind: "help" }
+  | { readonly kind: "usage-error"; readonly message: string };
+
+/**
+ * The seam that makes `brigadier run` testable without git and without a
+ * subprocess. Production passes nothing and gets the real engine, the real
+ * clock, and the real slice runner.
+ *
+ * The quota oracles are deliberately NOT injectable: which oracles a run reads
+ * is a product decision documented in `buildRunDependencies`, and a test that
+ * could replace them would stop proving that decision holds.
+ */
+export interface RunHarness {
+  readonly engine?: WorktreeEngine;
+  readonly now?: () => number;
+  readonly sliceRunner?: SliceRunner;
+}
+
+export interface RunOptions {
+  /** `argv` with the `run` command word already removed. */
+  readonly argv: readonly string[];
+  readonly env: ConfigEnvironment;
+  /** The repository the run operates on. */
+  readonly cwd: string;
+  readonly stdout: OutputStream;
+  readonly stderr: OutputStream;
+  /** Required only for `--plan -`. */
+  readonly stdin?: InputStream;
+  readonly io?: ConfigIo;
+  readonly harness?: RunHarness;
+}
+
+/** Runs `brigadier run` and resolves the process exit code. */
+export async function runPlan(options: RunOptions): Promise<number> {
+  const { stdout, stderr } = options;
+
+  const parsed = parseRunArguments(options.argv);
+  if (parsed.kind === "help") {
+    stdout.write(USAGE);
+    return RUN_OK;
+  }
+  if (parsed.kind === "usage-error") {
+    stderr.write(`${parsed.message}\n`);
+    stderr.write(USAGE);
+    return RUN_USAGE_ERROR;
+  }
+  const invocation = parsed.invocation;
+
+  const source = await readPlanSource(invocation.planSource, options);
+  if (!source.ok) {
+    stderr.write(`${source.message}\n`);
+    return RUN_NOT_STARTED;
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(source.text);
+  } catch (error) {
+    stderr.write(
+      `brigadier run: ${source.label} is not valid JSON: ${describe(error)}\n`,
+    );
+    return RUN_NOT_STARTED;
+  }
+
+  let document: RunRequest["document"];
+  try {
+    document = parsePlanDocument(parsedJson);
+  } catch (error) {
+    // Every issue, never the first one. `parsePlanDocument` collects the whole
+    // repair precisely so a user fixes a plan in one pass instead of running
+    // the CLI once per defect.
+    if (error instanceof PlanDocumentError) {
+      stderr.write(
+        `brigadier run: ${source.label} is not a valid plan document (${error.issues.length} issue(s)):\n`,
+      );
+      for (const issue of error.issues) {
+        stderr.write(`  ${issue}\n`);
+      }
+      return RUN_NOT_STARTED;
+    }
+    stderr.write(
+      `brigadier run: could not read the plan: ${describe(error)}\n`,
+    );
+    return RUN_NOT_STARTED;
+  }
+
+  const loaded = await loadRunConfig(options);
+  if (!loaded.ok) {
+    stderr.write(`${loaded.message}\n`);
+    return RUN_NOT_STARTED;
+  }
+
+  // The one legitimate `process.env` read in the system arrives here, already
+  // narrowed by the caller. A machine missing HOME, PATH, or USER cannot launch
+  // any worker for any slice — USER included, because Claude Code resolves its
+  // OAuth credentials through it — so it is refused before a ref is written
+  // rather than rediscovered once per slice.
+  let env: LaunchEnv;
+  try {
+    env = requireLaunchEnv(options.env);
+  } catch (error) {
+    stderr.write(`brigadier run: ${describe(error)}\n`);
+    return RUN_NOT_STARTED;
+  }
+
+  const slug = invocation.slug ?? deriveSlug(document.plan.id);
+  if (slug === null) {
+    stderr.write(
+      `brigadier run: no branch-safe slug can be derived from plan id ${JSON.stringify(document.plan.id)}; pass --slug <name> (letters, digits, dots, underscores, and hyphens, starting with a letter or digit)\n`,
+    );
+    return RUN_NOT_STARTED;
+  }
+
+  const dependencies = buildRunDependencies({
+    config: loaded.config,
+    env,
+    log: (line: string) => {
+      stdout.write(`${line}\n`);
+    },
+    ...(options.harness === undefined ? {} : { harness: options.harness }),
+  });
+
+  const request: RunRequest = {
+    document,
+    repositoryPath: options.cwd,
+    slug,
+    maxWorkers: invocation.maxWorkers,
+    dryRun: invocation.dryRun,
+    unsafeInPlace: invocation.unsafeInPlace,
+  };
+
+  let report: RunReport;
+  try {
+    report = await createRunner(dependencies).run(request);
+  } catch (error) {
+    // `run` is documented to report rather than throw for anything a caller can
+    // legitimately hand it, so this is a defect rather than an outcome. It still
+    // owes the user a sentence instead of a stack trace.
+    stderr.write(
+      `brigadier run: the run did not complete: ${describe(error)}\n`,
+    );
+    return RUN_NOT_STARTED;
+  } finally {
+    await disposeOracles(dependencies.ports, stderr);
+  }
+
+  renderRunReport(stdout, report);
+  return report.ok ? RUN_OK : RUN_FAILED;
+}
+
+/**
+ * Everything a run composes, in one function, so the ports a test asserts
+ * against are the ports the CLI actually builds rather than a reimplementation
+ * of them.
+ */
+export interface RunDependenciesInput {
+  readonly config: BrigadierConfig;
+  readonly env: LaunchEnv;
+  readonly log: (line: string) => void;
+  readonly harness?: RunHarness;
+}
+
+export function buildRunDependencies(
+  input: RunDependenciesInput,
+): RunnerDependencies {
+  const harness = input.harness ?? {};
+  const ports: SupervisorPorts = {
+    engine: harness.engine ?? new GitWorktreeEngine(),
+    // Bound to the executable `brigadier init` recorded for each vendor. The
+    // config is the only place that knows where this machine's CLIs live —
+    // a Homebrew path, a version-manager shim, a checkout — and an adapter
+    // built without it falls back to a bare `claude` / `codex` off PATH, which
+    // is a different binary whenever the user's PATH is not the probe's.
+    workerFor: createWorkerFactory(input.config),
+    // ONLY THE CLAUDE ORACLE, AND THIS IS A DELIBERATE V1 TRADE.
+    //
+    // Claude's oracle is push-based: a plain object the slice runner ingests
+    // worker events into, costing no process and no probe. Codex's is
+    // pull-based and backs itself with a real `codex app-server` subprocess, so
+    // wiring it here would mean every run — including a dry run, and including
+    // a run that touches no Codex model at all — starts by spawning a vendor
+    // process and waiting on it. A vendor problem entirely unrelated to the
+    // user's plan would then be able to hang the whole supervisor before it did
+    // any work.
+    //
+    // THE PRICE, STATED HONESTLY: with no Codex snapshot, the router sees no
+    // Codex quota. `judgeQuota` reads an absent snapshot as "unknown", which the
+    // pipeline treats as available, so a drained Codex model is NOT avoided up
+    // front. It is routed to, the spawn fails, and the slice's earned escalation
+    // handles it — one wasted worktree and one wasted attempt instead of a
+    // routing decision that never had to be made. That is worse than knowing,
+    // and better than a supervisor that cannot start.
+    oracles: [createClaudeQuotaOracle()],
+    now: harness.now ?? ((): number => Date.now()),
+    log: input.log,
+  };
+  return {
+    ports,
+    config: input.config,
+    capabilities: buildCapabilities(input.config),
+    sliceRunner:
+      harness.sliceRunner ?? createSliceRunner({ ports, env: input.env }),
+  };
+}
+
+/**
+ * Resolves each configured vendor to an adapter bound to that vendor's recorded
+ * executable, and every other vendor to null.
+ *
+ * Null rather than a default adapter is the whole point: an unconfigured vendor
+ * is one `brigadier init` did not find, and handing back an adapter that would
+ * spawn a bare `codex` off PATH would launch a binary the config never approved.
+ * The slice runner turns the null into a `LAUNCH_FAILURE` naming the vendor.
+ *
+ * The adapters are built once and shared across every slice in the run. They
+ * hold no per-launch state — each `spawn` builds its own event queue, lifecycle,
+ * and process handle — so sharing them is safe and keeps a concurrent wave from
+ * re-resolving the same path per slice.
+ */
+export function createWorkerFactory(
+  config: BrigadierConfig,
+): (vendor: Vendor) => AnyWorker | null {
+  const adapters = new Map<Vendor, AnyWorker>();
+  for (const entry of config.vendors) {
+    adapters.set(entry.vendor, adapterFor(entry));
+  }
+  return (vendor: Vendor): AnyWorker | null => adapters.get(vendor) ?? null;
+}
+
+/**
+ * A `switch` with no `default`, so a third vendor added to `Vendor` stops
+ * compiling here rather than silently resolving to null at runtime.
+ */
+function adapterFor(entry: VendorConfig): AnyWorker {
+  switch (entry.vendor) {
+    case "claude":
+      return createClaudeWorker({ executable: entry.executable });
+    case "codex":
+      return createCodexWorker({ executable: entry.executable });
+  }
+}
+
+/**
+ * Releases anything an oracle owns. Failures are reported and swallowed: the run
+ * is already over, and a dispose error must not change its exit code.
+ */
+async function disposeOracles(
+  ports: SupervisorPorts,
+  stderr: OutputStream,
+): Promise<void> {
+  const settled = await Promise.allSettled(
+    ports.oracles.map((oracle) => oracle.dispose()),
+  );
+  for (const [index, outcome] of settled.entries()) {
+    if (outcome.status === "rejected") {
+      const vendor = ports.oracles[index]?.vendor ?? "unknown";
+      stderr.write(
+        `brigadier run: could not dispose the ${vendor} quota oracle: ${describe(outcome.reason)}\n`,
+      );
+    }
+  }
+}
+
+type LoadedConfig =
+  | { readonly ok: true; readonly config: BrigadierConfig }
+  | { readonly ok: false; readonly message: string };
+
+/**
+ * Reads the machine's config, or explains what to do about not having one.
+ *
+ * Both failures point at `brigadier init`, and they are worded apart on
+ * purpose: "there is no config" and "the config you have cannot be trusted" ask
+ * the same command of the user for different reasons, and a user who has run
+ * `init` before needs to know which one they are looking at.
+ */
+async function loadRunConfig(options: RunOptions): Promise<LoadedConfig> {
+  let configPath: string;
+  try {
+    configPath = resolveConfigPath(options.env);
+  } catch (error) {
+    return {
+      ok: false,
+      message: `brigadier run: ${describe(error)}`,
+    };
+  }
+
+  let config: BrigadierConfig | null;
+  try {
+    config =
+      options.io === undefined
+        ? await readConfig(configPath)
+        : await readConfig(configPath, options.io);
+  } catch (error) {
+    return {
+      ok: false,
+      message: `brigadier run: the config at ${configPath} cannot be used: ${describe(error)}. Re-run \`brigadier init\` to rebuild it.`,
+    };
+  }
+  if (config === null) {
+    return {
+      ok: false,
+      message: `brigadier run: no brigadier config was found at ${configPath}. Run \`brigadier init\` to scan this machine for worker CLIs and write one.`,
+    };
+  }
+  return { ok: true, config };
+}
+
+type PlanSource =
+  | { readonly ok: true; readonly text: string; readonly label: string }
+  | { readonly ok: false; readonly message: string };
+
+/** Reads the plan bytes from a file or from stdin. */
+async function readPlanSource(
+  planSource: string,
+  options: RunOptions,
+): Promise<PlanSource> {
+  if (planSource === "-") {
+    const stdin = options.stdin;
+    if (stdin === undefined) {
+      return {
+        ok: false,
+        message:
+          "brigadier run: --plan - was given, but this process has no stdin to read the plan from",
+      };
+    }
+    try {
+      return {
+        ok: true,
+        text: await readAllInput(stdin),
+        label: "the plan on stdin",
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message: `brigadier run: could not read the plan from stdin: ${describe(error)}`,
+      };
+    }
+  }
+
+  const path = resolvePath(options.cwd, planSource);
+  try {
+    return { ok: true, text: await readFile(path, "utf8"), label: path };
+  } catch (error) {
+    return {
+      ok: false,
+      message: `brigadier run: could not read the plan file ${path}: ${describe(error)}`,
+    };
+  }
+}
+
+/**
+ * Drains an input stream to a string. Bounded by the stream ending, which is
+ * the caller's contract: `--plan -` is a deliberate request to read until EOF.
+ */
+async function readAllInput(input: InputStream): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  for await (const chunk of input) {
+    text +=
+      typeof chunk === "string"
+        ? chunk
+        : decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+/**
+ * Turns a plan id into a branch-safe slug, or null when nothing usable is left.
+ *
+ * Null rather than a fallback like `run`: the slug names every ref the run
+ * creates, so a silent substitution would make two different plans collide on
+ * one set of branches. `--slug` is the answer, and the diagnostic says so.
+ */
+function deriveSlug(planId: string): string | null {
+  const slug = planId
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/, "");
+  return SLUG_PATTERN.test(slug) ? slug : null;
+}
+
+/**
+ * Parses `run`'s options. Pure, and total: every path returns one of the three
+ * members rather than throwing.
+ *
+ * `--plan` is an option rather than a positional argument, and that is a
+ * decision rather than a style: the positional slot is reserved for the task
+ * description a future planner will consume, and a `--plan` that also accepted
+ * a bare path would make `brigadier run plan.json` and `brigadier run "fix the
+ * parser"` indistinguishable at the moment the planner ships.
+ */
+function parseRunArguments(argv: readonly string[]): RunArguments {
+  let planSource: string | null = null;
+  let slug: string | null = null;
+  let maxWorkers = 1;
+  let dryRun = false;
+  let unsafeInPlace = false;
+
+  let index = 0;
+  while (index < argv.length) {
+    const argument = argv[index] ?? "";
+    index += 1;
+
+    if (argument === "--help" || argument === "-h") {
+      // Help is help wherever it appears, exactly as `init` treats it.
+      return { kind: "help" };
+    }
+
+    const equals = argument.startsWith("--") ? argument.indexOf("=") : -1;
+    const name = equals > 0 ? argument.slice(0, equals) : argument;
+    const inline = equals > 0 ? argument.slice(equals + 1) : null;
+
+    if (name === "--plan" || name === "--slug" || name === "--max-workers") {
+      let value = inline;
+      if (value === null) {
+        value = argv[index] ?? null;
+        index += 1;
+      }
+      if (value === null || value === "") {
+        return {
+          kind: "usage-error",
+          message: `brigadier run: ${name} requires a value`,
+        };
+      }
+      if (name === "--plan") {
+        planSource = value;
+        continue;
+      }
+      if (name === "--slug") {
+        if (!SLUG_PATTERN.test(value)) {
+          return {
+            kind: "usage-error",
+            message: `brigadier run: --slug ${JSON.stringify(value)} is not branch-safe; use letters, digits, dots, underscores, and hyphens, starting with a letter or digit`,
+          };
+        }
+        slug = value;
+        continue;
+      }
+      const parsed = parsePositiveInteger(value);
+      if (parsed === null) {
+        return {
+          kind: "usage-error",
+          message: `brigadier run: --max-workers must be a positive whole number, received ${JSON.stringify(value)}`,
+        };
+      }
+      maxWorkers = parsed;
+      continue;
+    }
+
+    if (argument === "--dry-run") {
+      dryRun = true;
+      continue;
+    }
+    if (argument === "--unsafe-in-place") {
+      unsafeInPlace = true;
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      return {
+        kind: "usage-error",
+        message: `brigadier run: unknown option ${JSON.stringify(argument)}`,
+      };
+    }
+    return { kind: "usage-error", message: PLANNER_NOT_IMPLEMENTED };
+  }
+
+  if (planSource === null) {
+    return {
+      kind: "usage-error",
+      message:
+        "brigadier run: --plan <file> is required; pass a plan JSON file, or `--plan -` to read it from stdin",
+    };
+  }
+  return {
+    kind: "run",
+    invocation: { planSource, slug, maxWorkers, dryRun, unsafeInPlace },
+  };
+}
+
+/** Digits only: `Number.parseInt` would accept `3abc` and `1e9`. */
+function parsePositiveInteger(value: string): number | null {
+  if (!/^[0-9]+$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Prints the report a user acts on.
+ *
+ * One line per slice, then one line per attempt beneath it, because the two
+ * answer different questions: the slice line says whether the work landed, and
+ * the attempt lines say who did it and at what effort. Printing only the last
+ * attempt would hide the escalation — a slice that failed on one model and
+ * succeeded on a stronger one is the single most interesting outcome a run
+ * produces, and it is invisible from the verdict alone.
+ *
+ * A DRY RUN PRINTS THE SAME ATTEMPT LINES, which is the point of the flag: the
+ * question it answers is "who would do this work, and how expensive is that"
+ * before a worktree is spent. It also has to be read through `report.dryRun`
+ * rather than through each slice's `ok`, because a routed-but-unrun slice is
+ * `ok: false` by construction — the successful arm of `SliceResult` demands a
+ * commit a dry run never produces.
+ */
+function renderRunReport(out: OutputStream, report: RunReport): void {
+  out.write(
+    `\n${report.dryRun ? "dry run" : "run"} ${report.slug}: ${report.slices.length} slice(s) in ${report.durationMs}ms\n`,
+  );
+  for (const slice of report.slices) {
+    out.write(`  ${slice.sliceId}  ${describeSliceVerdict(report, slice)}\n`);
+    for (const attempt of slice.attempts) {
+      out.write(
+        `      attempt ${attempt.attempt}  ${describeRouted(attempt.routed)}  ${describeAttempt(attempt)}\n`,
+      );
+      renderRejections(out, attempt);
+    }
+  }
+
+  out.write(`  integration branch: ${describeIntegration(report)}\n`);
+  if (report.merges.length === 0) {
+    out.write("  merges: (none)\n");
+  } else {
+    out.write("  merges:\n");
+    for (const merge of report.merges) {
+      out.write(`    ${merge.sliceId}: ${describeMerge(merge.result)}\n`);
+    }
+  }
+  if (report.planIssues.length > 0) {
+    out.write("  plan issues:\n");
+    for (const issue of report.planIssues) {
+      out.write(`    ${issue.code}: ${issue.message}\n`);
+    }
+  }
+  if (report.failure !== null) {
+    out.write(
+      `  run failed: ${report.failure.reason} — ${report.failure.message}\n`,
+    );
+  }
+}
+
+/**
+ * The router's rejection list, printed in full for every routing failure.
+ *
+ * This array is the entire diagnosis. "No configured model can take this slice"
+ * is not actionable on its own; "sonnet scored 74 against a hard floor of 90,
+ * and opus is quota-exhausted" tells the user whether to re-slice the plan,
+ * lower the difficulty, or wait for a window. Summarizing it would leave a user
+ * with a refusal and no way to answer it.
+ */
+function renderRejections(out: OutputStream, attempt: SliceAttempt): void {
+  const failure = attempt.failure;
+  if (failure === null || failure.kind !== "ROUTING_FAILED") {
+    return;
+  }
+  if (failure.rejected.length === 0) {
+    out.write("        rejected: (no model reached a routing stage)\n");
+    return;
+  }
+  for (const rejection of failure.rejected) {
+    out.write(
+      `        rejected ${rejection.vendor}/${rejection.model} [${rejection.stage}]: ${rejection.reason}\n`,
+    );
+  }
+}
+
+/**
+ * The verdict line, which must never be read off `report.dryRun` alone.
+ *
+ * A dry run's slices are all `ok: false` by construction, so the flag cannot be
+ * the first question — a slice that FAILED TO ROUTE during a dry run is exactly
+ * the answer the user asked for, and labelling it "would run" would report a
+ * refusal as a plan. The failure is therefore checked first, and "would run" is
+ * reserved for a slice that routed and was deliberately not executed.
+ */
+function describeSliceVerdict(report: RunReport, slice: SliceResult): string {
+  if (slice.ok) {
+    return `ok  ${slice.branch}  ${slice.commit}`;
+  }
+  const kind = slice.attempts.at(-1)?.failure?.kind;
+  if (kind !== undefined) {
+    return `failed  ${kind}`;
+  }
+  if (slice.attempts.length === 0) {
+    return "failed  (not attempted)";
+  }
+  // Routed, nothing went wrong, and nothing ran: a dry run, or a slice the
+  // pre-flight routed before a sibling's failure stopped the run.
+  return report.dryRun ? "would run" : "not run  (the run stopped first)";
+}
+
+function describeRouted(routed: RoutedWorker | null): string {
+  if (routed === null) {
+    return "unrouted";
+  }
+  const waived = routed.waivedDifficultyFloor
+    ? " (below this slice's difficulty floor; allowDegradedRouting is on)"
+    : "";
+  return `${routed.vendor}/${routed.model} effort=${routed.effort}${waived}`;
+}
+
+/**
+ * `routed` rather than `ok` for an attempt with no commit: committing is the
+ * last thing a real attempt does, so an attempt that failed nothing and
+ * committed nothing did not run — on a dry run by design, and otherwise because
+ * the run stopped around it.
+ */
+function describeAttempt(attempt: SliceAttempt): string {
+  const failure = attempt.failure;
+  if (failure !== null) {
+    return `${failure.kind}: ${failure.message}`;
+  }
+  return attempt.commit === null ? "routed" : `ok ${attempt.commit}`;
+}
+
+function describeIntegration(report: RunReport): string {
+  if (report.integrationBranch !== null) {
+    return report.integrationBranch;
+  }
+  return report.dryRun
+    ? "(none: a dry run writes no ref)"
+    : "(none: nothing was merged)";
+}
+
+function describeMerge(result: MergeResult): string {
+  return result.status === "conflicted"
+    ? `conflicted — ${result.details}`
+    : `${result.status} ${result.commit}`;
 }
 
 export type { Choice, InputStream, OutputStream } from "./prompt.js";

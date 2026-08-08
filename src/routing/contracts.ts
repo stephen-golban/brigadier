@@ -47,10 +47,28 @@ export interface SliceRequirements {
   readonly minContextWindowTokens?: number;
 }
 
+/**
+ * One exact model the caller has already tried for this slice.
+ *
+ * Exclusion is identity-based observed history, never preference-based: it
+ * means this `(vendor, model)` pair already failed this exact slice. The vendor
+ * is part of the key because two vendors may ship colliding model ids, not
+ * because vendor is allowed to influence ranking. Passing every model of one
+ * vendor would turn this fact into the vendor preference this contract forbids;
+ * callers must not use `excluded` that way. Moving a model up or down remains a
+ * visible edit to the competence matrix.
+ */
+export interface ExcludedModel {
+  readonly vendor: Vendor;
+  readonly model: string;
+}
+
 export interface RoutingRequest {
   readonly slice: Slice;
   readonly difficulty: SliceDifficulty;
   readonly requires?: SliceRequirements;
+  /** Models this slice already ran on and failed. */
+  readonly excluded?: readonly ExcludedModel[];
   /**
    * True only when this slice already ran and failed its gate. This is the ONLY
    * thing that can unlock `xhigh` (decisions #9/#20): above `high`, models take
@@ -117,7 +135,7 @@ export interface RoutedWorker {
 export type RoutingFailureReason =
   /** No vendor in the config lists a model. `brigadier init` was never run. */
   | "NO_CONFIGURED_MODELS"
-  /** Models exist, but none survived the capability, competence, or effort stages. */
+  /** Models exist, but none survived exclusion, capability, competence, or effort. */
   | "NO_CAPABLE_MODEL"
   /** Quota exhaustion removed every model of every configured vendor. */
   | "ALL_VENDORS_EXHAUSTED";
@@ -141,6 +159,6 @@ export type RoutingDecision =
 export interface RoutingRejection {
   readonly vendor: Vendor;
   readonly model: string;
-  readonly stage: "quota" | "capability" | "competence" | "effort";
+  readonly stage: "quota" | "excluded" | "capability" | "competence" | "effort";
   readonly reason: string;
 }

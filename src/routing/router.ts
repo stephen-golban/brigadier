@@ -2,13 +2,14 @@
  * The routing engine: one slice plus a judgement of how hard it is, in; one
  * `{vendor, model, effort}` plus the trace that produced it, out.
  *
- * The pipeline is decision #7's, in order — quota, capability filter,
- * competence rank, difficulty, effort, cost — and vendor is not a stage. Every
- * configured model from every configured vendor enters one pool and competes on
- * the competence scale in `./competence.ts`; nothing in this file may branch on
- * `entry.vendor` to prefer one, and the only places vendor is read at all are
- * quota (which is scoped to an account, so it has to be) and the identity of the
- * result.
+ * The pipeline is decision #7's, in order — quota, exclusion, capability
+ * filter, competence rank, difficulty, effort, cost — and vendor is not a
+ * stage. Exclusion is an eligibility fact about an exact model that already
+ * failed this slice, not a ranking input. Every configured model from every
+ * configured vendor otherwise enters one pool and competes on the competence
+ * scale in `./competence.ts`; nothing in this file may branch on `entry.vendor`
+ * to prefer one, and the only places vendor is read at all are quota (which is
+ * scoped to an account, so it has to be) and the identity of a model.
  *
  * The rules below are product decisions rather than implementation choices, and
  * every one of them is load-bearing:
@@ -87,6 +88,7 @@ import {
   scoreModelId,
 } from "./competence.js";
 import type {
+  ExcludedModel,
   RoutingDecision,
   RoutingInput,
   RoutingRejection,
@@ -245,7 +247,7 @@ export function route(
   );
 
   let quotaLine = `quota: ${describeQuotaStatuses(input.config, observations)}`;
-  const working: readonly PooledModel[] = judgements
+  const quotaWorking: readonly PooledModel[] = judgements
     .filter((judgement) => judgement.status !== "exhausted")
     .map((judgement) => judgement.entry);
 
@@ -274,6 +276,34 @@ export function route(
     rationale.push(
       `quota warning: ${warned.map(describeJudgement).join(", ")} — kept in the pool, since a warning says a window is close, not that it is spent`,
     );
+  }
+
+  // Exclusion runs after quota, so a model that is both drained and excluded
+  // receives the quota rejection only. Quota was the first fact that made it
+  // unrunnable, and one pooled candidate must produce one rejection rather than
+  // being double-counted. It still runs before competence ranking: a model
+  // known to have failed this slice must never win a rank and only then be
+  // discarded, and filtering here also keeps it out of the salvage pool that
+  // `selectWorker` derives from its input.
+  const working = excludeModels(quotaWorking, request.excluded, rejections);
+  const excludedCount = quotaWorking.length - working.length;
+  if (excludedCount > 0) {
+    const excludedPairs = rejections
+      .filter((rejection) => rejection.stage === "excluded")
+      .map((rejection) => `${rejection.vendor}/${rejection.model}`)
+      .join(", ");
+    rationale.push(
+      `exclusion: removed ${excludedCount} of ${quotaWorking.length} model(s) before competence ranking — ${excludedPairs}`,
+    );
+  }
+
+  if (quotaWorking.length > 0 && working.length === 0) {
+    return {
+      ok: false,
+      reason: "NO_CAPABLE_MODEL",
+      message: `exclusion removed all ${excludedCount} model(s) available after quota for slice ${JSON.stringify(request.slice.id)}; no model remains to run it`,
+      rejected: rejections,
+    };
   }
 
   const outcome = selectWorker(working, request, capabilities, rejections);
@@ -377,6 +407,36 @@ function buildPool(config: BrigadierConfig): readonly PooledModel[] {
     }
   }
   return pool;
+}
+
+/* ---------------------------- exclusion stage --------------------------- */
+
+function excludeModels(
+  pool: readonly PooledModel[],
+  excluded: readonly ExcludedModel[] | undefined,
+  rejections: RoutingRejection[],
+): readonly PooledModel[] {
+  if (excluded === undefined || excluded.length === 0) {
+    return pool;
+  }
+
+  const excludedKeys = new Set(
+    excluded.map((entry) => keyOf(entry.vendor, entry.model)),
+  );
+  const survivors: PooledModel[] = [];
+  for (const entry of pool) {
+    if (!excludedKeys.has(keyOf(entry.vendor, entry.model))) {
+      survivors.push(entry);
+      continue;
+    }
+    rejections.push({
+      vendor: entry.vendor,
+      model: entry.model,
+      stage: "excluded",
+      reason: `${describe(entry)} already ran this slice and failed its gate`,
+    });
+  }
+  return survivors;
 }
 
 /* ------------------------------- stage 1 -------------------------------- */

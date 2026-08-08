@@ -21,6 +21,12 @@
  * since the matrix moved out of `init`. `./init/index.js` still re-exports it
  * so `init` compiles against one copy, but exporting it from both barrels here
  * would be an ambiguous re-export. The public name is unchanged either way.
+ *
+ * `supervisor` re-exports its own curated barrel wholesale, like `config` and
+ * `worker` do: the curation already happened there, in the module that knows
+ * which of its exports are entry points and which are the numbering scheme and
+ * worker pool behind them. Read its header for the inclusions and the
+ * exclusions; nothing is filtered a second time here.
  */
 
 export * from "./config/index.js";
@@ -68,12 +74,12 @@ export type {
   PlanIssue,
   PlanIssueCode,
   PlanValidation,
-  PlanValidationOptions,
 } from "./plan/index.js";
 export { validatePlan } from "./plan/index.js";
 export * from "./quota/index.js";
 export type {
   CompetenceRule,
+  ExcludedModel,
   RoutedWorker,
   RoutingDecision,
   RoutingFailureReason,
@@ -84,5 +90,6 @@ export type {
   SliceRequirements,
 } from "./routing/index.js";
 export { COMPETENCE_TABLE, DIFFICULTY_FLOORS, route } from "./routing/index.js";
+export * from "./supervisor/index.js";
 export * from "./worker/index.js";
 export * from "./worktree/index.js";

@@ -14,7 +14,7 @@ export type PlanIssueCode =
   | "UNKNOWN_DEPENDENCY"
   | "SELF_DEPENDENCY"
   | "DEPENDENCY_CYCLE"
-  | "TOO_MANY_CONCURRENT_SLICES";
+  | "DEPENDENCIES_UNSUPPORTED";
 
 /** One independently actionable reason a proposed plan cannot be scheduled. */
 export interface PlanIssue {
@@ -26,18 +26,15 @@ export interface PlanIssue {
   readonly paths: readonly string[];
 }
 
-export interface PlanValidationOptions {
-  /**
-   * Fan-out is an explicit supervisor decision. Requiring the limit here keeps
-   * a caller from accidentally gaining concurrency through a library default.
-   */
-  readonly maxWorkers: number;
-}
-
 export type PlanValidation =
   | {
       readonly ok: true;
-      /** Every member of a wave has all dependencies satisfied by prior waves. */
+      /**
+       * Every member of a wave has all dependencies satisfied by prior waves.
+       * Waves describe structure, not a concurrency limit. Fan-out remains an
+       * explicit supervisor decision because `RunRequest.maxWorkers` is
+       * required rather than supplied by a library default.
+       */
       readonly waves: readonly (readonly string[])[];
       /** The scheduler and sandbox consume the same canonical path spellings. */
       readonly normalizedPaths: ReadonlyMap<string, readonly string[]>;

@@ -17,6 +17,7 @@ const repositoryRoot = resolve(import.meta.dir, "..");
  */
 const PUBLIC_API: readonly string[] = [
   "ADAPTER_DECLARATIONS",
+  "ATTEMPT_LIMIT",
   "CLAUDE_STATIC_MODELS",
   "COMPETENCE_TABLE",
   "CONFIG_FILE_NAME",
@@ -36,24 +37,35 @@ const PUBLIC_API: readonly string[] = [
   "IDLE_TIMEOUT_BOUNDARY_MS",
   "LinkedSecretCommitError",
   "NoChangesToCommitError",
+  "PlanDocumentError",
+  "RUN_FAILURE_REASONS",
+  "SLICE_FAILURE_KINDS",
   "VendorDiscoverer",
+  "buildCapabilities",
   "buildClaudeCommand",
   "buildCodexCommand",
+  "buildWorkerSpec",
   "claudeWorker",
   "codexWorker",
   "createClaudeQuotaOracle",
+  "createClaudeWorker",
   "createCodexQuotaOracle",
+  "createCodexWorker",
   "createDiscoverer",
   "createIdleTimeoutMs",
+  "createRunner",
+  "createSliceRunner",
   "defaultEffortCeiling",
   "narrowEfforts",
   "normalizeClaudeRateLimitEvent",
   "normalizeCodexRateLimits",
   "parseCodexCatalog",
   "parseConfig",
+  "parsePlanDocument",
   "proposeConfig",
   "readConfig",
   "readNdjson",
+  "requireLaunchEnv",
   "resolveConfigHome",
   "resolveConfigPath",
   "route",
@@ -71,7 +83,7 @@ test("root barrel exposes exactly the curated public surface", () => {
   const exports = Object.keys(packageApi).sort();
 
   expect(exports).toEqual([...PUBLIC_API]);
-  expect(exports).toHaveLength(49);
+  expect(exports).toHaveLength(61);
 });
 
 test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {
@@ -80,6 +92,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
   // Asserted one at a time: `not.toEqual(arrayContaining([a, b]))` passes as
   // soon as a single name is absent, so a list of them proves almost nothing.
   const mustNotLeak: readonly string[] = [
+    "PlanValidationOptions",
     "isObject",
     "stringValue",
     "failure",
@@ -95,6 +108,19 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     // CLI internals: `src/cli.ts` imports these from `./init/index.js`.
     "runCli",
     "USAGE",
+    "runPlan",
+    "buildRunDependencies",
+    "createWorkerFactory",
+    // Supervisor internals. The orchestrator's branch numbering and its worker
+    // pool are a contract with `GitWorktreeEngine`'s refs, not with a consumer;
+    // `DefaultSliceRunner` is the class behind `createSliceRunner`; and the
+    // capability table is the lookup behind `buildCapabilities`, whose derived
+    // `Capability[]` is the artifact worth auditing.
+    "allocateAttemptSlots",
+    "runBounded",
+    "DefaultSliceRunner",
+    "CAPABILITY_TABLE",
+    "matchCapabilityRule",
     // Discovery wiring and low-level readers.
     "VENDOR_CATALOG_SOURCES",
     "CLAUDE_CATALOG_SOURCE",
@@ -125,7 +151,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
   for (const name of mustNotLeak) {
     expect(exports).not.toContain(name);
   }
-  expect(mustNotLeak).toHaveLength(33);
+  expect(mustNotLeak).toHaveLength(42);
 });
 
 test("built dist output executes the Codex quota oracle under Node", () => {

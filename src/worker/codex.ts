@@ -36,11 +36,21 @@ import {
   writePromptAndClose,
 } from "./shared.ts";
 
+export interface CodexWorkerOptions {
+  readonly executable?: string;
+}
+
 export class CodexWorker implements Worker<"codex"> {
   readonly vendor = "codex" as const;
   readonly processCompletion = "self-exits" as const;
+  private readonly executable: string;
 
-  constructor(private readonly shutdown?: ShutdownProcess) {}
+  constructor(
+    private readonly shutdown?: ShutdownProcess,
+    options: CodexWorkerOptions = {},
+  ) {
+    this.executable = executableOrDefault(options.executable, "codex");
+  }
 
   async spawn(spec: CodexWorkerSpec): Promise<SpawnedWorker> {
     createIdleTimeoutMs(spec.idleTimeoutMs);
@@ -49,7 +59,7 @@ export class CodexWorker implements Worker<"codex"> {
     let processHandle: DetachedProcess;
 
     try {
-      const command = buildCodexCommand(spec);
+      const command = buildCodexCommand(spec, this.executable);
       processHandle = await spawnDetachedProcess(
         command[0] ?? "codex",
         command.slice(1),
@@ -206,16 +216,25 @@ export class CodexWorker implements Worker<"codex"> {
 
 export const codexWorker: Worker<"codex"> = new CodexWorker();
 
+export function createCodexWorker(
+  options: CodexWorkerOptions = {},
+): CodexWorker {
+  return new CodexWorker(undefined, options);
+}
+
 /**
  * Codex 0.145.0 can suppress project `AGENTS.md` through
  * `project_doc_max_bytes=0`. Its `--ignore-user-config` flag suppresses only
  * `$CODEX_HOME/config.toml`; global `$CODEX_HOME/AGENTS.md` remains ambient.
  */
-export function buildCodexCommand(spec: CodexWorkerSpec): string[] {
+export function buildCodexCommand(
+  spec: CodexWorkerSpec,
+  executable?: string,
+): string[] {
   validateMaxTurns(spec.maxTurns);
   const laneProfile = codexLaneProfile(spec);
   const command = [
-    "codex",
+    executableOrDefault(executable, "codex"),
     "exec",
     "--json",
     "--model",
@@ -237,6 +256,19 @@ export function buildCodexCommand(spec: CodexWorkerSpec): string[] {
   // separate positional prompt as a synthetic <stdin> block.
   command.push("-");
   return command;
+}
+
+function executableOrDefault(
+  executable: string | undefined,
+  defaultExecutable: string,
+): string {
+  if (executable === undefined) {
+    return defaultExecutable;
+  }
+  if (executable.length === 0) {
+    throw new RangeError("Codex executable must not be empty");
+  }
+  return executable;
 }
 
 function codexLaneProfile(spec: CodexWorkerSpec): string {

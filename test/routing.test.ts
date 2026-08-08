@@ -9,6 +9,7 @@ import type {
   Slice,
   Vendor,
 } from "../src/contracts.ts";
+import type { ExcludedModel } from "../src/routing/contracts.ts";
 import type {
   RoutingDecision,
   RoutingInput,
@@ -161,7 +162,11 @@ function metered(
 
 function request(
   difficulty: SliceDifficulty,
-  extra: { requires?: SliceRequirements; escalated?: boolean } = {},
+  extra: {
+    requires?: SliceRequirements;
+    escalated?: boolean;
+    excluded?: readonly ExcludedModel[];
+  } = {},
 ): RoutingRequest {
   return { slice: SLICE, difficulty, ...extra };
 }
@@ -429,6 +434,243 @@ describe("competence rank and difficulty floor", () => {
         reason: "competence score 40 is below the hard floor of 90",
       },
     ]);
+  });
+});
+
+/* -------------------------- exclusion stage ----------------------------- */
+
+describe("model exclusion", () => {
+  test("an escalated retry excludes the failed model and moves up the competence table", () => {
+    const config = makeConfig([
+      { vendor: "codex", models: [["gpt-5.6-sol", "xhigh"]] },
+      { vendor: "claude", models: [["claude-opus-4-6", "xhigh"]] },
+    ]);
+    const routed = expectRouted(
+      route(
+        request("hard", {
+          escalated: true,
+          excluded: [{ vendor: "codex", model: "gpt-5.6-sol" }],
+        }),
+        input(config),
+      ),
+    );
+
+    expect(routed.vendor).toBe("claude");
+    expect(routed.model).toBe("claude-opus-4-6");
+    expect(routed.effort).toBe("xhigh");
+    expect(routed.waivedDifficultyFloor).toBe(false);
+    expect(routed.rationale.length).toBe(6);
+    expect(routed.rationale[2]).toBe(
+      "exclusion: removed 1 of 2 model(s) before competence ranking — codex/gpt-5.6-sol",
+    );
+    expect(routed.rationale[4]).toBe(
+      "competence: hard difficulty sets a floor of 90; eligible claude/claude-opus-4-6=100; picked claude/claude-opus-4-6 — deepest Anthropic reasoning tier: architecture and ambiguous specs (lowest score clearing the floor wins, so the slice costs no more than it has to)",
+    );
+  });
+
+  test("exclusion keys identity by vendor and model, not model id alone", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["shared-sonnet", "high"]] },
+      { vendor: "codex", models: [["shared-sonnet", "high"]] },
+    ]);
+    const routed = expectRouted(
+      route(
+        request("standard", {
+          excluded: [{ vendor: "claude", model: "shared-sonnet" }],
+        }),
+        input(config),
+      ),
+    );
+
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("shared-sonnet");
+    expect(routed.rationale.length).toBe(6);
+    expect(routed.rationale[2]).toBe(
+      "exclusion: removed 1 of 2 model(s) before competence ranking — claude/shared-sonnet",
+    );
+  });
+
+  test("excluding every configured model fails with an exclusion diagnosis and full trace", () => {
+    const failure = expectFailure(
+      route(
+        request("standard", {
+          excluded: [
+            { vendor: "claude", model: "claude-opus-4-6" },
+            { vendor: "claude", model: "claude-sonnet-5" },
+            { vendor: "claude", model: "claude-haiku-5" },
+            { vendor: "codex", model: "gpt-5.6-sol" },
+            { vendor: "codex", model: "gpt-5.6-terra" },
+          ],
+        }),
+        input(twoVendorConfig()),
+      ),
+    );
+
+    expect(failure.reason).toBe("NO_CAPABLE_MODEL");
+    expect(failure.message).toBe(
+      'exclusion removed all 5 model(s) available after quota for slice "slice-1"; no model remains to run it',
+    );
+    expect(failure.rejected.length).toBe(5);
+    expect(failure.rejected.map((entry) => entry.stage)).toEqual([
+      "excluded",
+      "excluded",
+      "excluded",
+      "excluded",
+      "excluded",
+    ]);
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "excluded",
+        reason:
+          "claude/claude-opus-4-6 already ran this slice and failed its gate",
+      },
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "excluded",
+        reason:
+          "claude/claude-sonnet-5 already ran this slice and failed its gate",
+      },
+      {
+        vendor: "claude",
+        model: "claude-haiku-5",
+        stage: "excluded",
+        reason:
+          "claude/claude-haiku-5 already ran this slice and failed its gate",
+      },
+      {
+        vendor: "codex",
+        model: "gpt-5.6-sol",
+        stage: "excluded",
+        reason: "codex/gpt-5.6-sol already ran this slice and failed its gate",
+      },
+      {
+        vendor: "codex",
+        model: "gpt-5.6-terra",
+        stage: "excluded",
+        reason:
+          "codex/gpt-5.6-terra already ran this slice and failed its gate",
+      },
+    ]);
+  });
+
+  test("an excluded below-floor model cannot reappear through salvage", () => {
+    const config = makeConfig(
+      [
+        { vendor: "claude", models: [["claude-haiku-5", "high"]] },
+        { vendor: "codex", models: [["gpt-5.6-terra", "high"]] },
+      ],
+      true,
+    );
+    const routed = expectRouted(
+      route(
+        request("hard", {
+          excluded: [{ vendor: "codex", model: "gpt-5.6-terra" }],
+        }),
+        input(config),
+      ),
+    );
+
+    expect(routed.vendor).toBe("claude");
+    expect(routed.model).toBe("claude-haiku-5");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+    expect(routed.rationale.length).toBe(6);
+    expect(routed.rationale[2]).toBe(
+      "exclusion: removed 1 of 2 model(s) before competence ranking — codex/gpt-5.6-terra",
+    );
+    expect(routed.rationale[4]).toBe(
+      'competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/claude-haiku-5=40; picked claude/claude-haiku-5 at an actual competence score of 40 (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)',
+    );
+  });
+
+  test("quota takes precedence when the same model is also excluded", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["claude-opus-4-6", "high"]] },
+    ]);
+    const failure = expectFailure(
+      route(
+        request("hard", {
+          excluded: [{ vendor: "claude", model: "claude-opus-4-6" }],
+        }),
+        input(config, [], [snapshot("claude", "exhausted")]),
+      ),
+    );
+
+    expect(failure.reason).toBe("ALL_VENDORS_EXHAUSTED");
+    expect(failure.message).toBe(
+      "every configured vendor (claude) reports its quota exhausted, so no model is left to run this slice",
+    );
+    expect(failure.rejected.length).toBe(1);
+    expect(failure.rejected.map((entry) => entry.stage)).toEqual(["quota"]);
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-opus-4-6",
+        stage: "quota",
+        reason:
+          "claude reports its account-wide quota exhausted, and every model configured for claude reports the same, so claude has nothing left to run this slice",
+      },
+    ]);
+  });
+
+  test("an exclusion for a model outside the pool is ignored", () => {
+    const routed = expectRouted(
+      route(
+        request("standard", {
+          excluded: [{ vendor: "codex", model: "removed-from-config" }],
+        }),
+        input(twoVendorConfig()),
+      ),
+    );
+
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-terra");
+    expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(false);
+    expect(routed.rationale.length).toBe(5);
+    expect(routed.rationale).toEqual([
+      "pool: 5 model(s) from 2 configured vendor(s) — claude/claude-opus-4-6, claude/claude-sonnet-5, claude/claude-haiku-5, codex/gpt-5.6-sol, codex/gpt-5.6-terra",
+      "quota: claude=no snapshot (treated as available), codex=no snapshot (treated as available)",
+      "capability: slice requires nothing; 5 of 5 model(s) passed",
+      "competence: standard difficulty sets a floor of 60; eligible codex/gpt-5.6-terra=70, claude/claude-sonnet-5=74, codex/gpt-5.6-sol=96, claude/claude-opus-4-6=100; picked codex/gpt-5.6-terra — fast Codex tier: mechanical volume, scaffolding, and boilerplate (lowest score clearing the floor wins, so the slice costs no more than it has to)",
+      'effort: base "high" from standard difficulty; no clamp applied; final "high"',
+    ]);
+  });
+
+  test("an empty or undefined exclusion list is identical to an omitted one", () => {
+    const undefinedExcluded = {
+      slice: SLICE,
+      difficulty: "standard",
+      excluded: undefined,
+    } as unknown as RoutingRequest;
+    const expected = {
+      vendor: "codex",
+      model: "gpt-5.6-terra",
+      effort: "high",
+      waivedDifficultyFloor: false,
+      rationale: [
+        "pool: 5 model(s) from 2 configured vendor(s) — claude/claude-opus-4-6, claude/claude-sonnet-5, claude/claude-haiku-5, codex/gpt-5.6-sol, codex/gpt-5.6-terra",
+        "quota: claude=no snapshot (treated as available), codex=no snapshot (treated as available)",
+        "capability: slice requires nothing; 5 of 5 model(s) passed",
+        "competence: standard difficulty sets a floor of 60; eligible codex/gpt-5.6-terra=70, claude/claude-sonnet-5=74, codex/gpt-5.6-sol=96, claude/claude-opus-4-6=100; picked codex/gpt-5.6-terra — fast Codex tier: mechanical volume, scaffolding, and boilerplate (lowest score clearing the floor wins, so the slice costs no more than it has to)",
+        'effort: base "high" from standard difficulty; no clamp applied; final "high"',
+      ],
+    } as const;
+
+    expect(
+      expectRouted(route(request("standard"), input(twoVendorConfig()))),
+    ).toEqual(expected);
+    expect(
+      expectRouted(
+        route(request("standard", { excluded: [] }), input(twoVendorConfig())),
+      ),
+    ).toEqual(expected);
+    expect(
+      expectRouted(route(undefinedExcluded, input(twoVendorConfig()))),
+    ).toEqual(expected);
   });
 });
 

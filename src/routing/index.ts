@@ -15,6 +15,7 @@ export {
   UNRANKED_SCORE,
 } from "./competence.js";
 export type {
+  ExcludedModel,
   RoutedWorker,
   RoutingDecision,
   RoutingFailureReason,

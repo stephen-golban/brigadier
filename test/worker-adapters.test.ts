@@ -10,6 +10,8 @@ import {
   type WorkerEvent,
   type WorkerOutcome,
 } from "../src/contracts.ts";
+import { createClaudeWorker } from "../src/worker/claude.ts";
+import { createCodexWorker } from "../src/worker/codex.ts";
 import {
   buildClaudeCommand,
   buildCodexCommand,
@@ -29,6 +31,30 @@ afterEach(async () => {
 });
 
 describe("ClaudeWorker", () => {
+  test("uses the configured executable for argv and process spawn", async () => {
+    const executable = resolve(fakeBin, "claude");
+    expect(buildClaudeCommand(claudeSpec("success"), executable)[0]).toBe(
+      executable,
+    );
+
+    const decoyBin = await createExecutableDecoys();
+    const spec = claudeSpec("success", {
+      PATH: `${decoyBin}:${requiredPath()}`,
+    });
+    const spawned = await within(
+      createClaudeWorker({ executable }).spawn(spec),
+      2_000,
+      "configured Claude spawn",
+    );
+    const outcome = await within<WorkerOutcome>(
+      spawned.completion,
+      2_000,
+      "configured Claude completion",
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.output).toBe("ok");
+  });
+
   test("passes the prompt only on write-then-close stdin and normalizes success", async () => {
     const spec = claudeSpec("success");
     const command = buildClaudeCommand(spec);
@@ -273,6 +299,35 @@ describe("ClaudeWorker", () => {
 });
 
 describe("CodexWorker", () => {
+  test("uses the configured executable for argv and process spawn", async () => {
+    const executable = resolve(fakeBin, "codex");
+    expect(buildCodexCommand(codexSpec("success"), executable)[0]).toBe(
+      executable,
+    );
+
+    const decoyBin = await createExecutableDecoys();
+    const base = codexSpec("success");
+    const spec = {
+      ...base,
+      environment: {
+        ...base.environment,
+        PATH: `${decoyBin}:${requiredPath()}`,
+      },
+    } as const satisfies CodexWorkerSpec;
+    const spawned = await within(
+      createCodexWorker({ executable }).spawn(spec),
+      2_000,
+      "configured Codex spawn",
+    );
+    const outcome = await within<WorkerOutcome>(
+      spawned.completion,
+      2_000,
+      "configured Codex completion",
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.output).toBe("ok");
+  });
+
   test("uses stdin sentinel and reasoning config while preserving Codex tokens", async () => {
     const spec = codexSpec("success");
     const command = buildCodexCommand(spec);
@@ -424,6 +479,28 @@ test("Claude argv is an absolute contract for mandatory flags and edit lanes", (
     "/workspace/mcp.json",
     "--strict-mcp-config",
   ]);
+});
+
+test("worker executable defaults and empty-string validation are explicit", () => {
+  expect(buildClaudeCommand(claudeSpec("success"), undefined)[0]).toBe(
+    "claude",
+  );
+  expect(buildCodexCommand(codexSpec("success"), undefined)[0]).toBe("codex");
+
+  expect(() => createClaudeWorker({ executable: "" })).toThrow(RangeError);
+  expect(() => createClaudeWorker({ executable: "" })).toThrow(
+    "Claude executable must not be empty",
+  );
+  expect(() => createCodexWorker({ executable: "" })).toThrow(RangeError);
+  expect(() => createCodexWorker({ executable: "" })).toThrow(
+    "Codex executable must not be empty",
+  );
+  expect(() => buildClaudeCommand(claudeSpec("success"), "")).toThrow(
+    "Claude executable must not be empty",
+  );
+  expect(() => buildCodexCommand(codexSpec("success"), "")).toThrow(
+    "Codex executable must not be empty",
+  );
 });
 
 test("read-only specs emit no edit permissions in either adapter", () => {
@@ -721,6 +798,22 @@ exit 0
 `,
   );
   await chmod(executable, 0o755);
+  return directory;
+}
+
+async function createExecutableDecoys(): Promise<string> {
+  const directory = await mkdtemp(resolve(tmpdir(), "brigadier-decoys-"));
+  temporaryDirectories.push(directory);
+  const claudeExecutable = resolve(directory, "claude");
+  const codexExecutable = resolve(directory, "codex");
+  await Promise.all([
+    Bun.write(claudeExecutable, "#!/bin/sh\nexit 97\n"),
+    Bun.write(codexExecutable, "#!/bin/sh\nexit 97\n"),
+  ]);
+  await Promise.all([
+    chmod(claudeExecutable, 0o755),
+    chmod(codexExecutable, 0o755),
+  ]);
   return directory;
 }
 

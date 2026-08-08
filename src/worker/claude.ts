@@ -50,11 +50,21 @@ const API_RETRY_ERRORS = new Set<ApiRetryError>([
   "max_output_tokens",
 ]);
 
+export interface ClaudeWorkerOptions {
+  readonly executable?: string;
+}
+
 export class ClaudeWorker implements Worker<"claude"> {
   readonly vendor = "claude" as const;
   readonly processCompletion = "signals-then-must-be-killed" as const;
+  private readonly executable: string;
 
-  constructor(private readonly shutdown?: ShutdownProcess) {}
+  constructor(
+    private readonly shutdown?: ShutdownProcess,
+    options: ClaudeWorkerOptions = {},
+  ) {
+    this.executable = executableOrDefault(options.executable, "claude");
+  }
 
   async spawn(spec: ClaudeWorkerSpec): Promise<SpawnedWorker> {
     createIdleTimeoutMs(spec.idleTimeoutMs);
@@ -63,7 +73,7 @@ export class ClaudeWorker implements Worker<"claude"> {
     let processHandle: DetachedProcess;
 
     try {
-      const command = buildClaudeCommand(spec);
+      const command = buildClaudeCommand(spec, this.executable);
       processHandle = await spawnDetachedProcess(
         command[0] ?? "claude",
         command.slice(1),
@@ -210,12 +220,21 @@ export class ClaudeWorker implements Worker<"claude"> {
 
 export const claudeWorker: Worker<"claude"> = new ClaudeWorker();
 
-export function buildClaudeCommand(spec: ClaudeWorkerSpec): string[] {
+export function createClaudeWorker(
+  options: ClaudeWorkerOptions = {},
+): ClaudeWorker {
+  return new ClaudeWorker(undefined, options);
+}
+
+export function buildClaudeCommand(
+  spec: ClaudeWorkerSpec,
+  executable?: string,
+): string[] {
   if (spec.maxTurns !== null) {
     validateMaxTurns(spec.maxTurns);
   }
   const command = [
-    "claude",
+    executableOrDefault(executable, "claude"),
     "-p",
     "--verbose",
     "--output-format",
@@ -259,6 +278,19 @@ export function buildClaudeCommand(spec: ClaudeWorkerSpec): string[] {
   }
   command.push("--strict-mcp-config");
   return command;
+}
+
+function executableOrDefault(
+  executable: string | undefined,
+  defaultExecutable: string,
+): string {
+  if (executable === undefined) {
+    return defaultExecutable;
+  }
+  if (executable.length === 0) {
+    throw new RangeError("Claude executable must not be empty");
+  }
+  return executable;
 }
 
 function mapClaudeEvent(raw: unknown): WorkerEvent[] {

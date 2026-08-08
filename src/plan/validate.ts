@@ -1,9 +1,5 @@
 import type { Plan } from "../contracts.js";
-import type {
-  PlanIssue,
-  PlanValidation,
-  PlanValidationOptions,
-} from "./contracts.js";
+import type { PlanIssue, PlanValidation } from "./contracts.js";
 
 interface PathClaim {
   readonly path: string;
@@ -22,14 +18,7 @@ interface Conflict {
  * produced before their worker trees exist, so filesystem-dependent guesses
  * here would make isolation depend on whichever machine validates first.
  */
-export function validatePlan(
-  plan: Plan,
-  options: PlanValidationOptions,
-): PlanValidation {
-  if (!Number.isSafeInteger(options.maxWorkers) || options.maxWorkers <= 0) {
-    throw new RangeError("maxWorkers must be a positive safe integer");
-  }
-
+export function validatePlan(plan: Plan): PlanValidation {
   const emptyIssues: PlanIssue[] = [];
   const duplicateIdIssues: PlanIssue[] = [];
   const noOwnedPathIssues: PlanIssue[] = [];
@@ -39,7 +28,7 @@ export function validatePlan(
   const unknownDependencyIssues: PlanIssue[] = [];
   const selfDependencyIssues: PlanIssue[] = [];
   const cycleIssues: PlanIssue[] = [];
-  const workerLimitIssues: PlanIssue[] = [];
+  const unsupportedDependencyIssues: PlanIssue[] = [];
 
   if (plan.slices.length === 0) {
     emptyIssues.push({
@@ -174,6 +163,14 @@ export function validatePlan(
   const seenUnknownDependencies = new Set<string>();
   const seenSelfDependencies = new Set<string>();
   for (const slice of plan.slices) {
+    if (slice.dependsOn.length > 0) {
+      unsupportedDependencyIssues.push({
+        code: "DEPENDENCIES_UNSUPPORTED",
+        message: `slice ${JSON.stringify(slice.id)} declares dependsOn, but a dependent slice would not see its prerequisite's output; dependency content is not yet implemented, so split this plan into separate runs`,
+        sliceIds: [slice.id],
+        paths: [],
+      });
+    }
     let dependencies = dependenciesById.get(slice.id);
     if (dependencies === undefined) {
       dependencies = new Set<string>();
@@ -229,18 +226,6 @@ export function validatePlan(
   // but do not invent a concurrency width from incomplete or cyclic waves.
   if (graphIsSound) {
     dependencyWaves = buildDependencyWaves(knownIds, dependenciesById);
-    const widestWave = dependencyWaves.reduce<readonly string[]>(
-      (widest, wave) => (wave.length > widest.length ? wave : widest),
-      [],
-    );
-    if (widestWave.length > options.maxWorkers) {
-      workerLimitIssues.push({
-        code: "TOO_MANY_CONCURRENT_SLICES",
-        message: `widest dependency wave [${widestWave.map((id) => JSON.stringify(id)).join(", ")}] has width ${widestWave.length} but maxWorkers permits ${options.maxWorkers}`,
-        sliceIds: widestWave,
-        paths: [],
-      });
-    }
   }
 
   const issues = [
@@ -253,7 +238,7 @@ export function validatePlan(
     ...unknownDependencyIssues,
     ...selfDependencyIssues,
     ...cycleIssues,
-    ...workerLimitIssues,
+    ...unsupportedDependencyIssues,
   ];
   if (issues.length > 0) {
     return { ok: false, issues };
@@ -301,6 +286,14 @@ function invalidPathReasons(path: string): readonly string[] {
   if (path.includes("\\")) {
     reasons.push(
       "brigadier targets POSIX paths, where a backslash is ambiguous between a separator and a literal filename character; spell the path with /",
+    );
+  }
+  // This plan-gate rejection is the first of two enforcement layers. Worker
+  // spec construction must also reject grammar-breaking paths because specs
+  // can be assembled directly without passing through a Plan.
+  if (/[(),"']/.test(path)) {
+    reasons.push(
+      "parentheses, commas, double quotes, and single quotes are not permitted because owned paths are embedded in worker lane permission grammars",
     );
   }
   const controlCodePoints = sortedUnique(

@@ -86,7 +86,12 @@ export type MergeResult =
       readonly integrationBranch: string;
     }
   | {
-      /** The integration ref is unchanged when this result is returned. */
+      /**
+       * The integration ref is not advanced when this result is returned. The
+       * merge attempt may already have materialized the integration branch and
+       * retired the scratch base and slice refs. Deferring materialization
+       * until after the conflict check would be the behavioural fix.
+       */
       readonly status: "conflicted";
       readonly integrationBranch: string;
       readonly details: string;
