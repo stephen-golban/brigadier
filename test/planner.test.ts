@@ -313,8 +313,14 @@ describe("parsePlannerReply", () => {
   });
 
   test("terminates on a huge unterminated brace run", () => {
-    // Bounded by construction: no backtracking, no regular expression.
-    expect(parsePlannerReply("{".repeat(200_000)).kind).toBe("unreadable");
+    // `matchingBrace` allows twice the maximum work of its advancing loop. A
+    // lost increment exhausts that synchronous budget and throws promptly;
+    // wall-clock races cannot interrupt a loop that never yields.
+    expect(parsePlannerReply("{".repeat(200_000))).toEqual({
+      kind: "unreadable",
+      reason:
+        'the reply contained no JSON object with a "status" of "plan" or "needs_human"',
+    });
   });
 });
 

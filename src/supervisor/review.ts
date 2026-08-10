@@ -173,6 +173,7 @@ const SEVERITIES: ReadonlyMap<string, ReviewSeverity> = new Map([
  */
 const MAX_SCAN_CHARS = 64 * 1024;
 const MAX_CANDIDATES = 200;
+const SCAN_STEP_BUDGET_FACTOR = 2;
 
 /**
  * How much of the change the reviewer is shown, in characters.
@@ -643,7 +644,17 @@ export function parseFindings(text: string): readonly ReviewFinding[] | null {
   const scanned =
     text.length > MAX_SCAN_CHARS ? text.slice(-MAX_SCAN_CHARS) : text;
   const starts: number[] = [];
+  let scanSteps = 0;
+  const scanStepBudget = scanned.length * SCAN_STEP_BUDGET_FACTOR;
   for (let index = 0; index < scanned.length; index += 1) {
+    scanSteps += 1;
+    if (scanSteps > scanStepBudget) {
+      // Keep this independent from matchingBrace's budget: losing this loop's
+      // own increment must fail synchronously before candidate parsing starts.
+      throw new Error(
+        `parseFindings exceeded its ${scanStepBudget}-step candidate-scan budget`,
+      );
+    }
     if (scanned[index] === "{") {
       starts.push(index);
     }
@@ -684,7 +695,19 @@ function matchingBrace(text: string, start: number): number | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
+  let steps = 0;
+  const stepBudget = (text.length - start) * SCAN_STEP_BUDGET_FACTOR;
   for (let index = start; index < text.length; index += 1) {
+    steps += 1;
+    if (steps > stepBudget) {
+      // A timer cannot preempt a synchronous parser loop. This defensive,
+      // input-proportional budget is twice the most iterations the advancing
+      // loop can make, so real input cannot exhaust it while a lost increment
+      // fails promptly instead of wedging the supervisor.
+      throw new Error(
+        `matchingBrace exceeded its ${stepBudget}-step budget while parsing review output`,
+      );
+    }
     const character = text[index];
     if (inString) {
       if (escaped) {

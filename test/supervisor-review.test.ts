@@ -2,10 +2,11 @@
  * The cross-vendor review gate and the one-shot prompt primitive underneath it.
  *
  * EVERY TEST HERE IS BOUNDED. `runOneShotPrompt` drains an event stream and
- * awaits a completion, which is exactly the shape that hangs rather than fails
- * when it is wrong, so every run in this file is raced against a timer and the
- * timer is asserted. A test that wedged the suite on broken code would be worth
- * less than no test at all.
+ * awaits a completion, so its asynchronous runs are raced against an asserted
+ * timer. The synchronous reply parser instead enforces an input-proportional
+ * step budget inside its scan, because a timer cannot preempt a synchronous
+ * loop. A test that wedged the suite on broken code would be worth less than no
+ * test at all.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -716,18 +717,13 @@ describe("parseFindings", () => {
     ]);
   });
 
-  test("terminates on a large adversarial reply", async () => {
-    // A parser that backtracked would take superlinear time on this input. The
-    // bound is asserted rather than assumed: a scan that did not terminate
-    // would fail here rather than wedge the suite.
+  test("terminates on a large adversarial reply", () => {
+    // `matchingBrace` allows twice the maximum work of its advancing loop. A
+    // lost increment exhausts that synchronous budget and throws promptly;
+    // wall-clock races cannot interrupt a loop that never yields.
     const noise = `${"{".repeat(20_000)}\n`;
     const reply = `${noise}{"findings":[]}`;
-    await withBound(
-      Promise.resolve().then(() => {
-        expect(parseFindings(reply)).toEqual([]);
-      }),
-      "parse",
-    );
+    expect(parseFindings(reply)).toEqual([]);
   });
 });
 

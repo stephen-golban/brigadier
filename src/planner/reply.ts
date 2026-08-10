@@ -39,6 +39,7 @@
  */
 const MAX_SCAN_CHARS = 256 * 1024;
 const MAX_CANDIDATES = 800;
+const SCAN_STEP_BUDGET_FACTOR = 2;
 
 /**
  * How many questions a genuinely ambiguous task may raise, and how long each
@@ -75,7 +76,17 @@ export function parsePlannerReply(text: string): PlannerReply {
     text.length > MAX_SCAN_CHARS ? text.slice(-MAX_SCAN_CHARS) : text;
 
   const starts: number[] = [];
+  let scanSteps = 0;
+  const scanStepBudget = scanned.length * SCAN_STEP_BUDGET_FACTOR;
   for (let index = 0; index < scanned.length; index += 1) {
+    scanSteps += 1;
+    if (scanSteps > scanStepBudget) {
+      // Keep this independent from matchingBrace's budget: losing this loop's
+      // own increment must fail synchronously before candidate parsing starts.
+      throw new Error(
+        `parsePlannerReply exceeded its ${scanStepBudget}-step candidate-scan budget`,
+      );
+    }
     if (scanned[index] === "{") {
       starts.push(index);
     }
@@ -255,7 +266,19 @@ function matchingBrace(text: string, start: number): number | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
+  let steps = 0;
+  const stepBudget = (text.length - start) * SCAN_STEP_BUDGET_FACTOR;
   for (let index = start; index < text.length; index += 1) {
+    steps += 1;
+    if (steps > stepBudget) {
+      // A timer cannot preempt a synchronous parser loop. This defensive,
+      // input-proportional budget is twice the most iterations the advancing
+      // loop can make, so real input cannot exhaust it while a lost increment
+      // fails promptly instead of wedging the planner.
+      throw new Error(
+        `matchingBrace exceeded its ${stepBudget}-step budget while parsing planner output`,
+      );
+    }
     const character = text[index];
     if (inString) {
       if (escaped) {
