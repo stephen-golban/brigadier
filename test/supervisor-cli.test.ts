@@ -15,6 +15,7 @@ import {
   createInterruptGate,
   runCli,
 } from "../src/init/index.ts";
+import type { McpRunControl } from "../src/mcp/server.ts";
 import type {
   Planner,
   PlannerOutcome,
@@ -351,7 +352,7 @@ interface InvokeOptions {
   /** Replaces the model that turns a task description into a plan. */
   readonly planner?: Planner;
   /** Replaces the stdio MCP server, which would otherwise block on stdin. */
-  readonly mcpServer?: () => Promise<number>;
+  readonly mcpServer?: (control?: McpRunControl) => Promise<number>;
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
    * Drives cancellation the way `src/cli.ts` does, minus the signal handler.
@@ -1002,6 +1003,31 @@ describe("brigadier: the install and mcp subcommands", () => {
       });
       expect(result.code).toBe(0);
       expect(served).toBe(1);
+    });
+  });
+
+  test("mcp hands the interrupt signal and arming seam to the server", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const controller = new AbortController();
+      const armings: string[] = [];
+      let receivedSignal: AbortSignal | undefined;
+      const result = await invoke({
+        argv: ["mcp"],
+        cwd,
+        scratchHome,
+        signal: controller.signal,
+        onCancellable: () => {
+          armings.push("armed");
+        },
+        mcpServer: (control) => {
+          receivedSignal = control?.signal;
+          control?.onCancellable?.();
+          return Promise.resolve(0);
+        },
+      });
+      expect(result.code).toBe(0);
+      expect(receivedSignal).toBe(controller.signal);
+      expect(armings).toEqual(["armed"]);
     });
   });
 

@@ -58,7 +58,14 @@ import type {
 import type { RoutedWorker } from "../routing/contracts.js";
 import type { SpecBuildInput } from "./spec.js";
 import { buildWorkerSpec } from "./spec.js";
-import { ABORTED, describeError, raceAbort, settle } from "./support.js";
+import {
+  ABORTED,
+  COMPLETION_TIMEOUT,
+  describeError,
+  raceAbort,
+  settle,
+  settleWithin,
+} from "./support.js";
 
 /**
  * The environment a one-shot launch needs, aliased from the spec builder for
@@ -128,7 +135,11 @@ export type OneShotResult =
   | {
       readonly ok: false;
       readonly failure: WorkerFailure;
+      /** Present only when cancellation could not confirm process exit. */
+      readonly cleanupFailure?: string;
     };
+
+const CANCELLATION_COMPLETION_BOUND_MS = 100;
 
 /**
  * Claude's read-only tool set.
@@ -235,14 +246,20 @@ export async function runOneShotPrompt(
     // worker is reading, and a live process in a removed directory is how a
     // `git worktree remove` fails.
     const note = await cancelQuietly(spawned, message);
+    const cleanupFailure =
+      note === null
+        ? null
+        : `the ${request.vendor}/${request.model} worker (pid ${spawned.pid ?? "none"}) may still be running — ${note}`;
     return {
       ok: false,
       failure: {
         kind: "CANCELLED",
-        message: note === null ? message : `${message}; ${note}`,
+        message:
+          cleanupFailure === null ? message : `${message}; ${cleanupFailure}`,
         retryable: false,
         statusCode: null,
       },
+      ...(cleanupFailure === null ? {} : { cleanupFailure }),
     };
   }
 
@@ -344,10 +361,42 @@ async function cancelQuietly(
 ): Promise<string | null> {
   try {
     await spawned.cancel({ kind: "shutdown", message });
-    return null;
   } catch (error) {
     return `terminating its process group failed: ${describeError(error)}`;
   }
+
+  const completion: Promise<WorkerOutcome> = spawned.completion;
+  const completed = await settleWithin(
+    completion,
+    CANCELLATION_COMPLETION_BOUND_MS,
+  );
+  if (completed === COMPLETION_TIMEOUT) {
+    return `termination was not confirmed because completion did not settle within ${CANCELLATION_COMPLETION_BOUND_MS} ms`;
+  }
+  // TypeScript widens an imported unique-symbol sentinel in this module even
+  // after the equality guard above. The runtime union has only the sentinel
+  // and this settled record, so the narrowing is stated once here.
+  const settlement = completed as
+    | { readonly ok: true; readonly value: WorkerOutcome }
+    | { readonly ok: false; readonly error: unknown };
+  if (settlement.ok === false) {
+    const rejected = settlement as {
+      readonly ok: false;
+      readonly error: unknown;
+    };
+    return `termination was not confirmed because completion rejected: ${describeError(rejected.error)}`;
+  }
+  const outcome = (
+    settlement as { readonly ok: true; readonly value: WorkerOutcome }
+  ).value;
+  if (outcome.ok === false) {
+    const failure = (outcome as Extract<WorkerOutcome, { readonly ok: false }>)
+      .failure;
+    return failure.kind === "CANCELLED"
+      ? null
+      : `termination was not confirmed because completion settled with ${failure.kind}: ${failure.message}`;
+  }
+  return "termination was not confirmed because completion settled successfully";
 }
 
 /**

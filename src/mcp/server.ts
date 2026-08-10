@@ -36,8 +36,10 @@ import type { InputStream, OutputStream } from "../init/prompt.js";
 // implementation of "split an async chunk stream into lines" in this repository.
 import { LineReader } from "../init/prompt.js";
 import type { RunReport, SliceResult } from "../supervisor/contracts.js";
+import { interruptExitCode } from "../supervisor/contracts.js";
 import { createRunner } from "../supervisor/orchestrator.js";
 import { requireLaunchEnv } from "../supervisor/slice.js";
+import { ABORTED, raceAbort, settle } from "../supervisor/support.js";
 import type { MergeResult } from "../worktree/contracts.js";
 import { createDispatcher } from "./protocol.js";
 import type { LoadedConfig, McpRunRequest, ToolDependencies } from "./tools.js";
@@ -52,6 +54,13 @@ export interface McpServerOptions {
   readonly stderr: OutputStream;
   readonly version: string;
   readonly dependencies: ToolDependencies;
+  readonly signal?: AbortSignal;
+  readonly onCancellable?: () => void;
+}
+
+export interface McpRunControl {
+  readonly signal?: AbortSignal;
+  readonly onCancellable?: () => void;
 }
 
 /**
@@ -61,13 +70,16 @@ export interface McpServerOptions {
  * Resolves 0 when stdin reached end of input, which for a stdio MCP server means
  * the client closed the pipe — an ordinary shutdown, not a fault.
  */
-export async function runMcpServer(): Promise<number> {
+export async function runMcpServer(
+  control: McpRunControl = {},
+): Promise<number> {
   return await serveMcp({
     stdin: process.stdin,
     stdout: process.stdout,
     stderr: process.stderr,
     version: packageJson.version,
-    dependencies: createRealDependencies(process.env),
+    dependencies: createRealDependencies(process.env, control),
+    ...control,
   });
 }
 
@@ -82,20 +94,37 @@ export async function runMcpServer(): Promise<number> {
  * it takes `maxWorkers`.
  */
 export async function serveMcp(options: McpServerOptions): Promise<number> {
+  const dependencies: ToolDependencies = {
+    ...options.dependencies,
+    execute: async (request) => {
+      options.onCancellable?.();
+      return await options.dependencies.execute(request);
+    },
+  };
   const dispatch = createDispatcher({
     serverName: SERVER_NAME,
     serverVersion: options.version,
-    tools: createTools(options.dependencies),
+    tools: createTools(dependencies),
   });
   const reader = new LineReader(options.stdin);
   for (;;) {
-    const line = await reader.readLine();
+    const read = await raceAbort(options.signal, settle(reader.readLine()));
+    if (read === ABORTED) {
+      return interruptExitCode(options.signal?.reason);
+    }
+    if (!read.ok) {
+      throw read.error;
+    }
+    const line = read.value;
     if (line === null) {
       return 0;
     }
     const response = await dispatch(line);
     if (response !== null) {
       options.stdout.write(`${response}\n`);
+    }
+    if (options.signal?.aborted === true) {
+      return interruptExitCode(options.signal.reason);
     }
   }
 }
@@ -109,6 +138,7 @@ export async function serveMcp(options: McpServerOptions): Promise<number> {
  */
 export function createRealDependencies(
   env: ConfigEnvironment,
+  control: Pick<McpRunControl, "signal"> = {},
 ): ToolDependencies {
   return {
     async loadConfig(): Promise<LoadedConfig> {
@@ -142,6 +172,7 @@ export function createRealDependencies(
           maxWorkers: request.maxWorkers,
           dryRun: request.dryRun,
           unsafeInPlace: request.unsafeInPlace,
+          ...(control.signal === undefined ? {} : { signal: control.signal }),
         });
         return { text: renderReport(report, log), isError: !report.ok };
       } finally {

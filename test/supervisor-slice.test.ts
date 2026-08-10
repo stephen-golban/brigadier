@@ -70,7 +70,10 @@ import type {
   WorktreeSession,
   WorktreeSpec,
 } from "../src/worktree/contracts.js";
-import { NoChangesToCommitError } from "../src/worktree/engine.js";
+import {
+  GitWorktreeEngine,
+  NoChangesToCommitError,
+} from "../src/worktree/engine.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -286,6 +289,30 @@ async function makeWorld(): Promise<World> {
       { sliceNumber: 8, worktreePath: join(root, "wt", "slice-8") },
     ],
   };
+}
+
+async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+  const process = Bun.spawn({
+    cmd: ["git", ...args],
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    process.kill(9);
+  }, 10_000);
+  const [exitCode, stdout, stderr] = await Promise.all([
+    process.exited,
+    new Response(process.stdout).text(),
+    new Response(process.stderr).text(),
+  ]);
+  clearTimeout(timer);
+  expect(timedOut).toBe(false);
+  expect(exitCode).toBe(0);
+  expect(stderr).toBe("");
+  return stdout.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +754,15 @@ const SKIPPED: SliceReview = {
   reviewer: null,
   reason: "NO_OTHER_VENDOR",
   message: "no other vendor is configured",
+  durationMs: 0,
+};
+
+const CANCELLED_REVIEW: SliceReview = {
+  verdict: "skipped",
+  reviewer: REVIEWER,
+  reason: "CANCELLED",
+  message:
+    "slice slice-auth was not reviewed: the codex/gpt-5.6-sol reviewer failed with CANCELLED: brigadier received SIGINT",
   durationMs: 0,
 };
 
@@ -3229,6 +3265,78 @@ describe("DefaultSliceRunner review gate", () => {
       "NO_OTHER_VENDOR",
     );
   });
+
+  test("an interrupted review leaves the slice ref at its prepared base", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-review-cancel-ref-"));
+    temporaries.push(root);
+    const repository = join(root, "repo");
+    await mkdir(repository, { recursive: true });
+    await runGit(repository, ["init", "-b", "main"]);
+    await runGit(repository, ["config", "user.name", "Brigadier Test"]);
+    await runGit(repository, ["config", "user.email", "test@example.invalid"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await runGit(repository, ["add", "README.md"]);
+    await runGit(repository, ["commit", "-m", "base"]);
+
+    const engine = new GitWorktreeEngine({ commandTimeoutMs: 10_000 });
+    const session = await engine.prepare({
+      repositoryPath: repository,
+      slug: "review-cancel",
+      secrets: { linkedPaths: [] },
+    });
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        outcome: OK_OUTCOME,
+        onSpawn: async (spec) => {
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(join(spec.cwd, "src/added.ts"), "export {};\n");
+        },
+      },
+    ]);
+    const routeRequests: RoutingRequest[] = [];
+    const runner = new DefaultSliceRunner({
+      ports: {
+        engine,
+        workerFor: (vendor) => (vendor === "claude" ? adapter.worker : null),
+        oracles: [],
+        now: makeClock(),
+        log: () => {},
+      },
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], routeRequests),
+      review: {
+        review: () => {
+          controller.abort(SIGINT_REASON);
+          return Promise.resolve(CANCELLED_REVIEW);
+        },
+      },
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session,
+        attemptSlots: [{ sliceNumber: 7, worktreePath: join(root, "slice-7") }],
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      10_000,
+      "cancelled review ref run",
+    );
+
+    expect(
+      await runGit(repository, [
+        "rev-list",
+        "--count",
+        "refs/heads/brigadier/review-cancel/slice-7",
+      ]),
+    ).toBe("2");
+    expect(result.cancelled).toBe(true);
+    await engine.release(session);
+  }, 30_000);
 
   test("the gate is not consulted when the worker itself failed", async () => {
     const world = await makeWorld();
