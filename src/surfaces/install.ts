@@ -56,6 +56,8 @@ const EXECUTABLE_MODE = 0o755;
 /** Bumped only if the manifest's shape changes; an unknown version is ignored. */
 const MANIFEST_VERSION = 1;
 const MANIFEST_FILE_NAME = "surfaces.json";
+const CODEX_HOOK_MARKER = "# brigadier-managed-hook";
+const CODEX_HOOKS_FILE_NAME = "hooks.json";
 
 /**
  * The filesystem operations the installer needs.
@@ -279,7 +281,7 @@ const HOST_PLANS: readonly HostPlan[] = [
     ],
     notes: (roots) => [
       `~/.agents/skills is read by both Codex and opencode, so this one skill serves both.`,
-      `THE HANDOFF HOOK IS TRUST-GATED ON CODEX. Running it is a click, and the click is required again after every edit, because Codex hashes the hook definition. brigadier does NOT write a Codex hook registration: the configuration key differs across Codex releases and a guessed one is a silent no-op. Register it yourself against ${appendPath(AGENTS_SKILL(roots), "hooks", "handoff.mjs")} — see the README next to it.`,
+      `THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${appendPath(roots.codexHome, CODEX_HOOKS_FILE_NAME)}, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to a hash of the hook definition, so it is required again after any edit to handoff.mjs. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
       `${appendPath(roots.codexHome, "AGENTS.md")} is loaded by Codex 0.145.0 into every session including brigadier's own workers, and no flag suppresses it. Keep it doctrine.`,
     ],
   },
@@ -418,6 +420,16 @@ export async function runInstall(
   const recorded = manifest.files;
   const written = new Map(recorded);
 
+  let codexHook: CodexHookPreparation | null = null;
+  if (parsed.hosts.includes("codex")) {
+    const prepared = await prepareCodexHookRegistration(fs, roots);
+    if (!prepared.ok) {
+      io.stderr.write(`brigadier install: ${prepared.message}\n`);
+      return 1;
+    }
+    codexHook = prepared;
+  }
+
   let refused = 0;
   let changed = 0;
   let unchanged = 0;
@@ -439,6 +451,22 @@ export async function runInstall(
         force: parsed.force,
         dryRun: parsed.dryRun,
       });
+      writeOutcome(io.stdout, outcome);
+      if (outcome.verdict === "refused" || outcome.verdict === "failed") {
+        refused += 1;
+      } else if (outcome.verdict === "unchanged") {
+        unchanged += 1;
+      } else {
+        changed += 1;
+      }
+    }
+    if (host === "codex" && codexHook !== null) {
+      const outcome = await applyCodexHookRegistration(
+        fs,
+        roots,
+        codexHook,
+        parsed.dryRun,
+      );
       writeOutcome(io.stdout, outcome);
       if (outcome.verdict === "refused" || outcome.verdict === "failed") {
         refused += 1;
@@ -475,6 +503,359 @@ export async function runInstall(
     `\n${parsed.dryRun ? "dry run: " : ""}${changed} written, ${unchanged} unchanged, ${refused} refused.\n`,
   );
   return refused > 0 ? 1 : 0;
+}
+
+interface CodexHookPreparation {
+  readonly ok: true;
+  readonly path: string;
+  readonly snapshot: SurfaceSnapshot | null;
+  readonly contents: string;
+  readonly verdict: "created" | "updated" | "unchanged";
+}
+
+interface CodexHookPreparationError {
+  readonly ok: false;
+  readonly message: string;
+}
+
+async function prepareCodexHookRegistration(
+  fs: SurfaceIo,
+  roots: Roots,
+): Promise<CodexHookPreparation | CodexHookPreparationError> {
+  const path = appendPath(roots.codexHome, CODEX_HOOKS_FILE_NAME);
+  const proof = await proveWriteContained(fs, roots.codexHome, path);
+  if (!proof.ok) {
+    return { ok: false, message: proof.message };
+  }
+
+  let snapshot: SurfaceSnapshot | null;
+  try {
+    snapshot = await readIfPresent(fs, path);
+  } catch (error) {
+    return {
+      ok: false,
+      message: `could not safely read ${path}: ${describe(error)}`,
+    };
+  }
+
+  const command = `${shellQuote(
+    appendPath(AGENTS_SKILL(roots), "hooks", "handoff.mjs"),
+  )} ${CODEX_HOOK_MARKER}`;
+  if (snapshot === null) {
+    return {
+      ok: true,
+      path,
+      snapshot,
+      contents: formatCodexHooks({
+        hooks: { PreCompact: [codexHook(command)] },
+      }),
+      verdict: "created",
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.contents);
+  } catch {
+    return {
+      ok: false,
+      message: `could not parse ${path}. Fix the malformed JSON and re-run; brigadier left the file unchanged.`,
+    };
+  }
+  const merged = mergeCodexHook(snapshot.contents, parsed, command, path);
+  if (!merged.ok) {
+    return merged;
+  }
+  const contents = merged.contents;
+  return {
+    ok: true,
+    path,
+    snapshot,
+    contents,
+    verdict: contents === snapshot.contents ? "unchanged" : "updated",
+  };
+}
+
+async function applyCodexHookRegistration(
+  fs: SurfaceIo,
+  roots: Roots,
+  prepared: CodexHookPreparation,
+  dryRun: boolean,
+): Promise<FileOutcome> {
+  if (prepared.verdict === "unchanged" || dryRun) {
+    return {
+      verdict: prepared.verdict,
+      path: prepared.path,
+      detail: null,
+    };
+  }
+  try {
+    await fs.mkdir(parentOf(prepared.path));
+    const proof = await proveWriteContained(fs, roots.codexHome, prepared.path);
+    if (!proof.ok) {
+      return { verdict: "refused", path: prepared.path, detail: proof.message };
+    }
+    await fs.writeFile(
+      prepared.path,
+      prepared.contents,
+      FILE_MODE,
+      prepared.snapshot,
+    );
+    return { verdict: prepared.verdict, path: prepared.path, detail: null };
+  } catch (error) {
+    const proof = await proveWriteContained(fs, roots.codexHome, prepared.path);
+    return proof.ok
+      ? { verdict: "failed", path: prepared.path, detail: describe(error) }
+      : { verdict: "refused", path: prepared.path, detail: proof.message };
+  }
+}
+
+function mergeCodexHook(
+  source: string,
+  parsed: unknown,
+  command: string,
+  path: string,
+):
+  | { readonly ok: true; readonly contents: string }
+  | CodexHookPreparationError {
+  if (!isJsonObject(parsed)) {
+    return {
+      ok: false,
+      message: `could not merge ${path}: its top level must be a JSON object. Fix the file and re-run; brigadier left it unchanged.`,
+    };
+  }
+  const root = parsed;
+  const hooksValue = root.hooks;
+  if (hooksValue !== undefined && !isJsonObject(hooksValue)) {
+    return {
+      ok: false,
+      message: `could not merge ${path}: "hooks" must be a JSON object. Fix the file and re-run; brigadier left it unchanged.`,
+    };
+  }
+  const hooks = hooksValue ?? {};
+  const preCompactValue = hooks.PreCompact;
+  if (preCompactValue !== undefined && !Array.isArray(preCompactValue)) {
+    return {
+      ok: false,
+      message: `could not merge ${path}: "hooks.PreCompact" must be an array. Fix the file and re-run; brigadier left it unchanged.`,
+    };
+  }
+
+  const preCompact = preCompactValue ?? [];
+  const desired = codexHook(command);
+  const layouts = objectLayout(source, 0);
+  const hooksRange = layouts.properties.get("hooks");
+  if (hooksRange === undefined) {
+    return {
+      ok: true,
+      contents: insertObjectProperty(
+        source,
+        layouts,
+        "hooks",
+        JSON.stringify({ PreCompact: [desired] }, null, 2),
+        2,
+      ),
+    };
+  }
+
+  const hooksLayout = objectLayout(source, hooksRange.start);
+  const preCompactRange = hooksLayout.properties.get("PreCompact");
+  if (preCompactRange === undefined) {
+    return {
+      ok: true,
+      contents: insertObjectProperty(
+        source,
+        hooksLayout,
+        "PreCompact",
+        JSON.stringify([desired], null, 2),
+        4,
+      ),
+    };
+  }
+
+  const entries = arrayElements(source, preCompactRange.start);
+  const marked = entries.filter((range) =>
+    containsBrigadierHook(JSON.parse(source.slice(range.start, range.end))),
+  );
+  if (
+    marked.length === 1 &&
+    JSON.stringify(
+      JSON.parse(source.slice(marked[0]?.start, marked[0]?.end)),
+    ) === JSON.stringify(desired)
+  ) {
+    return { ok: true, contents: source };
+  }
+  if (marked.length === 0) {
+    const insertion = `${preCompact.length === 0 ? "" : ","}\n${indentJson(
+      JSON.stringify(desired, null, 2),
+      6,
+    )}\n    `;
+    return {
+      ok: true,
+      contents: `${source.slice(0, preCompactRange.end - 1)}${insertion}${source.slice(preCompactRange.end - 1)}`,
+    };
+  }
+
+  const retained = entries
+    .filter((range) => !marked.includes(range))
+    .map((range) => source.slice(range.start, range.end));
+  const replacement = `[
+${[...retained, JSON.stringify(desired, null, 2)]
+  .map((entry) => indentJson(entry, 6))
+  .join(",\n")}
+    ]`;
+  return {
+    ok: true,
+    contents: `${source.slice(0, preCompactRange.start)}${replacement}${source.slice(preCompactRange.end)}`,
+  };
+}
+
+interface JsonRange {
+  readonly start: number;
+  readonly end: number;
+}
+
+interface JsonObjectLayout {
+  readonly close: number;
+  readonly properties: ReadonlyMap<string, JsonRange>;
+}
+
+function containsBrigadierHook(value: unknown): boolean {
+  return (
+    isJsonObject(value) &&
+    Array.isArray(value.hooks) &&
+    value.hooks.some(
+      (hook) =>
+        isJsonObject(hook) &&
+        typeof hook.command === "string" &&
+        hook.command.endsWith(CODEX_HOOK_MARKER),
+    )
+  );
+}
+
+function objectLayout(source: string, start: number): JsonObjectLayout {
+  const properties = new Map<string, JsonRange>();
+  let cursor = skipJsonWhitespace(source, start) + 1;
+  for (;;) {
+    cursor = skipJsonWhitespace(source, cursor);
+    if (source[cursor] === "}") {
+      return { close: cursor, properties };
+    }
+    const keyEnd = jsonStringEnd(source, cursor);
+    const key = JSON.parse(source.slice(cursor, keyEnd)) as string;
+    cursor = skipJsonWhitespace(source, keyEnd) + 1;
+    const valueStart = skipJsonWhitespace(source, cursor);
+    const valueEnd = jsonValueEnd(source, valueStart);
+    properties.set(key, { start: valueStart, end: valueEnd });
+    cursor = skipJsonWhitespace(source, valueEnd);
+    if (source[cursor] === ",") {
+      cursor += 1;
+    }
+  }
+}
+
+function arrayElements(source: string, start: number): readonly JsonRange[] {
+  const elements: JsonRange[] = [];
+  let cursor = skipJsonWhitespace(source, start) + 1;
+  for (;;) {
+    cursor = skipJsonWhitespace(source, cursor);
+    if (source[cursor] === "]") {
+      return elements;
+    }
+    const end = jsonValueEnd(source, cursor);
+    elements.push({ start: cursor, end });
+    cursor = skipJsonWhitespace(source, end);
+    if (source[cursor] === ",") {
+      cursor += 1;
+    }
+  }
+}
+
+function jsonValueEnd(source: string, start: number): number {
+  if (source[start] === '"') {
+    return jsonStringEnd(source, start);
+  }
+  if (source[start] === "{" || source[start] === "[") {
+    const opening = source[start];
+    const closing = opening === "{" ? "}" : "]";
+    let depth = 1;
+    let cursor = start + 1;
+    while (depth > 0) {
+      if (source[cursor] === '"') {
+        cursor = jsonStringEnd(source, cursor);
+        continue;
+      }
+      if (source[cursor] === opening) {
+        depth += 1;
+      } else if (source[cursor] === closing) {
+        depth -= 1;
+      }
+      cursor += 1;
+    }
+    return cursor;
+  }
+  let cursor = start;
+  while (!/[\s,}\]]/.test(source[cursor] ?? "")) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function jsonStringEnd(source: string, start: number): number {
+  let cursor = start + 1;
+  while (source[cursor] !== '"') {
+    cursor += source[cursor] === "\\" ? 2 : 1;
+  }
+  return cursor + 1;
+}
+
+function skipJsonWhitespace(source: string, start: number): number {
+  let cursor = start;
+  while (/\s/.test(source[cursor] ?? "")) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function insertObjectProperty(
+  source: string,
+  layout: JsonObjectLayout,
+  key: string,
+  value: string,
+  spaces: number,
+): string {
+  const property = `${JSON.stringify(key)}: ${indentJson(value, spaces).trimStart()}\n${" ".repeat(Math.max(0, spaces - 2))}`;
+  if (layout.properties.size === 0) {
+    return `${source.slice(0, layout.close)}\n${" ".repeat(spaces)}${property}${source.slice(layout.close)}`;
+  }
+  const lastEnd = Math.max(
+    ...[...layout.properties.values()].map((range) => range.end),
+  );
+  return `${source.slice(0, lastEnd)},${source.slice(lastEnd, layout.close)}  ${property}${source.slice(layout.close)}`;
+}
+
+function indentJson(value: string, spaces: number): string {
+  const indentation = " ".repeat(spaces);
+  return value
+    .split("\n")
+    .map((line) => `${indentation}${line}`)
+    .join("\n");
+}
+
+function codexHook(command: string): Record<string, unknown> {
+  return { hooks: [{ type: "command", command }] };
+}
+
+function formatCodexHooks(value: Record<string, unknown>): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 interface ApplyInput {

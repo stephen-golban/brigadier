@@ -83,8 +83,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3127,
   },
   "codex/hooks/README.md": {
-    sha256: "64cdc2af24479711b36664d89e6646e8a2b95e0d192672164ebf95d84d33a88d",
-    bytes: 2099,
+    sha256: "a48674e591b9d0aca1413f1faf65ce01ee22b26afe2bbcd6a8924ee412308036",
+    bytes: 2755,
   },
   "codex/hooks/handoff.mjs": {
     sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
@@ -515,6 +515,7 @@ describe("brigadier install", () => {
         `  created    ${home}/.agents/skills/brigadier/hooks/handoff.mjs`,
         `  created    ${home}/.agents/skills/brigadier/hooks/README.md`,
         `  created    ${home}/.codex/AGENTS.md`,
+        `  created    ${home}/.codex/hooks.json`,
         `  created    ${home}/.config/opencode/plugin/brigadier.js`,
         `  created    ${home}/.config/opencode/brigadier.README.md`,
         `  created    ${home}/.brigadier/surfaces/claude-desktop/manifest.json`,
@@ -522,7 +523,7 @@ describe("brigadier install", () => {
       ]);
       expect(
         result.stdout.endsWith(
-          "\ndry run: 13 written, 0 unchanged, 0 refused.\n",
+          "\ndry run: 14 written, 0 unchanged, 0 refused.\n",
         ),
       ).toBe(true);
       // A dry run writes NOTHING, not even the manifest that records writes.
@@ -549,14 +550,10 @@ describe("brigadier install", () => {
           ),
         ),
       ).toBe(true);
-      // Codex: trust-gated, and the click comes back on every edit.
-      expect(
-        notes.some((note) =>
-          note.includes(
-            "THE HANDOFF HOOK IS TRUST-GATED ON CODEX. Running it is a click, and the click is required again after every edit, because Codex hashes the hook definition.",
-          ),
-        ),
-      ).toBe(true);
+      // Codex: registered, but not live until approved; edits invalidate trust.
+      expect(notes).toContain(
+        `  note: THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${home}/.codex/hooks.json, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to a hash of the hook definition, so it is required again after any edit to handoff.mjs. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
+      );
       // opencode: works, and the unverified line is named as unverified.
       expect(
         notes.some((note) =>
@@ -1065,6 +1062,7 @@ describe("brigadier install", () => {
         `  created    ${home}/.agents/skills/brigadier/hooks/handoff.mjs`,
         `  created    ${home}/.agents/skills/brigadier/hooks/README.md`,
         `  created    ${home}/elsewhere/codex/AGENTS.md`,
+        `  created    ${home}/elsewhere/codex/hooks.json`,
         `  created    ${home}/elsewhere/xdg/opencode/plugin/brigadier.js`,
         `  created    ${home}/elsewhere/xdg/opencode/brigadier.README.md`,
         `  created    ${home}/elsewhere/brigadier/surfaces/claude-desktop/manifest.json`,
