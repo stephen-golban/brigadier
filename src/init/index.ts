@@ -28,6 +28,9 @@ import {
 } from "../config/index.js";
 import type { AnyWorker, Effort, Vendor } from "../contracts.js";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
+import { runMcpServer } from "../mcp/server.js";
+import type { Planner, PlannerOutcome } from "../planner/index.js";
+import { createModelPlanner } from "../planner/index.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
 import type { RoutedWorker } from "../routing/index.js";
 // Imported from the module rather than the barrel on purpose: the interrupt
@@ -56,6 +59,7 @@ import {
   parsePlanDocument,
   requireLaunchEnv,
 } from "../supervisor/index.js";
+import { runInstall } from "../surfaces/install.js";
 import { createClaudeWorker, createCodexWorker } from "../worker/index.js";
 import type { MergeResult, WorktreeEngine } from "../worktree/index.js";
 import { GitWorktreeEngine } from "../worktree/index.js";
@@ -515,6 +519,16 @@ interface CliOptions {
   readonly stdin?: InputStream;
   /** Injected in tests; production loads the discovery module on demand. */
   readonly discoverer?: Discoverer;
+  /**
+   * Injected in tests; production serves MCP over the real process streams.
+   *
+   * IT EXISTS TO STOP A TEST FROM HANGING. `runMcpServer` reads the real
+   * `process.stdin` and resolves only when the client closes the pipe, so a
+   * test that reached it would block until the runner was killed — and a test
+   * that hangs on broken code never reports the breakage it was written to
+   * catch. With this seam, the `mcp` dispatch is provable without a server.
+   */
+  readonly mcpServer?: () => Promise<number>;
   readonly io?: ConfigIo;
   /** The repository `run` operates on. Defaults to `process.cwd()`. */
   readonly cwd?: string;
@@ -633,21 +647,31 @@ const USAGE = `Usage: brigadier <command> [options]
 
 Commands:
   init                 scan for installed worker CLIs and write a config
-  run                  run a plan: route every slice, spawn a worker for each,
-                       commit what it produced, and merge the lot
+  run                  run a task or a plan: decompose it, route every slice,
+                       spawn a worker for each, commit what it produced, and
+                       merge the lot
+  install              write brigadier's host-side doctrine into each host
+  mcp                  serve brigadier's tools over stdio MCP
 
 Options for init:
   -y, --yes            accept every proposed default without prompting
       --print-config   print the resolved config as JSON and exit without writing
   -h, --help           print this message
 
+Usage for run:
+  brigadier run "<task description>"   plan the task, then run the plan
+  brigadier run --plan <file>          run a plan that already exists
+
 Options for run:
-      --plan <file>    the plan JSON to run; "-" reads the plan from stdin
+      --plan <file>    the plan JSON to run; "-" reads the plan from stdin.
+                       Mutually exclusive with a task description
       --max-workers <n>
-                       slices to run at once (default 1; fan-out is earned)
+                       slices to run at once (default 1; fan-out is earned).
+                       For a task description this is also the largest number
+                       of slices the planner may propose
       --slug <name>    names this run's branches (default: from the plan id)
-      --dry-run        route every slice and report it; create no worktree,
-                       spawn no worker, write no commit
+      --dry-run        plan and route every slice and report it; create no
+                       worktree, spawn no worker, write no commit
       --unsafe-in-place
                        run workers in this checkout instead of isolated
                        worktrees; every file here becomes visible to every worker
@@ -660,10 +684,14 @@ Options:
 Exit codes:
   0  the command succeeded
   1  brigadier could not start the run: no config, an unreadable or invalid
-     plan file, or an environment with no HOME, PATH, or USER
+     plan file, an environment with no HOME, PATH, or USER, or a planner that
+     could not produce a plan
   2  usage error
   3  the run started and did not succeed; the "run failed:" line names which
      stage stopped it, and each slice's line names what happened to it
+  4  the task was too ambiguous to plan, so brigadier refused to guess. It
+     spawned nothing and created nothing, and printed the questions it needs
+     answered. This is not a failed run: answer them and run it again
   130  the run was interrupted with SIGINT (Ctrl-C): every worker still running
      was terminated along with its whole process group, its worktree was
      removed, and the refs the run created were retired. Interrupt a second
@@ -704,6 +732,37 @@ export async function runCli(options: CliOptions): Promise<number> {
         ? {}
         : { onCancellable: options.onCancellable }),
     });
+  }
+  // `install` owns its own argv, including its help and its usage errors, and
+  // it is handed argv with the command word removed exactly as `run` is. It is
+  // dispatched rather than reimplemented here: it is another unit's, it is
+  // proven, and the composition root's job is to hand it its io.
+  if (command === "install") {
+    return runInstall(argv.slice(1), {
+      env: options.env,
+      stdout,
+      stderr,
+    });
+  }
+  // `mcp` takes no options at all, so anything after the command word is a
+  // mistake worth naming rather than ignoring. It is refused HERE because
+  // `runMcpServer` reads the real `process.stdin` and blocks until the client
+  // closes the pipe — a stray flag that reached it would look like a hang.
+  if (command === "mcp") {
+    const extra = argv.slice(1);
+    if (extra.includes("--help") || extra.includes("-h")) {
+      stdout.write(USAGE);
+      return 0;
+    }
+    const unknown = extra[0];
+    if (unknown !== undefined) {
+      stderr.write(
+        `brigadier mcp: unexpected argument ${JSON.stringify(unknown)}; the MCP server takes no options\n`,
+      );
+      stderr.write(USAGE);
+      return 2;
+    }
+    return (options.mcpServer ?? runMcpServer)();
   }
   if (command !== "init") {
     stderr.write(
@@ -814,23 +873,43 @@ const RUN_NOT_STARTED = 1;
 const RUN_USAGE_ERROR = 2;
 const RUN_FAILED = 3;
 
+/**
+ * DECISION #10's EXIT CODE: the task was too ambiguous to plan.
+ *
+ * It needed a code of its own, and the three existing ones each say something
+ * false about it. `0` would tell a `brigadier run … && deploy` that the work
+ * landed when nothing was built. `1` means "could not start" and is right about
+ * the facts but wrong about the remedy — every other 1 sends the user to look at
+ * their config, their plan file, or their environment, and this one is a
+ * question waiting for an answer. `3` means a run started and did not succeed,
+ * and no run started here: no worktree was created, no ref was written, and no
+ * worker was spawned for the task itself.
+ *
+ * A user who gets questions has not had a run fail, and the host-side skill
+ * branches on exactly that distinction to re-invoke with the answers folded in.
+ * `4` is the next free number below the shell's reserved 126/127/128+n range.
+ */
+const RUN_NEEDS_HUMAN = 4;
+
 /** The engine's own rule (`validateSlug`), applied before any ref is written. */
 const SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /**
- * A future `brigadier run "<task>"` will hand the description to a planner and
- * run what comes back. That planner does not exist, so the positional form is
- * refused rather than quietly reinterpreted — and refused with the sentence
- * that says which half is missing, because "unknown argument" would send a user
- * looking for a typo in a command they spelled correctly.
+ * Where this run's plan comes from.
+ *
+ * The two arms are mutually exclusive rather than layered, and that is the
+ * decision the reserved positional slot was always holding open: `--plan`
+ * names a plan that already exists, and a bare argument names a task that does
+ * not have one yet. A run that accepted both would have to decide which wins,
+ * and either answer silently discards something the user typed.
  */
-const PLANNER_NOT_IMPLEMENTED =
-  "brigadier run: planning a task description is not implemented yet, so a bare argument cannot be turned into a plan. Pass a plan file with `--plan <file>`, or `--plan -` to read the plan from stdin.";
+type PlanOrigin =
+  | { readonly kind: "file"; readonly path: string }
+  | { readonly kind: "task"; readonly description: string };
 
 /** Everything `brigadier run` decides from argv alone, before it touches disk. */
 interface RunInvocation {
-  /** A path, or `-` for stdin. */
-  readonly planSource: string;
+  readonly source: PlanOrigin;
   /** Null means "derive it from the plan id". */
   readonly slug: string | null;
   readonly maxWorkers: number;
@@ -856,6 +935,17 @@ export interface RunHarness {
   readonly engine?: WorktreeEngine;
   readonly now?: () => number;
   readonly sliceRunner?: SliceRunner;
+  /**
+   * Replaces the model that turns a task description into a plan.
+   *
+   * Without this seam every test of `brigadier run "<task>"` would spawn a real
+   * vendor CLI, which would make the CLI's exit codes a function of somebody's
+   * quota. The planner's OWN tests inject one level lower — at the one-shot
+   * call — so the prompt, the budget rule, and the reply parsing are still
+   * exercised for real; this seam exists for the tests that are about the
+   * command line rather than about planning.
+   */
+  readonly planner?: Planner;
 }
 
 interface RunOptions {
@@ -892,62 +982,11 @@ async function runPlan(options: RunOptions): Promise<number> {
   }
   const invocation = parsed.invocation;
 
-  const source = await readPlanSource(invocation.planSource, options);
-  if (!source.ok) {
-    stderr.write(`${source.message}\n`);
-    return RUN_NOT_STARTED;
+  const resolved = await resolvePlan(options, invocation);
+  if (resolved.kind === "stop") {
+    return resolved.code;
   }
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(source.text);
-  } catch (error) {
-    stderr.write(
-      `brigadier run: ${source.label} is not valid JSON: ${describe(error)}\n`,
-    );
-    return RUN_NOT_STARTED;
-  }
-
-  let document: RunRequest["document"];
-  try {
-    document = parsePlanDocument(parsedJson);
-  } catch (error) {
-    // Every issue, never the first one. `parsePlanDocument` collects the whole
-    // repair precisely so a user fixes a plan in one pass instead of running
-    // the CLI once per defect.
-    if (error instanceof PlanDocumentError) {
-      stderr.write(
-        `brigadier run: ${source.label} is not a valid plan document (${error.issues.length} issue(s)):\n`,
-      );
-      for (const issue of error.issues) {
-        stderr.write(`  ${issue}\n`);
-      }
-      return RUN_NOT_STARTED;
-    }
-    stderr.write(
-      `brigadier run: could not read the plan: ${describe(error)}\n`,
-    );
-    return RUN_NOT_STARTED;
-  }
-
-  const loaded = await loadRunConfig(options);
-  if (!loaded.ok) {
-    stderr.write(`${loaded.message}\n`);
-    return RUN_NOT_STARTED;
-  }
-
-  // The one legitimate `process.env` read in the system arrives here, already
-  // narrowed by the caller. A machine missing HOME, PATH, or USER cannot launch
-  // any worker for any slice — USER included, because Claude Code resolves its
-  // OAuth credentials through it — so it is refused before a ref is written
-  // rather than rediscovered once per slice.
-  let env: LaunchEnv;
-  try {
-    env = requireLaunchEnv(options.env);
-  } catch (error) {
-    stderr.write(`brigadier run: ${describe(error)}\n`);
-    return RUN_NOT_STARTED;
-  }
+  const { document, config, env } = resolved;
 
   const slug = invocation.slug ?? deriveSlug(document.plan.id);
   if (slug === null) {
@@ -958,7 +997,7 @@ async function runPlan(options: RunOptions): Promise<number> {
   }
 
   const dependencies = buildRunDependencies({
-    config: loaded.config,
+    config,
     env,
     log: (line: string) => {
       stdout.write(`${line}\n`);
@@ -976,13 +1015,18 @@ async function runPlan(options: RunOptions): Promise<number> {
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
 
-  // THE LAST LINE BEFORE AN INTERRUPT HAS ANYTHING TO CLEAN UP. Every failure
-  // above this point returns without having created a ref, a worktree, or a
-  // process, so a Ctrl-C anywhere above it — including one that lands while
-  // `--plan -` is still blocked on stdin — must kill brigadier outright rather
-  // than announce a cleanup of nothing and demand a second press. From here on
-  // the orchestrator owns worktrees and the runner owns worker process groups,
-  // and a first interrupt has to be allowed to wind them down.
+  // THE LAST LINE BEFORE THE ORCHESTRATOR HAS ANYTHING TO CLEAN UP. From here
+  // on the orchestrator owns worktrees and the runner owns worker process
+  // groups, and a first interrupt has to be allowed to wind them down.
+  //
+  // A PLANNED RUN HAS ALREADY ARMED THE GATE, in `resolvePlan`, because the
+  // planner spawns a real worker process and a Ctrl-C during planning has to be
+  // able to kill it. `arm` is documented idempotent and one-way, so calling it
+  // again here costs nothing. What is NOT true any more, and used to be, is
+  // that "every failure above this point returns without having created a
+  // process": a task run can fail after its planner ran. It still returns
+  // without having created a ref or a worktree, which is the property the
+  // failure paths above actually depend on.
   //
   // Armed for a dry run too, which creates neither: a dry run returns before
   // `prepare`, so the window is microseconds wide, and arming on the same line
@@ -1010,6 +1054,241 @@ async function runPlan(options: RunOptions): Promise<number> {
   return (
     interruptedExitCode(options.signal) ?? (report.ok ? RUN_OK : RUN_FAILED)
   );
+}
+
+/**
+ * A plan, the config it will run under, and a launchable environment — or the
+ * exit code to return instead.
+ *
+ * `stop` carries only a code because every branch that produces one has already
+ * written its own diagnostic. Bundling the three values is what lets the two
+ * origins keep their own ORDER of failures: a `--plan` run reports a bad plan
+ * file before it ever looks for a config, which is the behaviour it has always
+ * had, while a task run must have both config and environment in hand before it
+ * can launch the planner that produces the plan at all.
+ */
+type ResolvedPlan =
+  | {
+      readonly kind: "ok";
+      readonly document: RunRequest["document"];
+      readonly config: BrigadierConfig;
+      readonly env: LaunchEnv;
+    }
+  | { readonly kind: "stop"; readonly code: number };
+
+async function resolvePlan(
+  options: RunOptions,
+  invocation: RunInvocation,
+): Promise<ResolvedPlan> {
+  return invocation.source.kind === "file"
+    ? resolvePlanFromFile(options, invocation.source.path)
+    : resolvePlanFromTask(options, invocation, invocation.source.description);
+}
+
+/** `brigadier run --plan <file>`: the path this command has always had. */
+async function resolvePlanFromFile(
+  options: RunOptions,
+  path: string,
+): Promise<ResolvedPlan> {
+  const { stderr } = options;
+
+  const source = await readPlanSource(path, options);
+  if (!source.ok) {
+    stderr.write(`${source.message}\n`);
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(source.text);
+  } catch (error) {
+    stderr.write(
+      `brigadier run: ${source.label} is not valid JSON: ${describe(error)}\n`,
+    );
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+
+  let document: RunRequest["document"];
+  try {
+    document = parsePlanDocument(parsedJson);
+  } catch (error) {
+    // Every issue, never the first one. `parsePlanDocument` collects the whole
+    // repair precisely so a user fixes a plan in one pass instead of running
+    // the CLI once per defect.
+    if (error instanceof PlanDocumentError) {
+      stderr.write(
+        `brigadier run: ${source.label} is not a valid plan document (${error.issues.length} issue(s)):\n`,
+      );
+      for (const issue of error.issues) {
+        stderr.write(`  ${issue}\n`);
+      }
+      return { kind: "stop", code: RUN_NOT_STARTED };
+    }
+    stderr.write(
+      `brigadier run: could not read the plan: ${describe(error)}\n`,
+    );
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+
+  const environment = await loadConfigAndEnv(options);
+  if (!environment.ok) {
+    stderr.write(`${environment.message}\n`);
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+  return {
+    kind: "ok",
+    document,
+    config: environment.config,
+    env: environment.env,
+  };
+}
+
+/**
+ * `brigadier run "<task>"`: ask a model for a plan, then run it like any other.
+ *
+ * THE PLAN IS PRINTED BEFORE THE RUN, AND THAT IS NOT DECORATION. The user did
+ * not write this plan and cannot open it anywhere: it exists only inside this
+ * process. Printing it first means they see what brigadier decided to do before
+ * the workers start, and — the case that actually matters — that they still
+ * have it when the run fails. `PlannerOutcome.json` is a plan file `--plan`
+ * accepts, so the printed block is a working artifact rather than a summary.
+ */
+async function resolvePlanFromTask(
+  options: RunOptions,
+  invocation: RunInvocation,
+  task: string,
+): Promise<ResolvedPlan> {
+  const { stdout, stderr } = options;
+
+  const environment = await loadConfigAndEnv(options);
+  if (!environment.ok) {
+    stderr.write(`${environment.message}\n`);
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+
+  const planner =
+    options.harness?.planner ??
+    createModelPlanner({
+      config: environment.config,
+      workerFor: createWorkerFactory(environment.config),
+      env: environment.env,
+      log: (line: string) => {
+        stdout.write(`${line}\n`);
+      },
+    });
+
+  // ARMED BEFORE THE PLANNER RUNS, not after. The planner spawns a real vendor
+  // process, so from this line onward a Ctrl-C has something to wind down and
+  // must be allowed to, rather than killing brigadier and orphaning the model.
+  // Nothing above it has created a process, a ref, or a worktree.
+  options.onCancellable?.();
+
+  let outcome: PlannerOutcome;
+  try {
+    outcome = await planner.plan({
+      task,
+      cwd: options.cwd,
+      maxSlices: invocation.maxWorkers,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+  } catch (error) {
+    // A `Planner` is documented to report rather than throw, so this is a
+    // defect rather than an outcome — and it still owes the user a sentence.
+    stderr.write(
+      `brigadier run: the planner did not complete: ${describe(error)}\n`,
+    );
+    return {
+      kind: "stop",
+      code: interruptedExitCode(options.signal) ?? RUN_NOT_STARTED,
+    };
+  }
+
+  if (outcome.kind === "failed") {
+    stderr.write(`${outcome.message}\n`);
+    return {
+      kind: "stop",
+      code: interruptedExitCode(options.signal) ?? RUN_NOT_STARTED,
+    };
+  }
+  if (outcome.kind === "needs-human") {
+    renderNeedsHuman(stdout, outcome.questions);
+    // An interrupt still outranks it: a user who pressed Ctrl-C during planning
+    // is owed the signal's code, not a set of questions they did not wait for.
+    return {
+      kind: "stop",
+      code: interruptedExitCode(options.signal) ?? RUN_NEEDS_HUMAN,
+    };
+  }
+
+  stdout.write(
+    `\nplanned by ${outcome.planner.vendor}/${outcome.planner.model} at ${outcome.planner.effort} effort:\n`,
+  );
+  stdout.write(`${outcome.json}\n`);
+  return {
+    kind: "ok",
+    document: outcome.document,
+    config: environment.config,
+    env: environment.env,
+  };
+}
+
+/**
+ * DECISION #10 ON SCREEN: questions, and an explicit statement that nothing ran.
+ *
+ * The "nothing was created" sentence is printed unconditionally because it is
+ * the fact a user cannot check cheaply and would otherwise have to assume. The
+ * trailing JSON line is for the host-side skill that re-invokes brigadier with
+ * the answers folded in — the same "machine-readable last line" contract the
+ * review gate asks of its reviewers, chosen for the same reason: parsing prose
+ * to recover a question list is worse than emitting the list.
+ */
+function renderNeedsHuman(
+  out: OutputStream,
+  questions: readonly string[],
+): void {
+  out.write(
+    "\nbrigadier run: this task is ambiguous enough that planning it would mean guessing, so nothing was planned, nothing was created, and no worker was spawned.\n\nAnswer these and run it again:\n",
+  );
+  for (const [index, question] of questions.entries()) {
+    out.write(`  ${index + 1}. ${question}\n`);
+  }
+  out.write(`${JSON.stringify({ status: "needs_human", questions })}\n`);
+}
+
+type LoadedEnvironment =
+  | {
+      readonly ok: true;
+      readonly config: BrigadierConfig;
+      readonly env: LaunchEnv;
+    }
+  | { readonly ok: false; readonly message: string };
+
+/**
+ * The machine's config plus a launchable environment, in that order.
+ *
+ * The one legitimate `process.env` read in the system arrives here, already
+ * narrowed by the caller. A machine missing HOME, PATH, or USER cannot launch
+ * any worker for any slice — USER included, because Claude Code resolves its
+ * OAuth credentials through it — so it is refused before a ref is written
+ * rather than rediscovered once per slice. A task run refuses it before the
+ * PLANNER launches, for the same reason and one step earlier.
+ */
+async function loadConfigAndEnv(
+  options: RunOptions,
+): Promise<LoadedEnvironment> {
+  const loaded = await loadRunConfig(options);
+  if (!loaded.ok) {
+    return { ok: false, message: loaded.message };
+  }
+  try {
+    return {
+      ok: true,
+      config: loaded.config,
+      env: requireLaunchEnv(options.env),
+    };
+  } catch (error) {
+    return { ok: false, message: `brigadier run: ${describe(error)}` };
+  }
 }
 
 /**
@@ -1260,13 +1539,19 @@ function deriveSlug(planId: string): string | null {
  * members rather than throwing.
  *
  * `--plan` is an option rather than a positional argument, and that is a
- * decision rather than a style: the positional slot is reserved for the task
- * description a future planner will consume, and a `--plan` that also accepted
- * a bare path would make `brigadier run plan.json` and `brigadier run "fix the
- * parser"` indistinguishable at the moment the planner ships.
+ * decision rather than a style: the positional slot holds the task description
+ * the planner consumes, and a `--plan` that also accepted a bare path would
+ * make `brigadier run plan.json` and `brigadier run "fix the parser"`
+ * indistinguishable now that both are real commands.
+ *
+ * A SECOND POSITIONAL IS REFUSED RATHER THAN JOINED. `brigadier run fix the
+ * parser` without quotes arrives here as three arguments, and concatenating
+ * them would silently accept a command whose shell quoting is wrong — which is
+ * how a task description ends up missing whatever the shell ate.
  */
 function parseRunArguments(argv: readonly string[]): RunArguments {
   let planSource: string | null = null;
+  let task: string | null = null;
   let slug: string | null = null;
   let maxWorkers = 1;
   let dryRun = false;
@@ -1337,19 +1622,45 @@ function parseRunArguments(argv: readonly string[]): RunArguments {
         message: `brigadier run: unknown option ${JSON.stringify(argument)}`,
       };
     }
-    return { kind: "usage-error", message: PLANNER_NOT_IMPLEMENTED };
+    if (task !== null) {
+      return {
+        kind: "usage-error",
+        message: `brigadier run: only one task description is accepted, and a second one ${JSON.stringify(argument)} was given; quote the whole task as a single argument`,
+      };
+    }
+    if (argument.trim() === "") {
+      return {
+        kind: "usage-error",
+        message: "brigadier run: the task description is empty",
+      };
+    }
+    task = argument;
   }
 
+  const rest = { slug, maxWorkers, dryRun, unsafeInPlace };
+  if (task !== null) {
+    if (planSource !== null) {
+      return {
+        kind: "usage-error",
+        message:
+          "brigadier run: pass a task description or --plan <file>, not both; --plan runs a plan that already exists and a task description asks brigadier to write one",
+      };
+    }
+    return {
+      kind: "run",
+      invocation: { source: { kind: "task", description: task }, ...rest },
+    };
+  }
   if (planSource === null) {
     return {
       kind: "usage-error",
       message:
-        "brigadier run: --plan <file> is required; pass a plan JSON file, or `--plan -` to read it from stdin",
+        'brigadier run: nothing to run; pass a task description as a single quoted argument, or a plan JSON file with `--plan <file>` ("-" reads it from stdin)',
     };
   }
   return {
     kind: "run",
-    invocation: { planSource, slug, maxWorkers, dryRun, unsafeInPlace },
+    invocation: { source: { kind: "file", path: planSource }, ...rest },
   };
 }
 

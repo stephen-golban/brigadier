@@ -16,11 +16,19 @@ import {
   runCli,
 } from "../src/init/index.ts";
 import type {
+  Planner,
+  PlannerOutcome,
+  PlannerRequest,
+} from "../src/planner/index.ts";
+import type {
   SliceResult,
   SliceRunInput,
   SliceRunner,
 } from "../src/supervisor/index.ts";
-import { requireLaunchEnv } from "../src/supervisor/index.ts";
+import {
+  parsePlanDocument,
+  requireLaunchEnv,
+} from "../src/supervisor/index.ts";
 import type {
   CommitResult,
   CommitSpec,
@@ -286,6 +294,45 @@ function failWorker(input: SliceRunInput): Promise<SliceResult> {
   });
 }
 
+/**
+ * A planner that answers from a literal and records what it was asked.
+ *
+ * No test in this file may spawn a real model: the CLI's exit codes would then
+ * be a function of somebody's quota and of a network. The planner's own prompt,
+ * budget rule and reply parsing are proven in `test/planner.test.ts`, one seam
+ * lower, against the real `createModelPlanner`.
+ */
+class RecordingPlanner implements Planner {
+  readonly requests: PlannerRequest[] = [];
+  #outcome: PlannerOutcome;
+
+  constructor(outcome: PlannerOutcome) {
+    this.#outcome = outcome;
+  }
+
+  plan(request: PlannerRequest): Promise<PlannerOutcome> {
+    this.requests.push(request);
+    return Promise.resolve(this.#outcome);
+  }
+}
+
+/**
+ * A successful planning outcome carrying the same plan the `--plan` tests use.
+ *
+ * Built through `parsePlanDocument` rather than as an object literal, because
+ * that is the ONLY way the product builds one: a fixture that hand-assembled a
+ * `PlanDocument` could carry a shape the real planner can never produce, and
+ * every assertion resting on it would be measuring the fixture.
+ */
+function plannedOutcome(): PlannerOutcome {
+  return {
+    kind: "planned",
+    document: parsePlanDocument(PLAN),
+    json: JSON.stringify(PLAN, null, 2),
+    planner: { vendor: "claude", model: "claude-opus-5", effort: "high" },
+  };
+}
+
 interface Invocation {
   readonly code: number;
   readonly stdout: string;
@@ -301,6 +348,10 @@ interface InvokeOptions {
   readonly stdin?: string;
   readonly config?: BrigadierConfig | null;
   readonly runner?: RecordingSliceRunner | null;
+  /** Replaces the model that turns a task description into a plan. */
+  readonly planner?: Planner;
+  /** Replaces the stdio MCP server, which would otherwise block on stdin. */
+  readonly mcpServer?: () => Promise<number>;
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
    * Drives cancellation the way `src/cli.ts` does, minus the signal handler.
@@ -334,6 +385,7 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
     // A constant clock: every duration the report prints is then exactly 0ms.
     now: () => 1_700_000_000_000,
     ...(runner === null ? {} : { sliceRunner: runner }),
+    ...(options.planner === undefined ? {} : { planner: options.planner }),
   };
   const stdout = collector();
   const stderr = collector();
@@ -354,6 +406,9 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
       ? {}
       : { stdin: scriptedInput(options.stdin) }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.mcpServer === undefined
+      ? {}
+      : { mcpServer: options.mcpServer }),
     ...(options.onCancellable === undefined
       ? {}
       : { onCancellable: options.onCancellable }),
@@ -652,12 +707,18 @@ describe("brigadier run: options", () => {
     });
   });
 
-  test("a missing --plan exits 2", async () => {
+  /**
+   * `run` with nothing at all is still a usage error, but it can no longer say
+   * that `--plan` is required: a task description is now an equally valid way
+   * to run, and a message naming only one of the two forms would send a user
+   * looking for a plan file they were never supposed to need.
+   */
+  test("run with neither a task nor a plan exits 2 and names both forms", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
       const result = await invoke({ argv: ["run"], cwd, scratchHome });
       expect(result.code).toBe(2);
       expect(result.stderr).toContain(
-        "brigadier run: --plan <file> is required; pass a plan JSON file, or `--plan -` to read it from stdin",
+        'brigadier run: nothing to run; pass a task description as a single quoted argument, or a plan JSON file with `--plan <file>` ("-" reads it from stdin)',
       );
     });
   });
@@ -692,7 +753,7 @@ describe("brigadier run: options", () => {
       });
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(
-        "  1  brigadier could not start the run: no config, an unreadable or invalid\n     plan file, or an environment with no HOME, PATH, or USER",
+        "  1  brigadier could not start the run: no config, an unreadable or invalid\n     plan file, an environment with no HOME, PATH, or USER, or a planner that\n     could not produce a plan",
       );
       // The code the sentence describes.
       expect(() =>
@@ -702,31 +763,303 @@ describe("brigadier run: options", () => {
   });
 });
 
-describe("brigadier run: the reserved positional slot", () => {
-  test("a bare positional argument reports that planning is not implemented", async () => {
+describe("brigadier run: the task positional", () => {
+  test("a bare task description is planned and then run", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
       const result = await invoke({
         argv: ["run", "fix the parser"],
         cwd,
         scratchHome,
+        planner,
       });
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain(
-        "brigadier run: planning a task description is not implemented yet, so a bare argument cannot be turned into a plan. Pass a plan file with `--plan <file>`, or `--plan -` to read the plan from stdin.",
+
+      expect(result.code).toBe(0);
+      // The user's words reach the planner verbatim, and the default fan-out
+      // budget is exactly one slice.
+      expect(planner.requests).toHaveLength(1);
+      expect(planner.requests[0]?.task).toBe("fix the parser");
+      expect(planner.requests[0]?.cwd).toBe(cwd);
+      expect(planner.requests[0]?.maxSlices).toBe(1);
+      // The plan is printed before the run, as a file `--plan` would accept.
+      expect(result.stdout).toContain(
+        "\nplanned by claude/claude-opus-5 at high effort:\n",
       );
-      expect(result.engine.prepared).toEqual([]);
+      expect(result.stdout).toContain('"id": "demo-plan"');
+      // And the planned slices are the ones that actually ran.
+      expect(result.runner?.inputs.map((input) => input.slice.id)).toEqual([
+        "s1",
+        "s2",
+      ]);
+      expect(result.engine.prepared).toHaveLength(1);
     });
   });
 
-  test("a positional given alongside --plan is still refused", async () => {
+  test("--max-workers raises the planner's fan-out budget", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
+      const result = await invoke({
+        argv: ["run", "--max-workers", "3", "fix the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(0);
+      expect(planner.requests[0]?.maxSlices).toBe(3);
+    });
+  });
+
+  /**
+   * DECISION #10, AND THE HALF OF IT THAT IS A PROMISE RATHER THAN A MESSAGE.
+   *
+   * The questions are the visible part. The invisible part — that brigadier
+   * spawned nothing and created nothing — is the part a user cannot check and
+   * has to be able to trust, so every creation channel the recording engine has
+   * is asserted empty here rather than spot-checked.
+   */
+  test("an ambiguous task returns questions, exits 4, and creates nothing", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner({
+        kind: "needs-human",
+        questions: ["Which parser?", "Should the fix change the wire format?"],
+        planner: { vendor: "claude", model: "claude-opus-5", effort: "high" },
+      });
+      const result = await invoke({
+        argv: ["run", "make it faster"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(4);
+      expect(result.stdout).toContain(
+        "\nbrigadier run: this task is ambiguous enough that planning it would mean guessing, so nothing was planned, nothing was created, and no worker was spawned.\n\nAnswer these and run it again:\n  1. Which parser?\n  2. Should the fix change the wire format?\n",
+      );
+      // The machine-readable last line the host-side skill re-invokes from.
+      expect(result.stdout).toContain(
+        '{"status":"needs_human","questions":["Which parser?","Should the fix change the wire format?"]}\n',
+      );
+
+      // Nothing. Every channel, named one at a time.
+      expect(result.engine.prepared).toEqual([]);
+      expect(result.engine.created).toEqual([]);
+      expect(result.engine.committed).toEqual([]);
+      expect(result.engine.merges).toEqual([]);
+      expect(result.engine.removed).toEqual([]);
+      expect(result.engine.released).toEqual([]);
+      expect(result.runner?.inputs).toEqual([]);
+      expect(await readdir(cwd)).toEqual(["plan.json"]);
+    });
+  });
+
+  test("a planner that could not produce a plan exits 1 and creates nothing", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner({
+        kind: "failed",
+        message: "brigadier run: the planner ran out of quota",
+      });
+      const result = await invoke({
+        argv: ["run", "fix the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(
+        "brigadier run: the planner ran out of quota\n",
+      );
+      expect(result.engine.prepared).toEqual([]);
+      expect(result.runner?.inputs).toEqual([]);
+    });
+  });
+
+  test("--dry-run plans, reports the routing, and creates nothing", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
+      const result = await invoke({
+        argv: ["run", "--dry-run", "fix the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "\nplanned by claude/claude-opus-5 at high effort:\n",
+      );
+      expect(result.stdout).toContain(
+        "\ndry run demo-plan: 2 slice(s) in 0ms\n",
+      );
+      expect(result.engine.prepared).toEqual([]);
+      expect(result.engine.created).toEqual([]);
+      expect(result.runner?.inputs).toEqual([]);
+      expect(await readdir(cwd)).toEqual(["plan.json"]);
+    });
+  });
+
+  test("a task and --plan together are refused without planning anything", async () => {
     await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
       const result = await invoke({
         argv: ["run", "--plan", plan, "fix the parser"],
         cwd,
         scratchHome,
+        planner,
       });
       expect(result.code).toBe(2);
-      expect(result.stderr).toContain("planning a task description");
+      expect(result.stderr).toContain(
+        "brigadier run: pass a task description or --plan <file>, not both; --plan runs a plan that already exists and a task description asks brigadier to write one",
+      );
+      expect(planner.requests).toEqual([]);
+      expect(result.engine.prepared).toEqual([]);
+    });
+  });
+
+  /**
+   * `brigadier run fix the parser` without quotes. Joining the words would
+   * accept a command whose shell quoting is wrong and silently plan whatever
+   * survived the shell.
+   */
+  test("a second positional is refused rather than joined", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
+      const result = await invoke({
+        argv: ["run", "fix", "the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain(
+        'brigadier run: only one task description is accepted, and a second one "the parser" was given; quote the whole task as a single argument',
+      );
+      expect(planner.requests).toEqual([]);
+    });
+  });
+
+  test("a whitespace-only task is refused", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const planner = new RecordingPlanner(plannedOutcome());
+      const result = await invoke({
+        argv: ["run", "   "],
+        cwd,
+        scratchHome,
+        planner,
+      });
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain(
+        "brigadier run: the task description is empty\n",
+      );
+      expect(planner.requests).toEqual([]);
+    });
+  });
+});
+
+describe("brigadier: the install and mcp subcommands", () => {
+  test("install is dispatched and writes its host files", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const result = await invoke({
+        argv: ["install", "claude-code"],
+        cwd,
+        scratchHome,
+        env: {
+          BRIGADIER_HOME: scratchHome,
+          HOME: scratchHome,
+          PATH: "/usr/bin:/bin",
+          USER: "worker",
+        },
+      });
+      expect(result.code).toBe(0);
+      // The manifest `runInstall` records what it wrote in.
+      expect(await readdir(scratchHome)).toContain("surfaces.json");
+    });
+  });
+
+  test("install reports its own usage errors with exit 2", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const result = await invoke({
+        argv: ["install", "not-a-host"],
+        cwd,
+        scratchHome,
+      });
+      expect(result.code).toBe(2);
+    });
+  });
+
+  test("a bare mcp dispatches to the server", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      let served = 0;
+      const result = await invoke({
+        argv: ["mcp"],
+        cwd,
+        scratchHome,
+        mcpServer: () => {
+          served += 1;
+          return Promise.resolve(0);
+        },
+      });
+      expect(result.code).toBe(0);
+      expect(served).toBe(1);
+    });
+  });
+
+  /**
+   * `mcp` takes no options, and a stray one is refused HERE rather than passed
+   * on: `runMcpServer` blocks on the real stdin until the client closes it, so
+   * a flag that reached it would look to the user like a hang.
+   *
+   * The server is injected rather than real for that same reason. If the guard
+   * below were deleted, this test must FAIL — it must not hang waiting on a
+   * stdin nobody is going to close.
+   */
+  test("mcp refuses a stray argument instead of starting the server", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      let served = 0;
+      const result = await invoke({
+        argv: ["mcp", "--port", "3000"],
+        cwd,
+        scratchHome,
+        mcpServer: () => {
+          served += 1;
+          return Promise.resolve(0);
+        },
+      });
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain(
+        'brigadier mcp: unexpected argument "--port"; the MCP server takes no options\n',
+      );
+      expect(served).toBe(0);
+    });
+  });
+
+  test("mcp --help prints usage and exits 0", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const result = await invoke({
+        argv: ["mcp", "--help"],
+        cwd,
+        scratchHome,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("  mcp                  serve brigadier");
+    });
+  });
+
+  test("usage names run's two forms and every command", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const result = await invoke({
+        argv: ["run", "--help"],
+        cwd,
+        scratchHome,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        '  brigadier run "<task description>"   plan the task, then run the plan\n  brigadier run --plan <file>          run a plan that already exists\n',
+      );
+      expect(result.stdout).toContain(
+        "  4  the task was too ambiguous to plan, so brigadier refused to guess. It\n     spawned nothing and created nothing, and printed the questions it needs\n     answered. This is not a failed run: answer them and run it again\n",
+      );
     });
   });
 });
