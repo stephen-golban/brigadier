@@ -66,11 +66,21 @@ signature, so the binary runs. It is not notarized, so a tarball downloaded
 through a browser carries a quarantine attribute and Gatekeeper refuses it until
 the user clears it.
 
-The tag guard runs before any of this. `scripts/verify-tag-version.sh` fails the
-build unless the tag, `package.json`'s `version`, and all four platform pins in
-`optionalDependencies` name the same version. `test/release-guard.test.ts`
-executes that step's own text out of the workflow file, so the guard cannot rot
-unnoticed.
+The tag guard runs inside the four platform builds, not ahead of the workflow.
+`scripts/verify-tag-version.sh` is the `Verify tag matches package version` step
+of the `build-platform` job, after checkout and `bun install` and before anything
+is compiled, and it fails that job unless the tag, `package.json`'s `version`,
+and all four platform pins in `optionalDependencies` name the same version.
+
+`package-root` runs in parallel with no guard of its own, so on a mismatched tag
+that job still packs the root tarball and uploads it as the `release-root-npm`
+artifact. Nothing reaches a registry or a release page, because `publish-npm`
+waits on both build jobs and `publish-github` waits on `build-platform`, and a
+failed guard skips both. The cost of a mismatched tag is therefore one stray
+workflow artifact, never a publication.
+
+`test/release-guard.test.ts` executes that step's own text out of the workflow
+file, so the guard cannot rot unnoticed.
 
 ---
 
@@ -243,6 +253,32 @@ bumping the version to `0.1.0` in a scratch tree and running the full suite.
 8. `README.md` → the two passages stating the package is unpublished at `0.0.0`.
    They stop being true the moment the release lands.
 
+> **Items 6 and 7 are unenforced only if you skip them. Doing them turns
+> `bun test` red until you also move a pin.**
+>
+> `test/surfaces.test.ts` pins every installable surface file by absolute
+> SHA-256 *and* byte length, in the `PINNED` map near the top of that file, and
+> checks the compiled template and the staged file against the same entry. The
+> `"claude-desktop/manifest.json"` entry currently reads
+> `3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f` and
+> `1597` bytes. Changing the version inside the manifest makes both halves wrong
+> and fails two tests — *every compiled template matches its pinned hash and
+> size*, and *every file on disk matches the same pinned hash and size* —
+> neither of which mentions the version, so the reason is not obvious from the
+> failure.
+>
+> Edit item 6 and item 7 together, keeping them byte-identical, then recompute:
+>
+> ```sh
+> shasum -a 256 surfaces/claude-desktop/manifest.json
+> wc -c surfaces/claude-desktop/manifest.json
+> ```
+>
+> Paste the hash into `sha256` and the byte count into `bytes` in the
+> `"claude-desktop/manifest.json"` entry of `PINNED`. The pin is deliberate — it
+> is what stops a regeneration script from corrupting a template and the
+> constant describing it in the same pass — so update it, never delete it.
+
 **Deliberately left behind:**
 
 9. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
@@ -271,8 +307,21 @@ npm pkg set "version=${VERSION}" \
 bun install
 ```
 
-Then edit items 3, 4, 6, 7, and 8 from the list above by hand, and run the full
-gate:
+Then edit items 3, 4, 6, 7, and 8 from the list above by hand.
+
+Items 6 and 7 change a pinned file, so recompute the pin before you run the gate:
+
+```sh
+shasum -a 256 surfaces/claude-desktop/manifest.json
+wc -c surfaces/claude-desktop/manifest.json
+```
+
+and put those two values into `sha256` and `bytes` of the
+`"claude-desktop/manifest.json"` entry in the `PINNED` map in
+`test/surfaces.test.ts`. Skip this and the `bun test` below fails on two surface
+assertions that say nothing about versions.
+
+Now run the full gate:
 
 ```sh
 bun test

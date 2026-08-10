@@ -21,6 +21,20 @@ const workflowPath = join(
 const GUARD_STEP_NAME = "Verify tag matches package version";
 
 /**
+ * The guard's whole output is one line of a few dozen bytes, so this is three
+ * orders of magnitude above anything it produces and still small enough that a
+ * guard which streams is killed long before this runner notices the memory.
+ */
+const MAX_GUARD_OUTPUT_BYTES = 64 * 1024;
+
+/**
+ * Backstop only, for a guard that consumes CPU without producing output. The
+ * guard is a finite script and every case here finishes in milliseconds; a run
+ * that reaches this deadline is a defect, and is failed rather than tolerated.
+ */
+const GUARD_TIMEOUT_MS = 30_000;
+
+/**
  * The text this test executes is read out of `.github/workflows/release.yml` at
  * run time and run verbatim. It is never transcribed into this file: a test that
  * re-implemented the guard would only prove the transcription self-consistent,
@@ -33,9 +47,16 @@ const guardStepScript = extractStepRun(
 );
 
 interface GuardResult {
-  readonly exitCode: number;
+  readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
+}
+
+/** A step run with nothing assumed about how it ended, bounds included. */
+interface SpawnedStep extends GuardResult {
+  /** `undefined` when the step exited on its own; the signal when it was killed. */
+  readonly signalCode: string | undefined;
+  readonly exitedDueToTimeout: boolean | undefined;
 }
 
 test("the release workflow's tag guard passes for the tag naming the packaged version", () => {
@@ -146,20 +167,66 @@ test("the workflow step reader recovers a block-scalar run: body verbatim", () =
  * Run the workflow step under the same interpreter GitHub Actions uses for
  * `shell: bash`, which is `bash --noprofile --norc -eo pipefail {0}`.
  *
- * Bounded by work: `spawnSync` returns when the guard exits, and the guard is a
- * finite script with no waiting in it. There is no timer to tune and nothing
- * that passes or fails differently on a slow machine.
+ * BOUNDED THREE WAYS, ALL OF THEM OUTSIDE THIS THREAD. `spawnSync` blocks the
+ * runner until the child is gone, so a `setTimeout` written here could not fire
+ * to save it: whatever bounds this call has to be enforced by something that is
+ * not the JavaScript event loop.
+ *
+ *   stdin is `/dev/null`, so a guard that ever waits on input reads EOF
+ *     immediately rather than waiting for a keystroke that will never come.
+ *     Bun's default for `spawnSync` is the same today; it is written out here
+ *     because the property is load-bearing and a default is not a promise;
+ *   `maxBuffer` caps the bytes the guard may write and the child is killed on
+ *     the write that crosses it, so a guard that streams cannot exhaust this
+ *     runner's memory;
+ *   `timeout` is enforced by Bun's own child supervision, which is what makes
+ *     it the one deadline that still fires while this call is blocked — the
+ *     backstop for a guard that spins on the CPU without reading, writing, or
+ *     exiting.
+ *
+ * None of the three is trusted to rescue a run: a child killed by any of them
+ * is failed here, on the spot, so an unbounded guard can never pass as a bounded
+ * one. `signalCode` is `undefined` exactly when the guard chose its own exit
+ * rather than being killed, which is the only outcome these tests accept; both
+ * the `maxBuffer` kill and the `timeout` kill leave `SIGTERM` there instead.
  */
 function runGuardStep(options: {
   readonly cwd: string;
   readonly tagName?: string;
 }): GuardResult {
+  const result = spawnStep({ ...options, script: guardStepScript });
+
+  expect(result.exitedDueToTimeout).toBe(false);
+  expect(result.signalCode).toBe(undefined);
+
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+/**
+ * The spawn itself, with nothing asserted about how it ended.
+ *
+ * Split out from `runGuardStep` for one reason: the bounds above are claims, and
+ * the two tests at the bottom of this file check them by handing this function a
+ * step that waits and a step that spins. Every other caller runs the workflow's
+ * own text, which is what `runGuardStep` exists to guarantee — `script` is not a
+ * way to test something other than the real guard.
+ */
+function spawnStep(options: {
+  readonly cwd: string;
+  readonly script: string;
+  readonly tagName?: string;
+  readonly timeoutMs?: number;
+}): SpawnedStep {
   const directory = mkdtempSync(
     join(tmpdir(), "brigadier-release-guard-step-"),
   );
   try {
     const stepPath = join(directory, "step.sh");
-    writeFileSync(stepPath, `${guardStepScript}\n`);
+    writeFileSync(stepPath, `${options.script}\n`);
 
     // HOME points at the throwaway directory, never at the real one: the
     // suite-wide guard in test/config.test.ts forbids any test from reaching
@@ -176,12 +243,17 @@ function runGuardStep(options: {
       cmd: ["bash", "--noprofile", "--norc", "-eo", "pipefail", stepPath],
       cwd: options.cwd,
       env: environment,
+      stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
+      maxBuffer: MAX_GUARD_OUTPUT_BYTES,
+      timeout: options.timeoutMs ?? GUARD_TIMEOUT_MS,
     });
 
     return {
       exitCode: result.exitCode,
+      signalCode: result.signalCode,
+      exitedDueToTimeout: result.exitedDueToTimeout,
       stdout: result.stdout.toString(),
       stderr: result.stderr.toString(),
     };
@@ -189,6 +261,66 @@ function runGuardStep(options: {
     rmSync(directory, { recursive: true, force: true });
   }
 }
+
+/* ------------------------------------------------------------------------ */
+/* The bounds, checked rather than claimed                                   */
+/* ------------------------------------------------------------------------ */
+
+test("a step that waits on input reads EOF instead of waiting with it", () => {
+  const result = spawnStep({
+    cwd: repositoryRoot,
+    script: 'read -r line\necho "read: $line"',
+  });
+
+  // stdin is /dev/null, so `read` fails at once and `-e` ends the step there:
+  // the echo never runs. A step wired to a terminal would still be sitting in
+  // that `read` when the suite gave up.
+  expect(result.exitCode).toBe(1);
+  expect(result.signalCode).toBe(undefined);
+  expect(result.exitedDueToTimeout).toBe(false);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toBe("");
+});
+
+test("a step that spins is killed by a bound the event loop could not enforce", () => {
+  const result = spawnStep({
+    cwd: repositoryRoot,
+    script: "while :; do :; done",
+    // Short only so this test is fast. The mechanism is identical at 30 s.
+    timeoutMs: 1_500,
+  });
+
+  // THE POINT OF THIS TEST. The loop above never yields, never writes, and
+  // never exits, and `spawnSync` blocks this thread for its whole duration —
+  // no `setTimeout` scheduled in this file could have run while it did. What
+  // killed it was Bun's own supervision of the child, outside the event loop.
+  //
+  // Measured, with the three options removed: the runner's own generic
+  // per-test timeout does eventually notice, and reports "this test timed out
+  // after 5000ms" — a message that names no bound, no signal, and no guard.
+  // The deadline set here is what turns that into an attributable failure.
+  expect(result.exitedDueToTimeout).toBe(true);
+  expect(result.signalCode).toBe("SIGTERM");
+  expect(result.exitCode).toBe(null);
+});
+
+test("a step that streams without stopping is killed by the output cap", () => {
+  const result = spawnStep({
+    cwd: repositoryRoot,
+    // Two orders of magnitude past MAX_GUARD_OUTPUT_BYTES, produced as fast as
+    // the machine can produce it.
+    script: "yes brigadier | head -c 8000000",
+  });
+
+  // Killed for writing too much, not for taking too long: this is the bound
+  // that stands between a chatty guard and a runner that dies of memory, and it
+  // is a bound on WORK — how many bytes were produced — so a faster machine
+  // cannot slip past it. `signalCode` first, because "it was killed" is the
+  // claim; which bound killed it is the follow-up.
+  expect(result.signalCode).toBe("SIGTERM");
+  expect(result.exitCode).toBe(null);
+  expect(result.exitedDueToTimeout).toBe(false);
+});
 
 /**
  * A throwaway checkout carrying only what the guard reads: a package.json, and

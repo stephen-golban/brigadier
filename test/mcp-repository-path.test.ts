@@ -14,6 +14,12 @@
  * test of the handler would prove a function returns a string; it would not
  * prove that the running server refuses.
  *
+ * "ABSOLUTE" IS NOT THE SAME QUESTION ON EVERY PLATFORM, so the subprocess
+ * session below proves the POSIX rule end to end and the two unit tests at the
+ * bottom prove the win32 rule, which is live code — brigadier's CLI refuses to
+ * run on Windows, but this server's JavaScript entry point does not — that no
+ * runner this project has would otherwise execute.
+ *
  * BOUNDED BY WORK, NOT BY WALL CLOCK. Every byte and every chunk the server
  * writes is counted against a fixed budget, and the budget is what fails a
  * server that spins — a timer is worthless against a loop that never yields.
@@ -22,10 +28,14 @@
  */
 
 import { expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, win32 } from "node:path";
+import {
+  isUnambiguousRepositoryPath,
+  refuseAmbiguousRepositoryPath,
+} from "../src/mcp/tools.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const entry = join(repositoryRoot, "src", "cli.ts");
@@ -157,7 +167,54 @@ function run(id: number, repositoryPath: unknown): string {
   });
 }
 
+/**
+ * Everything outside the scratch boundary that this test proves the server did
+ * not write. `/abs/repo` is the one path the session below hands to the tool and
+ * gets ACCEPTED, so it is the one an over-eager server would most plausibly
+ * create.
+ */
+const OUTSIDE_THE_BOUNDARY: readonly string[] = [
+  join(repositoryRoot, ".brigadier"),
+  join(repositoryRoot, "config.json"),
+  "/abs/repo",
+];
+
+/**
+ * What a path looks like right now: absent, a directory and its entries, or a
+ * file and its size and mtime.
+ *
+ * COMPARED BEFORE AGAINST AFTER, never asserted to be absent outright. The
+ * property under test is that the SERVER wrote nothing out here, and a bare
+ * `existsSync(...) === false` does not state that property — it states that the
+ * machine running the suite happens not to have the path, which is a different
+ * claim that some other machine is entitled to falsify. Reading the fingerprint
+ * on both sides keeps the real property and makes it independent of whatever
+ * was already on disk; it is also strictly stronger than the non-existence
+ * check it replaces, because a path that already existed and was MODIFIED now
+ * fails too, where before it was never looked at.
+ */
+function fingerprint(path: string): string {
+  const stats = statSync(path, { throwIfNoEntry: false });
+  if (stats === undefined) {
+    return "absent";
+  }
+  if (stats.isDirectory()) {
+    return `directory:[${readdirSync(path).sort().join(",")}]`;
+  }
+  return `file:${stats.size}:${stats.mtimeMs}`;
+}
+
+/** Every path outside the boundary whose fingerprint moved. */
+function changedOutsideTheBoundary(
+  before: readonly string[],
+): readonly string[] {
+  return OUTSIDE_THE_BOUNDARY.filter(
+    (path, index) => fingerprint(path) !== before[index],
+  );
+}
+
 test("brigadier_run refuses every relative repositoryPath and accepts every absolute one", async () => {
+  const beforeOutside = OUTSIDE_THE_BOUNDARY.map(fingerprint);
   const scratchHome = await mkdtemp(join(tmpdir(), "brigadier-mcp-abspath-"));
   // The server is launched somewhere that is NOT this repository, which is what
   // a relative path would otherwise resolve against.
@@ -271,7 +328,7 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
     expect(runTool?.inputSchema.properties.repositoryPath).toEqual({
       type: "string",
       description:
-        "Absolute path to the git repository to run in. Must be absolute: this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. A leading ~ is not expanded.",
+        "Path to the git repository to run in, absolute and unambiguous on the platform this server is running on: on POSIX a path beginning with /; on Windows a drive-qualified path such as C:\\repo or a UNC path such as \\\\server\\share. This server's working directory is not the client's, so anything the server would have to resolve against state of its own — a working directory, or a current drive — could silently target the wrong repository. On Windows that rules out /repo, \\repo, and C:repo, all of which are drive-relative. A leading ~ is not expanded.",
     });
     // THE SAFETY PROPERTY: the owner's real ~/.brigadier is untouched.
     //
@@ -282,7 +339,6 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
     // useless. What is left is stronger than a mtime comparison anyway: the
     // server was pointed at $BRIGADIER_HOME and it wrote NOTHING, anywhere.
     //
-    // Every path named below is outside the scratch boundary.
     // Nothing brigadier-shaped was written even into its own scratch home. The
     // filter is there because macOS itself drops a `Library` directory into any
     // path handed to a subprocess as $HOME, and that is the OS, not brigadier.
@@ -291,13 +347,126 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
         (name) => name === "config.json" || name === ".brigadier",
       ),
     ).toEqual([]);
+    // Both scratch directories were made by this test moments ago, so absence
+    // here is a fact about the server and nothing else.
     expect(existsSync(join(launchDirectory, ".brigadier"))).toBe(false);
     expect(existsSync(join(launchDirectory, "config.json"))).toBe(false);
-    expect(existsSync(join(repositoryRoot, ".brigadier"))).toBe(false);
-    expect(existsSync(join(repositoryRoot, "config.json"))).toBe(false);
-    expect(existsSync("/abs/repo")).toBe(false);
+    // And OUTSIDE the boundary, where the test does not own what is on disk,
+    // the assertion is that the server changed nothing — including at
+    // `/abs/repo`, the path it accepted.
+    expect(changedOutsideTheBoundary(beforeOutside)).toEqual([]);
   } finally {
     await rm(scratchHome, { recursive: true, force: true });
     await rm(launchDirectory, { recursive: true, force: true });
   }
 }, 60_000);
+
+/**
+ * WHAT "ABSOLUTE" HAS TO MEAN ON WINDOWS, and why `isAbsolute` is not it.
+ *
+ * `path.win32.isAbsolute` answers TRUE for `/repo` and `\repo`. Those are
+ * drive-relative: they resolve to `C:\repo` when the process's current drive is
+ * C and `D:\repo` when it is D. A server that accepted them would resolve the
+ * caller's path against state the caller cannot see, which is the exact failure
+ * the rule exists to prevent, arriving through the primitive chosen to prevent
+ * it. The two assertions on `win32.isAbsolute` below are here on purpose: they
+ * pin the primitive's real behaviour, so a later reader can see why the code
+ * cannot simply call it.
+ */
+test("an unambiguous repositoryPath names its volume on win32", () => {
+  // ACCEPTED: the volume is named, by drive letter or by host and share.
+  expect(isUnambiguousRepositoryPath("C:\\repo", "win32")).toBe(true);
+  expect(isUnambiguousRepositoryPath("c:/repo", "win32")).toBe(true);
+  expect(isUnambiguousRepositoryPath("C:\\repo\\..\\other", "win32")).toBe(
+    true,
+  );
+  expect(isUnambiguousRepositoryPath("\\\\server\\share", "win32")).toBe(true);
+  expect(isUnambiguousRepositoryPath("\\\\server\\share\\repo", "win32")).toBe(
+    true,
+  );
+
+  // REFUSED, AND THE PRIMITIVE DISAGREES: drive-relative, both of them.
+  expect(win32.isAbsolute("/repo")).toBe(true);
+  expect(win32.isAbsolute("\\repo")).toBe(true);
+  expect(isUnambiguousRepositoryPath("/repo", "win32")).toBe(false);
+  expect(isUnambiguousRepositoryPath("\\repo", "win32")).toBe(false);
+
+  // REFUSED, and the primitive agrees: relative to the current directory of
+  // drive C, which is per-drive state and not the process's working directory.
+  expect(win32.isAbsolute("C:repo")).toBe(false);
+  expect(isUnambiguousRepositoryPath("C:repo", "win32")).toBe(false);
+
+  // REFUSED: a host with no share names nothing to resolve within.
+  expect(isUnambiguousRepositoryPath("\\\\server", "win32")).toBe(false);
+  expect(isUnambiguousRepositoryPath("\\\\server\\", "win32")).toBe(false);
+
+  // REFUSED: ordinary relative paths, on Windows as everywhere.
+  expect(isUnambiguousRepositoryPath("relative\\repo", "win32")).toBe(false);
+  expect(isUnambiguousRepositoryPath(".\\repo", "win32")).toBe(false);
+  expect(isUnambiguousRepositoryPath("~\\code\\repo", "win32")).toBe(false);
+  expect(isUnambiguousRepositoryPath("", "win32")).toBe(false);
+});
+
+/**
+ * POSIX IS UNCHANGED, asserted against the predicate directly and stated in the
+ * same values the subprocess session above drives end to end.
+ *
+ * The win32 forms are refused here, which is the deliberate half of the rule:
+ * on POSIX `C:\repo` is not a path to a volume at all, it is an ordinary
+ * relative filename that happens to contain a colon and a backslash, and
+ * accepting it would resolve against the working directory nobody controls.
+ */
+test("an unambiguous repositoryPath is simply an absolute one on posix", () => {
+  for (const platform of ["darwin", "linux"] as const) {
+    expect(isUnambiguousRepositoryPath("/abs/repo", platform)).toBe(true);
+    expect(isUnambiguousRepositoryPath("/abs/repo/", platform)).toBe(true);
+    expect(isUnambiguousRepositoryPath("/abs/repo/../other", platform)).toBe(
+      true,
+    );
+    expect(isUnambiguousRepositoryPath("/", platform)).toBe(true);
+
+    expect(isUnambiguousRepositoryPath("relative/repo", platform)).toBe(false);
+    expect(isUnambiguousRepositoryPath("./repo", platform)).toBe(false);
+    expect(isUnambiguousRepositoryPath("~/code/repo", platform)).toBe(false);
+    expect(isUnambiguousRepositoryPath("", platform)).toBe(false);
+    expect(isUnambiguousRepositoryPath("C:\\repo", platform)).toBe(false);
+    expect(isUnambiguousRepositoryPath("\\\\server\\share", platform)).toBe(
+      false,
+    );
+  }
+});
+
+/**
+ * The bytes a caller actually reads. The POSIX message is asserted over the
+ * real pipe in the session above; this pins the win32 one, which no runner here
+ * can produce, and pins that the two differ only by the clause that applies.
+ */
+test("the refusal names the Windows rule only on Windows", () => {
+  const preamble =
+    "repositoryPath must be an absolute path, because this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository.";
+  const windowsClause =
+    " On Windows an absolute path must also name its volume — a drive-qualified path like C:\\repo or a UNC path like \\\\server\\share — because /repo, \\repo, and C:repo are drive-relative and resolve against a current drive or per-drive directory the caller cannot see.";
+  const tildeClause =
+    " A leading ~ is not expanded here, because no shell is involved; spell the home directory out in full.";
+
+  expect(refuseAmbiguousRepositoryPath("/repo", "win32")).toEqual({
+    text: `${preamble} Received "/repo".${windowsClause}`,
+    isError: true,
+  });
+  expect(refuseAmbiguousRepositoryPath("~\\code\\repo", "win32")).toEqual({
+    text: `${preamble} Received "~\\\\code\\\\repo".${windowsClause}${tildeClause}`,
+    isError: true,
+  });
+  expect(refuseAmbiguousRepositoryPath("relative/repo", "linux")).toEqual({
+    text: `${preamble} Received "relative/repo".`,
+    isError: true,
+  });
+  expect(refuseAmbiguousRepositoryPath("~/code/repo", "darwin")).toEqual({
+    text: `${preamble} Received "~/code/repo".${tildeClause}`,
+    isError: true,
+  });
+
+  // Accepted paths produce no refusal at all, on either platform.
+  expect(refuseAmbiguousRepositoryPath("/abs/repo", "darwin")).toBe(null);
+  expect(refuseAmbiguousRepositoryPath("C:\\repo", "win32")).toBe(null);
+});

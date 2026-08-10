@@ -18,7 +18,7 @@
  * spawn `claude` is ever replaced.
  */
 
-import { isAbsolute } from "node:path";
+import { posix } from "node:path";
 import type { BrigadierConfig } from "../config/contracts.js";
 import { validatePlan } from "../plan/validate.js";
 import type { RoutedWorker, RoutingDecision } from "../routing/contracts.js";
@@ -143,7 +143,7 @@ export function createTools(
           repositoryPath: {
             type: "string",
             description:
-              "Absolute path to the git repository to run in. Must be absolute: this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. A leading ~ is not expanded.",
+              "Path to the git repository to run in, absolute and unambiguous on the platform this server is running on: on POSIX a path beginning with /; on Windows a drive-qualified path such as C:\\repo or a UNC path such as \\\\server\\share. This server's working directory is not the client's, so anything the server would have to resolve against state of its own — a working directory, or a current drive — could silently target the wrong repository. On Windows that rules out /repo, \\repo, and C:repo, all of which are drive-relative. A leading ~ is not expanded.",
           },
           slug: {
             type: "string",
@@ -316,9 +316,12 @@ async function runTool(
       isError: true,
     };
   }
-  const notAbsolute = refuseRelativeRepositoryPath(repositoryPath);
-  if (notAbsolute !== null) {
-    return notAbsolute;
+  const ambiguous = refuseAmbiguousRepositoryPath(
+    repositoryPath,
+    process.platform,
+  );
+  if (ambiguous !== null) {
+    return ambiguous;
   }
 
   const slug = resolveSlug(record.slug, document.plan.id);
@@ -348,16 +351,71 @@ async function runTool(
 }
 
 /**
- * A RELATIVE `repositoryPath` IS REFUSED, NEVER RESOLVED.
+ * A drive-qualified Windows path: `C:\repo` or `C:/repo`. The volume is named,
+ * so nothing about where this resolves is inherited from the process.
+ */
+const WINDOWS_DRIVE_QUALIFIED = /^[A-Za-z]:[\\/]/;
+
+/**
+ * A UNC path: `\\server\share...`. Both the host and a first component after it
+ * are required, because `\\server` alone names no share to resolve within.
+ */
+const WINDOWS_UNC = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]/;
+
+/**
+ * Is this path unambiguous on `platform` — does it name, by itself, exactly one
+ * location, with nothing left to resolve against process state?
+ *
+ * VALIDATED AGAINST THE RUNNING PLATFORM ONLY, DELIBERATELY. The path is going
+ * to be resolved by this process, on this machine, so the only question that
+ * matters is whether it is unambiguous *here*. Validating against both platforms
+ * at once would be strictly worse in both directions: it would have to refuse
+ * `/repo` on Linux, which is perfectly unambiguous and is the normal case; and
+ * it would have to accept `C:\repo` on POSIX, where that string is not a path to
+ * a volume at all but an ordinary relative filename containing a colon and a
+ * backslash. A rule that is wrong on every platform in order to be uniform
+ * across them is not a stricter rule, only a vaguer one.
+ *
+ * `platform` is a parameter rather than a read of `process.platform` so that the
+ * win32 branch is reachable from a test on a POSIX machine. It is the whole
+ * reason this predicate is exported: brigadier's CLI refuses to run on Windows,
+ * but the MCP server's JavaScript entry point does not, so the win32 branch is
+ * live code that no CI runner this project has would otherwise execute.
+ *
+ * POSIX: `posix.isAbsolute` and nothing else, exactly as before. A trailing
+ * slash (`/repo/`) and an interior `..` (`/repo/../other`) are both absolute and
+ * both accepted; the worktree engine already resolves and realpaths what it is
+ * given and refuses anything that is not a repository root.
+ *
+ * WIN32: `win32.isAbsolute` is NOT good enough and is deliberately not used. It
+ * answers true for `/repo` and `\repo`, which are *drive-relative*: they resolve
+ * to `C:\repo` when this process's current drive is C and `D:\repo` when it is
+ * D. That is precisely the ambiguity this rule exists to eliminate — a path that
+ * resolves against state the caller cannot see — so the accepted forms are
+ * narrowed to the two that carry their own volume.
+ */
+export function isUnambiguousRepositoryPath(
+  value: string,
+  platform: NodeJS.Platform,
+): boolean {
+  if (platform === "win32") {
+    return WINDOWS_DRIVE_QUALIFIED.test(value) || WINDOWS_UNC.test(value);
+  }
+  return posix.isAbsolute(value);
+}
+
+/**
+ * AN AMBIGUOUS `repositoryPath` IS REFUSED, NEVER RESOLVED.
  *
  * An MCP client — Claude Desktop above all — gives nobody any control over this
  * server process's working directory: it is whatever the client's launcher
  * happened to inherit. A relative path would therefore resolve against a
  * directory the caller cannot see, name, or predict, and the failure that
  * produces is the worst one this tool has — running a plan, spawning workers,
- * and writing commits into the WRONG repository, silently. An absolute path is
- * the only thing an MCP client can state unambiguously, so it is the only thing
- * accepted.
+ * and writing commits into the WRONG repository, silently. A path that names one
+ * location by itself is the only thing an MCP client can state unambiguously, so
+ * it is the only thing accepted. See `isUnambiguousRepositoryPath` for what that
+ * means per platform, and why Windows needs more than "absolute".
  *
  * TWO MESSAGES, NOT ONE. The empty/non-string refusal above stays exactly as it
  * was and this is a separate one, because they are separate mistakes with
@@ -365,25 +423,30 @@ async function runTool(
  * path that looks fine and would have run somewhere else. Folding them into one
  * string would make each half wrong for the caller who hit the other.
  *
- * `isAbsolute` is the whole test, and it is deliberately the whole test. A
- * trailing slash (`/repo/`) and an interior `..` (`/repo/../other`) are both
- * absolute and both accepted here; the worktree engine already resolves and
- * realpaths what it is given and refuses anything that is not a repository
- * root. `~/repo` is NOT absolute — nothing expands tilde in this process, since
- * no shell is involved — so it is refused, with the reason spelled out, because
- * a caller who typed `~` believes it means their home directory.
+ * `~/repo` is refused with the reason spelled out — nothing expands tilde in
+ * this process, since no shell is involved — because a caller who typed `~`
+ * believes it already means their home directory.
  *
- * Returns the refusal, or `null` when the path is absolute.
+ * Returns the refusal, or `null` when the path is unambiguous.
  */
-function refuseRelativeRepositoryPath(value: string): ToolResult | null {
-  if (isAbsolute(value)) {
+export function refuseAmbiguousRepositoryPath(
+  value: string,
+  platform: NodeJS.Platform,
+): ToolResult | null {
+  if (isUnambiguousRepositoryPath(value, platform)) {
     return null;
   }
+  // Named only where it applies. On POSIX this clause is empty and the message
+  // is byte-for-byte the one this tool has always returned.
+  const windows =
+    platform === "win32"
+      ? " On Windows an absolute path must also name its volume — a drive-qualified path like C:\\repo or a UNC path like \\\\server\\share — because /repo, \\repo, and C:repo are drive-relative and resolve against a current drive or per-drive directory the caller cannot see."
+      : "";
   const tilde = value.startsWith("~")
     ? " A leading ~ is not expanded here, because no shell is involved; spell the home directory out in full."
     : "";
   return {
-    text: `repositoryPath must be an absolute path, because this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. Received ${JSON.stringify(value)}.${tilde}`,
+    text: `repositoryPath must be an absolute path, because this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. Received ${JSON.stringify(value)}.${windows}${tilde}`,
     isError: true,
   };
 }

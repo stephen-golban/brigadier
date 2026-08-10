@@ -10,11 +10,19 @@
  * and every one of those is a way a working handler still yields a server no
  * client can talk to.
  *
- * EVERY SESSION IS BOUNDED AND THE BOUND IS ASSERTED. `drive` writes its whole
- * script, closes stdin, and kills the process on a deadline; `timedOut` is
- * asserted false in every test. A server broken into hanging therefore fails in
- * seconds with a clear reason instead of wedging the suite, which is the one
- * failure mode a subprocess test can have that is worse than no test at all.
+ * EVERY SESSION IS BOUNDED BY WORK, AND THE BOUND IS ASSERTED. `drive` writes
+ * its whole script, closes stdin, and counts every chunk and every byte the
+ * child writes against a fixed budget; past either budget it kills the child and
+ * throws. That is the bound that matters. A server that streams without ever
+ * finishing is otherwise drained without limit for the whole twenty seconds of
+ * the deadline below — measured at 20,093 ms, and at a few megabytes a second
+ * that is enough to exhaust this runner before the kill ever arrives. The
+ * deadline is a leak guard for a SILENT child, nothing more, and `timedOut` is
+ * asserted false in every test so it can never quietly rescue a broken run.
+ *
+ * A server broken into hanging therefore fails in seconds with a clear reason
+ * instead of wedging the suite, which is the one failure mode a subprocess test
+ * can have that is worse than no test at all.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -26,10 +34,28 @@ import packageJson from "../package.json";
 const repositoryRoot = resolve(import.meta.dir, "..");
 
 /**
- * Generous enough that a cold `bun` start on a loaded machine is not flaky, and
- * short enough that a hung server is a fast red rather than a stalled suite.
+ * Leak guard only, for a child that writes NOTHING: generous enough that a cold
+ * `bun` start on a loaded machine is not flaky, and short enough that a silent
+ * hung server is a fast red rather than a stalled suite. A child that writes is
+ * caught by the work budgets below instead, and much sooner.
  */
 const TIMEOUT_MS = 20_000;
+
+/**
+ * The work budgets, in bytes and in chunks.
+ *
+ * The largest frame any session here provokes is the `tools/list` response, at
+ * 5,555 bytes, and the busiest session asks for a handful of much smaller
+ * frames on top of it. 64 KiB is therefore an order of magnitude above anything
+ * a working server produces and still nowhere near enough to hurt: a server
+ * that trips either budget is not answering, it is looping.
+ *
+ * The chunk budget exists alongside the byte budget because a child can also
+ * loop while writing almost nothing — a stream of empty or one-byte writes
+ * would sit under a byte budget forever.
+ */
+const MAX_STREAM_BYTES = 64 * 1024;
+const MAX_STREAM_CHUNKS = 256;
 
 /**
  * The version pinned into the `initialize` literal below.
@@ -45,6 +71,57 @@ interface Session {
   readonly stderr: string;
   readonly exitCode: number;
   readonly timedOut: boolean;
+}
+
+/**
+ * Drains one stream, counting work rather than time.
+ *
+ * Throws — rather than truncating — past either budget, because a test that
+ * quietly accepts a runaway server is a test that passes on broken code. The
+ * child is killed first, so the throw is not left waiting on an exit that a
+ * looping process would never reach.
+ *
+ * This is what `new Response(stream).text()` cannot do. That reads to the end of
+ * the stream with no budget at all, so against a child that never stops writing
+ * it grows a string until the deadline below finally kills the child — twenty
+ * seconds of accumulation that a fast writer turns into memory this runner does
+ * not have. The budgets here stop the same child in milliseconds.
+ */
+async function drainBounded(
+  stream: ReadableStream<Uint8Array>,
+  label: string,
+  kill: () => void,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  let chunks = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) {
+        return text + decoder.decode();
+      }
+      chunks += 1;
+      bytes += next.value.byteLength;
+      if (chunks > MAX_STREAM_CHUNKS) {
+        kill();
+        throw new Error(
+          `${label} exceeded the ${MAX_STREAM_CHUNKS}-chunk budget: the server is producing output without finishing`,
+        );
+      }
+      if (bytes > MAX_STREAM_BYTES) {
+        kill();
+        throw new Error(
+          `${label} exceeded the ${MAX_STREAM_BYTES}-byte budget: the server is producing output without finishing`,
+        );
+      }
+      text += decoder.decode(next.value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -68,10 +145,19 @@ async function drive(
     stdout: "pipe",
     stderr: "pipe",
   });
-  const stdout = new Response(proc.stdout).text();
-  const stderr = new Response(proc.stderr).text();
+  const kill = (): void => {
+    proc.kill(9);
+  };
+  const stdout = drainBounded(proc.stdout, "stdout", kill);
+  const stderr = drainBounded(proc.stderr, "stderr", kill);
   proc.stdin.write(`${lines.join("\n")}\n`);
   await proc.stdin.end();
+
+  // Both rejections are observed from the moment they can happen. A budget
+  // overrun rejects while this side is still waiting on `exited`, and a
+  // rejection nobody is holding in that window takes the whole runner down
+  // instead of failing the one test that provoked it.
+  const drained = Promise.allSettled([stdout, stderr]);
 
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -80,6 +166,7 @@ async function drive(
   }, TIMEOUT_MS);
   const exitCode = await proc.exited;
   clearTimeout(timer);
+  await drained;
 
   return {
     stdout: await stdout,
@@ -504,7 +591,7 @@ describe("the MCP server over stdio", () => {
           repositoryPath: {
             type: "string",
             description:
-              "Absolute path to the git repository to run in. Must be absolute: this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. A leading ~ is not expanded.",
+              "Path to the git repository to run in, absolute and unambiguous on the platform this server is running on: on POSIX a path beginning with /; on Windows a drive-qualified path such as C:\\repo or a UNC path such as \\\\server\\share. This server's working directory is not the client's, so anything the server would have to resolve against state of its own — a working directory, or a current drive — could silently target the wrong repository. On Windows that rules out /repo, \\repo, and C:repo, all of which are drive-relative. A leading ~ is not expanded.",
           },
           slug: {
             type: "string",
@@ -913,4 +1000,81 @@ describe("the MCP server over stdio", () => {
       await rm(home, { recursive: true, force: true });
     }
   }, 40_000);
+});
+
+/* ------------------------------------------------------------------------ */
+/* The budgets themselves                                                    */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * A child that writes and never finishes — the failure the budgets exist for.
+ *
+ * It writes 4 KiB per tick, so it crosses the 64 KiB byte budget in about
+ * seventeen ticks and a few dozen milliseconds. It never exits on its own and
+ * never reads its stdin, which is exactly the shape of a server broken into a
+ * loop that still has a working stdout.
+ */
+const RUNAWAY_ENTRY = `const chunk = "x".repeat(4096) + "\\n";
+setInterval(() => {
+  process.stdout.write(chunk);
+}, 1);
+`;
+
+describe("the work budgets", () => {
+  test("a child that streams without finishing fails the session instead of wedging it", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-runaway-"));
+    try {
+      const entry = join(home, "runaway.ts");
+      await writeFile(entry, RUNAWAY_ENTRY, "utf8");
+
+      // The budget is what fails this, and it fails it in milliseconds. Read
+      // through `new Response(stream).text()` the same child would be drained
+      // without limit until the 20-second leak guard finally killed it, having
+      // accumulated tens of megabytes on this side first.
+      await expect(
+        drive(entry, ['{"jsonrpc":"2.0","id":1,"method":"ping"}'], {
+          PATH: process.env.PATH ?? "",
+        }),
+      ).rejects.toThrow(
+        "stdout exceeded the 65536-byte budget: the server is producing output without finishing",
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a child that loops while writing almost nothing trips the chunk budget", async () => {
+    // Driven against a synthetic stream rather than a subprocess, because the
+    // point is a child whose BYTES stay small forever, and only a stream this
+    // side controls can guarantee the one-byte writes arrive one at a time
+    // rather than being coalesced by the pipe on their way over.
+    let killed = 0;
+    let enqueued = 0;
+    // `highWaterMark: 0` so the stream buffers nothing and `pull` runs only for
+    // a read that is actually waiting: the count below is then exactly the
+    // number of chunks the drain took, with no read-ahead of the default
+    // strategy's to explain away.
+    const endless = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          enqueued += 1;
+          controller.enqueue(new Uint8Array([0x2e]));
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    await expect(
+      drainBounded(endless, "stdout", () => {
+        killed += 1;
+      }),
+    ).rejects.toThrow(
+      "stdout exceeded the 256-chunk budget: the server is producing output without finishing",
+    );
+
+    // 257 chunks: the budget is exceeded by the first chunk past it, and not
+    // one byte of the 257 was enough to trouble the 65,536-byte budget.
+    expect(enqueued).toBe(257);
+    expect(killed).toBe(1);
+  });
 });
