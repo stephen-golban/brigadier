@@ -28,6 +28,7 @@
 
 import type {
   AnyWorker,
+  Effort,
   Plan,
   Slice,
   Vendor,
@@ -255,11 +256,154 @@ export interface SupervisorPorts {
 }
 
 /**
+ * How confident the reviewer is that what it found is actually wrong.
+ *
+ * TWO RUNGS, NOT FIVE, AND THE REASON IS THE ADJUDICATOR. Only one distinction
+ * changes what brigadier does — block the slice or record the note — so a
+ * richer scale would be a vocabulary the reviewer spends effort on and nothing
+ * reads. `blocking` is a claim the reviewer is willing to spend the slice's
+ * escalation on; `concern` is everything it wants a human to see and is not
+ * willing to fail the slice over.
+ */
+export type ReviewSeverity = "blocking" | "concern";
+
+/**
+ * One thing a reviewer says is wrong.
+ *
+ * `path` and `line` are nullable because they are the reviewer's claim, not
+ * brigadier's measurement: nothing here verifies that the file exists or that
+ * the line number is real, and a finding about the change as a whole has
+ * neither. Rendering a fabricated `file:line` as though brigadier had checked
+ * it would be worse than rendering none.
+ */
+export interface ReviewFinding {
+  readonly severity: ReviewSeverity;
+  readonly path: string | null;
+  readonly line: number | null;
+  readonly summary: string;
+}
+
+/** Which model formed the opinion. Always a different vendor than the builder. */
+export interface ReviewerIdentity {
+  readonly vendor: Vendor;
+  readonly model: string;
+  readonly effort: Effort;
+}
+
+/**
+ * Why no verdict was reached, in the order the gate can hit them.
+ *
+ * Every member here means the SLICE WAS NOT JUDGED. None of them is a pass, and
+ * a renderer that prints them as one is the defect this enum exists to prevent.
+ *
+ * - `NO_OTHER_VENDOR`: only one vendor is configured, so there is no second
+ *   opinion to be had. The ordinary state of a single-vendor install.
+ * - `NO_ADAPTER`: the other vendor is configured but `workerFor` returned null.
+ * - `REVIEWER_FAILED`: the reviewer's own worker failed — quota, auth, a crash.
+ *   It says nothing about the slice.
+ * - `UNREADABLE_RESPONSE`: the reviewer ran and answered, but its answer
+ *   carried no findings block this code could parse.
+ * - `CANCELLED`: the run was interrupted while the reviewer was running.
+ */
+export type ReviewSkipReason =
+  | "NO_OTHER_VENDOR"
+  | "NO_ADAPTER"
+  | "REVIEWER_FAILED"
+  | "UNREADABLE_RESPONSE"
+  | "CANCELLED";
+
+/** The `ReviewSkipReason` members as data, for exhaustive iteration. */
+export const REVIEW_SKIP_REASONS = [
+  "NO_OTHER_VENDOR",
+  "NO_ADAPTER",
+  "REVIEWER_FAILED",
+  "UNREADABLE_RESPONSE",
+  "CANCELLED",
+] as const satisfies readonly ReviewSkipReason[];
+
+/** The rejecting arm, named so `SliceFailure` can demand exactly it. */
+export interface RejectedSliceReview {
+  readonly verdict: "rejected";
+  readonly reviewer: ReviewerIdentity;
+  /**
+   * Everything the reviewer said, not only the blocking members. A user
+   * adjudicating a rejection needs the concerns too: they are the context that
+   * makes a blocking finding believable or obviously wrong.
+   */
+  readonly findings: readonly ReviewFinding[];
+  readonly durationMs: number;
+}
+
+/**
+ * What the cross-vendor gate concluded about one attempt's work.
+ *
+ * THREE ARMS RATHER THAN A BOOLEAN, BECAUSE "PASSED" AND "NEVER RAN" MUST NEVER
+ * RENDER ALIKE. The gate fails open — a reviewer that could not be chosen,
+ * could not be launched, or answered unreadably lets the slice through — and a
+ * two-state verdict would report every one of those as approval. That is the
+ * exact shape of defect this repository has shipped before: a run that was
+ * green because half of it never happened.
+ */
+export type SliceReview =
+  | {
+      readonly verdict: "approved";
+      readonly reviewer: ReviewerIdentity;
+      /**
+       * Present on the approving arm too, and never blocking by construction:
+       * a reviewer that raised concerns and no blocker approved the slice AND
+       * had something to say, and dropping it would lose the more useful half
+       * of a clean review.
+       */
+      readonly findings: readonly ReviewFinding[];
+      readonly durationMs: number;
+    }
+  | RejectedSliceReview
+  | {
+      readonly verdict: "skipped";
+      /** Null when no reviewer could be chosen at all. */
+      readonly reviewer: ReviewerIdentity | null;
+      readonly reason: ReviewSkipReason;
+      readonly message: string;
+      readonly durationMs: number;
+    };
+
+/**
+ * One attempt's work, handed to the gate.
+ *
+ * `worktreePath` is the UNCOMMITTED working tree the builder just wrote into.
+ * The gate runs before `engine.commit`, so there is no commit to diff against
+ * and the engine exposes no diff, status, or inspect method — see `review.ts`
+ * for why the insertion point is there anyway and what it costs.
+ */
+export interface SliceReviewRequest {
+  readonly slice: Slice;
+  readonly attempt: number;
+  readonly worktreePath: string;
+  /** The model whose work is being reviewed; the reviewer is never this one. */
+  readonly builder: RoutedWorker;
+  readonly routing: RoutingInput;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * The gate, kept behind an interface for the same reason `SliceRunner` is: the
+ * slice runner's own tests must be able to drive an approval, a rejection and
+ * every skip reason without a subprocess or a second vendor installed.
+ *
+ * IT NEVER REJECTS. It is called from inside `#runInWorktree`, which is
+ * documented total, and every way a review can go wrong is already a
+ * `verdict: "skipped"`.
+ */
+export interface SliceReviewer {
+  review(request: SliceReviewRequest): Promise<SliceReview>;
+}
+
+/**
  * Why one slice did not finish, named by the stage that stopped it.
  *
  * The stages are ordered as the runner performs them — route, prepare a
- * worktree, spawn a worker, inspect the diff, commit — so the kind alone tells a
- * reader how far the slice got and what state the repository is in.
+ * worktree, spawn a worker, review what it produced, commit — so the kind alone
+ * tells a reader how far the slice got and what state the repository is in.
  *
  * `NO_CHANGES` is a failure rather than a trivial success, and the reason is
  * worth stating flatly: a worker that exits cleanly having changed no file has
@@ -272,6 +416,7 @@ export type SliceFailureKind =
   | "ROUTING_FAILED"
   | "WORKTREE_FAILED"
   | "WORKER_FAILED"
+  | "REVIEW_REJECTED"
   | "NO_CHANGES"
   | "COMMIT_FAILED";
 
@@ -280,19 +425,28 @@ export type SliceFailureKind =
  *
  * WHAT "FAILED" MEANS HERE, EXACTLY. A slice fails when it could not be routed,
  * when its worktree could not be created, when its worker returned a failed
- * `WorkerOutcome`, when the worker changed no files, or when the commit did not
- * land. That is the complete list, and it is narrower than a reader of decision
- * #24 will expect: that decision speaks of a slice "failing its gate", and THIS
- * UNIT RUNS NO GATE. It does not run the repository's tests, its linter, or its
- * build for a slice, and it forms no opinion about whether the diff is any good.
- * Per-slice quality gating is deliberately a later unit's job.
+ * `WorkerOutcome`, when a cross-vendor reviewer found a blocking defect in what
+ * the worker produced, when the worker changed no files, or when the commit did
+ * not land. That is the complete list.
  *
- * The distinction matters because it changes what `ATTEMPT_LIMIT` buys. The
- * escalation here is driven by a worker that did not finish, not by work that
- * finished badly — so a slice whose worker cheerfully produces a wrong but
- * committable diff is `ok: true` today, and will stay that way until the gate
- * exists. Reading the retry as gate-driven would suggest a guarantee about
- * quality that nothing in this unit provides.
+ * `REVIEW_REJECTED` IS THE GATE DECISION #24 WAS WRITTEN FOR, AND UNTIL IT
+ * EXISTED THE ESCALATION HERE WAS DRIVEN ONLY BY WORKERS THAT DID NOT FINISH.
+ * That is what changed: a slice whose worker cheerfully produces a wrong but
+ * committable diff is no longer `ok: true` by default. It is read by a model
+ * from the OTHER vendor, and a blocking finding costs the slice its attempt and
+ * re-routes it — with the failing model on `excluded` — to a different one.
+ *
+ * WHAT THE GATE STILL DOES NOT DO, so `ATTEMPT_LIMIT`'s meaning stays honest:
+ * it does not run the repository's tests, its linter, or its build. The verdict
+ * is one model's reading of the code, not a green suite, and `review.ts` states
+ * at length what that verdict can and cannot distinguish. A slice can pass this
+ * gate and still be wrong.
+ *
+ * IT ALSO FAILS OPEN. A reviewer that could not be chosen, could not be
+ * launched, or answered unreadably yields `verdict: "skipped"` and the slice
+ * commits. That is a deliberate trade — a vendor outage must not fail every
+ * slice — and it is the reason `SliceReview` has a third arm rather than a
+ * boolean: "approved" and "never actually ran" must never render alike.
  *
  * Every member has a `message`, which is what a human reads. Three members
  * carry more, and each carries only what its own stage can actually produce.
@@ -347,6 +501,18 @@ export type SliceFailure =
       readonly message: string;
       readonly failure: WorkerFailure;
     }
+  | {
+      readonly kind: "REVIEW_REJECTED";
+      readonly message: string;
+      /**
+       * The verdict itself, carried structurally for the same reason
+       * `ROUTING_FAILED` carries `rejected`: the findings ARE the diagnosis. A
+       * user told only that "the review rejected this slice" cannot act; a user
+       * shown the file, the line, and the sentence can either fix the slice or
+       * tell brigadier the reviewer was wrong.
+       */
+      readonly review: RejectedSliceReview;
+    }
   | { readonly kind: "NO_CHANGES"; readonly message: string }
   | { readonly kind: "COMMIT_FAILED"; readonly message: string };
 
@@ -358,6 +524,7 @@ export const SLICE_FAILURE_KINDS = [
   "ROUTING_FAILED",
   "WORKTREE_FAILED",
   "WORKER_FAILED",
+  "REVIEW_REJECTED",
   "NO_CHANGES",
   "COMMIT_FAILED",
 ] as const satisfies readonly SliceFailureKind[];
@@ -383,6 +550,16 @@ export interface SliceAttempt {
   readonly outcome: WorkerOutcome | null;
   readonly commit: string | null;
   readonly failure: SliceFailure | null;
+  /**
+   * What the cross-vendor gate concluded, or null when this attempt never
+   * reached it — routing failed, the worktree failed, or the worker itself did.
+   *
+   * REQUIRED AND NULLABLE RATHER THAN OPTIONAL, so every construction site has
+   * to say which of those it is. An optional field would let a new attempt
+   * shape silently omit a review it did run, and "the gate approved this" is
+   * precisely the claim that must never be acquired by omission.
+   */
+  readonly review: SliceReview | null;
   readonly durationMs: number;
 }
 
@@ -579,6 +756,13 @@ type _SliceFailureKindsAreExhaustive = Assert<
 >;
 type _RunFailureReasonsAreExhaustive = Assert<
   [Exclude<RunFailureReason, (typeof RUN_FAILURE_REASONS)[number]>] extends [
+    never,
+  ]
+    ? true
+    : false
+>;
+type _ReviewSkipReasonsAreExhaustive = Assert<
+  [Exclude<ReviewSkipReason, (typeof REVIEW_SKIP_REASONS)[number]>] extends [
     never,
   ]
     ? true

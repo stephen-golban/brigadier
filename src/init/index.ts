@@ -1359,6 +1359,7 @@ function renderRunReport(out: OutputStream, report: RunReport): void {
         `      attempt ${attempt.attempt}  ${describeRouted(attempt.routed)}  ${describeAttempt(attempt)}\n`,
       );
       renderRejections(out, attempt);
+      renderReview(out, attempt);
     }
   }
 
@@ -1406,6 +1407,49 @@ function renderRejections(out: OutputStream, attempt: SliceAttempt): void {
     out.write(
       `        rejected ${rejection.vendor}/${rejection.model} [${rejection.stage}]: ${rejection.reason}\n`,
     );
+  }
+}
+
+/**
+ * The cross-vendor gate's verdict, printed under every attempt that reached it.
+ *
+ * IT IS PRINTED FOR APPROVALS TOO, AND THAT IS THE WHOLE REASON THIS FUNCTION
+ * EXISTS. The gate fails open: a run with only one vendor configured, or one
+ * whose reviewer hit a quota wall, commits every slice exactly as a fully
+ * reviewed run does. If the report said nothing on the happy path, those two
+ * runs would be byte-identical on screen, and a user would believe a second
+ * vendor had checked work that nothing had checked. So a skip prints its
+ * reason, an approval says who approved it, and silence means the attempt never
+ * got as far as the gate.
+ *
+ * CONCERNS ARE PRINTED UNDER AN APPROVAL. They did not stop the commit, and a
+ * reviewer that raised one has said the most useful thing it will say all run;
+ * dropping it because the slice passed would throw away the half of a review
+ * that a human can still act on.
+ */
+function renderReview(out: OutputStream, attempt: SliceAttempt): void {
+  const review = attempt.review;
+  if (review === null) {
+    return;
+  }
+  if (review.verdict === "skipped") {
+    out.write(
+      `        review: not run (${review.reason}) — ${review.message}\n`,
+    );
+    return;
+  }
+  const reviewer = `${review.reviewer.vendor}/${review.reviewer.model}`;
+  out.write(
+    `        review: ${review.verdict} by ${reviewer} effort=${review.reviewer.effort} in ${review.durationMs}ms\n`,
+  );
+  for (const finding of review.findings) {
+    const where =
+      finding.path === null
+        ? ""
+        : finding.line === null
+          ? ` ${finding.path}`
+          : ` ${finding.path}:${finding.line}`;
+    out.write(`          ${finding.severity}${where}: ${finding.summary}\n`);
   }
 }
 

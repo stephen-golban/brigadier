@@ -228,6 +228,19 @@ function succeed(input: SliceRunInput): Promise<SliceResult> {
         },
         outcome: null,
         commit: `commit-${input.slice.id}`,
+        // A real approval, so the CLI's report rendering of a passing gate is
+        // exercised by the ordinary success fixture rather than only by the
+        // tests written for the gate.
+        review: {
+          verdict: "approved",
+          reviewer: {
+            vendor: "codex",
+            model: "gpt-5.6-terra",
+            effort: "high",
+          },
+          findings: [],
+          durationMs: 0,
+        },
         failure: null,
         durationMs: 0,
       },
@@ -254,6 +267,8 @@ function failWorker(input: SliceRunInput): Promise<SliceResult> {
         },
         outcome: null,
         commit: null,
+        // The worker never finished, so the gate was never reached.
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message: `slice ${input.slice.id} attempt 1 failed on purpose`,

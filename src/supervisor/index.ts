@@ -20,12 +20,31 @@
  * can only catch `Error` can render one joined sentence where the parser
  * collected the whole repair.
  *
- * The three constants are report vocabulary, not configuration. `ATTEMPT_LIMIT`
+ * THE REVIEW GATE IS API IN TWO PIECES, and they answer different needs.
+ * `createCrossVendorReviewer` is the gate itself, which a consumer assembling
+ * its own `SliceRunner` needs in order to keep the product's differentiating
+ * behaviour rather than silently losing it. `runOneShotPrompt` is the primitive
+ * underneath it: one prompt, one model, text back, no worktree and no commit.
+ * That capability did not exist anywhere in this package before — every
+ * `Worker.spawn` call site sat inside the slice runner and required a live
+ * `CreatedWorktree` — and it is exported rather than hidden because the review
+ * gate is not its only caller. `SliceReviewer` and the `SliceReview` vocabulary
+ * come with them, since a caller supplying its own gate has to be able to spell
+ * a verdict, and a caller reading a `RunReport` has to be able to read one.
+ *
+ * `spawnWorker` (`./one-shot.js`) and `parseFindings` (`./review.js`) are NOT
+ * here. The first is the vendor-correlation guard the two spawn sites share;
+ * the second is the tolerance of one build's reviewer-reply format, which must
+ * stay free to change as the vendors' output does. Both are exported from their
+ * modules so their own tests can drive them directly.
+ *
+ * The four constants are report vocabulary, not configuration. `ATTEMPT_LIMIT`
  * is the only thing that explains why `SliceResult.attempts` is never longer
- * than two, and `SLICE_FAILURE_KINDS` / `RUN_FAILURE_REASONS` exist so a caller
- * can iterate the failure taxonomy — render a legend, build a counter — without
- * a `switch` that silently under-reports the day a member is added. Exporting
- * them freezes nothing that was not already frozen by the unions they mirror.
+ * than two, and `SLICE_FAILURE_KINDS` / `RUN_FAILURE_REASONS` /
+ * `REVIEW_SKIP_REASONS` exist so a caller can iterate the failure taxonomy —
+ * render a legend, build a counter — without a `switch` that silently
+ * under-reports the day a member is added. Exporting them freezes nothing that
+ * was not already frozen by the unions they mirror.
  *
  * WHAT IS DELIBERATELY NOT HERE, all of it exported from its own module and
  * none of it API:
@@ -66,6 +85,11 @@ export type {
   AttemptSlot,
   InterruptSignal,
   PlanDocument,
+  RejectedSliceReview,
+  ReviewerIdentity,
+  ReviewFinding,
+  ReviewSeverity,
+  ReviewSkipReason,
   RunFailureReason,
   RunInterruption,
   RunReport,
@@ -76,18 +100,26 @@ export type {
   SliceFailureKind,
   SliceMergeRecord,
   SliceResult,
+  SliceReview,
+  SliceReviewer,
+  SliceReviewRequest,
   SliceRunInput,
   SliceRunner,
   SupervisorPorts,
 } from "./contracts.js";
 export {
   ATTEMPT_LIMIT,
+  REVIEW_SKIP_REASONS,
   RUN_FAILURE_REASONS,
   SLICE_FAILURE_KINDS,
 } from "./contracts.js";
+export type { OneShotEnv, OneShotRequest, OneShotResult } from "./one-shot.js";
+export { runOneShotPrompt } from "./one-shot.js";
 export type { RunnerDependencies, RunOrchestrator } from "./orchestrator.js";
 export { createRunner } from "./orchestrator.js";
 export { PlanDocumentError, parsePlanDocument } from "./plan-document.js";
+export type { CrossVendorReviewerOptions } from "./review.js";
+export { createCrossVendorReviewer } from "./review.js";
 export type { LaunchEnv, SliceRunnerOptions } from "./slice.js";
 export { createSliceRunner, requireLaunchEnv } from "./slice.js";
 export type { SpecBuildInput } from "./spec.js";

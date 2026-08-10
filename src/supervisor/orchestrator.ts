@@ -74,6 +74,7 @@ import type {
   SliceDirective,
   SliceMergeRecord,
   SliceResult,
+  SliceReview,
   SliceRunInput,
   SliceRunner,
   SupervisorPorts,
@@ -947,6 +948,10 @@ function preflightSliceResult(preflight: Preflight): SliceResult {
         routed: preflight.decision.routed,
         outcome: null,
         commit: null,
+        // Nothing ran, so nothing was reviewed. A dry run reports which model
+        // WOULD do the work; it cannot report what a reviewer would think of
+        // work that does not exist.
+        review: null,
         failure: null,
         durationMs: preflight.durationMs,
       }
@@ -955,6 +960,7 @@ function preflightSliceResult(preflight: Preflight): SliceResult {
         routed: null,
         outcome: null,
         commit: null,
+        review: null,
         failure: {
           kind: "ROUTING_FAILED",
           message: preflight.decision.message,
@@ -1061,6 +1067,7 @@ function runnerThrewResult(
         routed: null,
         outcome: null,
         commit: null,
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message,
@@ -1089,13 +1096,33 @@ function sliceNumberOf(
 
 function sliceLogLine(result: SliceResult): string {
   if (result.ok) {
-    return `slice ${result.sliceId}: ok ${result.branch} ${result.commit}`;
+    // The gate's verdict rides on the success line because "ok" alone can now
+    // mean two different things: reviewed and approved, or committed with no
+    // review at all because the gate could not run. A log that printed them
+    // identically would be the first place that difference disappeared.
+    return `slice ${result.sliceId}: ok ${result.branch} ${result.commit} (review: ${logVerdict(result.attempts.at(-1)?.review ?? null)})`;
   }
   const kind = result.attempts.at(-1)?.failure?.kind ?? "NOT_ATTEMPTED";
   // "failed" is a verdict on the work. A cancelled slice has not earned one.
   return result.cancelled === true
     ? `slice ${result.sliceId}: cancelled`
     : `slice ${result.sliceId}: failed ${kind}`;
+}
+
+/**
+ * The shortest honest form of a verdict.
+ *
+ * `none` rather than an empty string for an absent review: a slice can only be
+ * `ok` by passing through the gate, so a null verdict on a successful slice is
+ * a defect worth being able to see in a log rather than a blank nobody notices.
+ */
+function logVerdict(review: SliceReview | null): string {
+  if (review === null) {
+    return "none";
+  }
+  return review.verdict === "skipped"
+    ? `skipped ${review.reason}`
+    : `${review.verdict} by ${review.reviewer.vendor}/${review.reviewer.model}`;
 }
 
 function errorMessage(error: unknown): string {

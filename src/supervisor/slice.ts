@@ -43,6 +43,17 @@
  * the run's summary can say a worker may have survived instead of asserting it
  * was cancelled.
  *
+ * IT IS ALSO WHERE THE CROSS-VENDOR GATE FIRES, AND THE PLACEMENT IS THE POINT.
+ * Between the builder's successful `WorkerOutcome` and `engine.commit` there is
+ * exactly one moment at which a slice's work exists and is still reversible for
+ * free: the work is sitting uncommitted in the worktree, and the worktree is
+ * about to be torn down anyway on any failure path. That moment is where a
+ * model from the OTHER vendor reads what was written and either approves it or
+ * rejects it. A rejection returns an ordinary failing attempt, which is what
+ * makes it re-route, exclude the failing model, and escalate for free. See
+ * `review.ts` for the verdict's meaning and its limits, and for why the gate
+ * fails open rather than closed.
+ *
  * IT ALSO OWNS ONE SAFETY PROPERTY OUTRIGHT: worktree containment. Every owned
  * path is proven against the real filesystem to land inside this attempt's
  * worktree BEFORE a worker exists to be told it may write there. See
@@ -63,7 +74,6 @@ import {
   sep,
 } from "node:path";
 import type {
-  AnyWorker,
   CancelReason,
   Slice,
   SpawnedWorker,
@@ -71,12 +81,6 @@ import type {
   WorkerOutcome,
   WorkerSpec,
 } from "../contracts.js";
-import type {
-  AnyQuotaOracle,
-  ClaudeQuotaOracle,
-  ClaudeQuotaWorkerEvent,
-  QuotaWorkerEvent,
-} from "../quota/contracts.js";
 import type {
   ExcludedModel,
   RoutedWorker,
@@ -89,15 +93,30 @@ import type { CreatedWorktree } from "../worktree/contracts.js";
 import { NoChangesToCommitError } from "../worktree/engine.js";
 import type {
   AttemptSlot,
+  ReviewFinding,
   SliceAttempt,
   SliceFailure,
   SliceResult,
+  SliceReview,
+  SliceReviewer,
+  SliceReviewRequest,
   SliceRunInput,
   SliceRunner,
   SupervisorPorts,
 } from "./contracts.js";
 import { interruptMessage } from "./contracts.js";
+import { spawnWorker } from "./one-shot.js";
+import { createCrossVendorReviewer } from "./review.js";
 import { buildWorkerSpec, type SpecBuildInput } from "./spec.js";
+import {
+  ABORTED,
+  COMPLETION_TIMEOUT,
+  describeError,
+  ingestQuotaEvent,
+  raceAbort,
+  settle,
+  settleWithin,
+} from "./support.js";
 
 /**
  * The process environment a worker launch needs, already proven to carry the
@@ -168,6 +187,20 @@ export interface SliceRunnerOptions {
     request: RoutingRequest,
     input: RoutingInput,
   ) => RoutingDecision;
+  /**
+   * The cross-vendor review gate. Defaults to the real one, which is what makes
+   * the gate ON for every caller that does not opt out — including
+   * `buildRunDependencies`, which constructs this runner with `{ports, env}`
+   * and nothing else.
+   *
+   * IT IS A SEAM RATHER THAN A FLAG. A test needs to drive an approval, a
+   * rejection, and every skip reason without two vendors installed and without
+   * a subprocess; a caller that genuinely does not want a second opinion can
+   * pass one that always skips. There is deliberately no way to configure it
+   * away from the command line, because a gate that is off by default is a gate
+   * that never runs.
+   */
+  readonly review?: SliceReviewer;
 }
 
 /** Per-attempt result, kept separate from `SliceAttempt` so a success can carry
@@ -204,11 +237,21 @@ type WorktreeOutcome =
       readonly ok: true;
       readonly commit: string;
       readonly outcome: WorkerOutcome;
+      /**
+       * The gate's verdict. Never `rejected` on this arm — a rejection returns
+       * the failing arm below and never reaches `engine.commit` — but it is
+       * carried on both because "approved" and "skipped, because there was no
+       * second vendor" are different facts about a slice that committed, and
+       * the report has to be able to say which one happened.
+       */
+      readonly review: SliceReview;
     }
   | {
       readonly ok: false;
       readonly failure: SliceFailure;
       readonly outcome: WorkerOutcome | null;
+      /** Null on every path that died before the gate was reached. */
+      readonly review: SliceReview | null;
       /** See `AttemptOutcome.workerRan`. */
       readonly workerRan: boolean;
       /** See `AttemptOutcome.cancelled`. */
@@ -228,11 +271,15 @@ export class DefaultSliceRunner implements SliceRunner {
     request: RoutingRequest,
     input: RoutingInput,
   ) => RoutingDecision;
+  readonly #review: SliceReviewer;
 
   constructor(options: SliceRunnerOptions) {
     this.#ports = options.ports;
     this.#env = options.env;
     this.#route = options.route ?? defaultRoute;
+    this.#review =
+      options.review ??
+      createCrossVendorReviewer({ ports: options.ports, env: options.env });
   }
 
   async run(input: SliceRunInput): Promise<SliceResult> {
@@ -345,6 +392,7 @@ export class DefaultSliceRunner implements SliceRunner {
           routed: null,
           outcome: null,
           commit: null,
+          review: null,
           failure: cancellationFailure(
             input.signal,
             `slice ${sliceId} attempt ${attempt} was cancelled before it was routed`,
@@ -370,6 +418,7 @@ export class DefaultSliceRunner implements SliceRunner {
           routed: null,
           outcome: null,
           commit: null,
+          review: null,
           failure: {
             kind: "ROUTING_FAILED",
             message: decision.message,
@@ -407,6 +456,7 @@ export class DefaultSliceRunner implements SliceRunner {
           routed,
           outcome: null,
           commit: null,
+          review: null,
           failure: {
             kind: "WORKTREE_FAILED",
             message: `could not create worktree for slice ${sliceId} attempt ${attempt} at ${slot.worktreePath}: ${describeError(error)}`,
@@ -433,6 +483,7 @@ export class DefaultSliceRunner implements SliceRunner {
         // assert something false about the model.
         workerRan: false,
         outcome: null,
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message: `slice ${sliceId} attempt ${attempt} failed unexpectedly: ${describeError(error)}`,
@@ -457,6 +508,7 @@ export class DefaultSliceRunner implements SliceRunner {
           routed,
           outcome: body.outcome,
           commit: body.commit,
+          review: body.review,
           failure: null,
           durationMs: elapsed(),
         },
@@ -494,6 +546,7 @@ export class DefaultSliceRunner implements SliceRunner {
         routed,
         outcome: body.outcome,
         commit: null,
+        review: body.review,
         failure,
         durationMs: elapsed(),
       },
@@ -562,6 +615,7 @@ export class DefaultSliceRunner implements SliceRunner {
         // about the repository's shape, not about anything a model did.
         workerRan: false,
         outcome: null,
+        review: null,
         failure: {
           kind: "WORKTREE_FAILED",
           message: `slice ${sliceId} attempt ${attempt}: ${contained.message}`,
@@ -617,6 +671,7 @@ export class DefaultSliceRunner implements SliceRunner {
         workerRan: false,
         cancelled: true,
         outcome: null,
+        review: null,
         failure: cancellationFailure(
           input.signal,
           `slice ${sliceId} attempt ${attempt} was cancelled before a ${routed.vendor}/${routed.model} worker was spawned`,
@@ -677,6 +732,8 @@ export class DefaultSliceRunner implements SliceRunner {
         workerRan: true,
         cancelled: true,
         outcome: null,
+        // The gate sits below this return, so it was never reached.
+        review: null,
         // The same fact in two places on purpose: the message is what a reader
         // of THIS slice's failure sees, and `cleanupFailure` is what the run's
         // summary needs in order to stop claiming the worker was cancelled.
@@ -708,6 +765,7 @@ export class DefaultSliceRunner implements SliceRunner {
         // The worker was spawned and then broke its own completion contract.
         workerRan: true,
         outcome: null,
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message: `slice ${sliceId} attempt ${attempt}: ${routed.vendor}/${routed.model} completion rejected: ${describeError(completed.error)}`,
@@ -727,10 +785,50 @@ export class DefaultSliceRunner implements SliceRunner {
         ok: false,
         workerRan: true,
         outcome,
+        // A worker that failed produced nothing to review. The gate judges
+        // work, and there is none.
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message: `slice ${sliceId} attempt ${attempt}: ${routed.vendor}/${routed.model} failed with ${outcome.failure.kind}: ${outcome.failure.message}`,
           failure: outcome.failure,
+        },
+      };
+    }
+
+    // THE CROSS-VENDOR GATE. The worker succeeded and its work is sitting
+    // uncommitted in `created.path`; this is the last moment at which it can be
+    // rejected without leaving a commit behind, because `engine.commit` below
+    // is irreversible through this engine's surface. See `review.ts` for why
+    // the gate is here rather than after the commit and what that costs.
+    const review = await this.#reviewQuietly({
+      slice: input.slice,
+      attempt,
+      worktreePath: created.path,
+      builder: routed,
+      routing: input.routing,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+    this.#ports.log(
+      `slice ${sliceId} attempt ${attempt}: review ${describeVerdict(review)}`,
+    );
+    if (review.verdict === "rejected") {
+      return {
+        ok: false,
+        // TRUE, AND IT IS THE WHOLE MECHANISM OF DECISION #24. A model that
+        // produced work a second vendor found broken has failed this slice, so
+        // it goes on `excluded` and attempt 2 is routed somewhere else with
+        // `escalated: true`. Every other gate-shaped failure in this file
+        // reports a worker that did not finish; this one reports work that
+        // finished badly, which is the case the escalation was designed for and
+        // which nothing in this product could reach until now.
+        workerRan: true,
+        outcome,
+        review,
+        failure: {
+          kind: "REVIEW_REJECTED",
+          message: `slice ${sliceId} attempt ${attempt}: ${review.reviewer.vendor}/${review.reviewer.model} found ${countBlocking(review.findings)} blocking issue(s) in ${routed.vendor}/${routed.model}'s work: ${summarizeBlocking(review.findings)}`,
+          review,
         },
       };
     }
@@ -740,7 +838,7 @@ export class DefaultSliceRunner implements SliceRunner {
         worktree: created,
         message: commitMessage(input.slice, attempt, routed),
       });
-      return { ok: true, commit: result.commit, outcome };
+      return { ok: true, commit: result.commit, outcome, review };
     } catch (error) {
       if (error instanceof NoChangesToCommitError) {
         // `engine.commit` compares the sanitized staged tree against the parent
@@ -752,6 +850,10 @@ export class DefaultSliceRunner implements SliceRunner {
           ok: false,
           workerRan: true,
           outcome,
+          // Carried even though the slice failed: the gate really did run, and
+          // a reviewer that approved an empty change is worth seeing on the
+          // report next to the reason the commit was refused.
+          review,
           failure: {
             kind: "NO_CHANGES",
             message: `slice ${sliceId} attempt ${attempt}: ${routed.vendor}/${routed.model} exited cleanly but changed no file in ${created.path}`,
@@ -762,6 +864,7 @@ export class DefaultSliceRunner implements SliceRunner {
         ok: false,
         workerRan: true,
         outcome,
+        review,
         failure: {
           kind: "COMMIT_FAILED",
           message: `could not commit slice ${sliceId} attempt ${attempt} on ${created.branch}: ${describeError(error)}`,
@@ -779,29 +882,46 @@ export class DefaultSliceRunner implements SliceRunner {
    * must not stop the drain and re-create the stall above.
    */
   async #drainEvents(events: AsyncIterable<WorkerEvent>): Promise<DrainReport> {
-    const oracle = claudeOracle(this.#ports.oracles);
     let consumed = 0;
     try {
       for await (const event of events) {
         consumed += 1;
-        if (event.type !== "quota") {
-          continue;
-        }
-        if (oracle === null || !isClaudeQuotaEvent(event)) {
-          continue;
-        }
-        try {
-          oracle.ingest(event);
-        } catch (error) {
-          this.#ports.log(
-            `ignored a failure from the claude quota oracle: ${describeError(error)}`,
-          );
-        }
+        ingestQuotaEvent(this.#ports.oracles, event, this.#ports.log);
       }
     } catch (error) {
       return { consumed, error };
     }
     return { consumed, error: null };
+  }
+
+  /**
+   * Ask the gate, and treat a gate that broke its own contract as a skip.
+   *
+   * `SliceReviewer.review` is documented never to reject, so this `catch` is a
+   * net for a defect in an implementation rather than an expected path. It
+   * matters anyway: `#runInWorktree` is total, and a throwing reviewer reaching
+   * the caller would turn a slice whose worker SUCCEEDED into an unexplained
+   * `WORKER_FAILED` through the outer catch — blaming a builder for the gate's
+   * bug and discarding a diff that may well have been fine.
+   *
+   * Skipping rather than rejecting is the same fail-open trade the rest of the
+   * gate makes: a reviewer that crashed formed no opinion, and inventing a
+   * rejection from its crash would be brigadier deciding the code was bad
+   * because its own code was.
+   */
+  async #reviewQuietly(request: SliceReviewRequest): Promise<SliceReview> {
+    const startedAt = this.#ports.now();
+    try {
+      return await this.#review.review(request);
+    } catch (error) {
+      return {
+        verdict: "skipped",
+        reviewer: null,
+        reason: "REVIEWER_FAILED",
+        message: `slice ${request.slice.id} attempt ${request.attempt} was not reviewed: the reviewer threw instead of reporting: ${describeError(error)}`,
+        durationMs: this.#ports.now() - startedAt,
+      };
+    }
   }
 
   async #removeQuietly(worktree: CreatedWorktree): Promise<string | null> {
@@ -1079,49 +1199,11 @@ function errorCode(error: unknown): string | null {
   return null;
 }
 
-/** What `raceAbort` resolves when the signal wins. */
-const ABORTED = Symbol("aborted");
-const CANCELLATION_COMPLETION_BOUND_MS = 100;
-const COMPLETION_TIMEOUT = Symbol("completion timeout");
-
 /**
- * `work`'s value, or `ABORTED` the moment the signal fires — whichever is first.
- *
- * THE LISTENER IS REMOVED IN A `finally`, AND THAT IS NOT TIDINESS. One signal
- * is shared by every slice in the run, so a listener left behind by each
- * finished slice accumulates on a single `AbortSignal` for the whole run; Node
- * warns at eleven and the leak is real regardless.
- *
- * `work` is not cancelled when the abort wins — nothing here could cancel it —
- * so every caller must hand in a promise that cannot reject. An abandoned
- * promise that rejects has no `await` left to catch it and becomes an unhandled
- * rejection at some unrelated later moment.
+ * How long `cancelQuietly` waits for a cancelled worker's completion to settle
+ * before reporting that termination could not be confirmed.
  */
-async function raceAbort<T>(
-  signal: AbortSignal | undefined,
-  work: Promise<T>,
-): Promise<T | typeof ABORTED> {
-  if (signal === undefined) {
-    return work;
-  }
-  if (signal.aborted) {
-    return ABORTED;
-  }
-  let onAbort: (() => void) | null = null;
-  const interrupted = new Promise<typeof ABORTED>((resolve) => {
-    onAbort = (): void => {
-      resolve(ABORTED);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  try {
-    return await Promise.race([work, interrupted]);
-  } finally {
-    if (onAbort !== null) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  }
-}
+const CANCELLATION_COMPLETION_BOUND_MS = 100;
 
 /**
  * Terminates the worker's whole process group, reporting rather than throwing.
@@ -1176,25 +1258,6 @@ async function cancelQuietly(
   return "termination was not confirmed because completion settled successfully";
 }
 
-async function settleWithin<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-): Promise<Settled<T> | typeof COMPLETION_TIMEOUT> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<typeof COMPLETION_TIMEOUT>((resolve) => {
-    timer = setTimeout(() => {
-      resolve(COMPLETION_TIMEOUT);
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([settle(promise), timeout]);
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-  }
-}
-
 /**
  * The `SliceFailure` for an attempt an interrupt stopped.
  *
@@ -1230,51 +1293,51 @@ interface DrainReport {
   readonly error: unknown;
 }
 
+/** The one-line form of a verdict, for the run's log. */
+function describeVerdict(review: SliceReview): string {
+  if (review.verdict === "skipped") {
+    return `skipped (${review.reason}): ${review.message}`;
+  }
+  const reviewer = `${review.reviewer.vendor}/${review.reviewer.model}`;
+  const blocking = countBlocking(review.findings);
+  const concerns = review.findings.length - blocking;
+  return `${review.verdict} by ${reviewer} (${blocking} blocking, ${concerns} concern(s)) in ${review.durationMs}ms`;
+}
+
+function countBlocking(findings: readonly ReviewFinding[]): number {
+  return findings.filter((finding) => finding.severity === "blocking").length;
+}
+
 /**
- * Launch a spec on an adapter without a type assertion.
+ * The blocking findings as one sentence, for the failure message.
  *
- * `workerFor` is typed `(vendor: Vendor) => AnyWorker | null`, which does not
- * correlate the vendor asked for with the adapter returned, so a mismatch is
- * representable and has to be handled rather than cast away. The throw is
- * caught by the caller and becomes a `LAUNCH_FAILURE`.
+ * Every blocking finding is named rather than only the first: the message is
+ * what a user reads when deciding whether the gate was right, and "and 3 more"
+ * makes that decision impossible without digging the structured review out of
+ * the report. The concerns are deliberately absent — they did not cause this
+ * failure, and they are still carried on `SliceFailure.review`.
  */
-async function spawnWorker(
-  worker: AnyWorker,
-  spec: WorkerSpec,
-): Promise<SpawnedWorker> {
-  if (worker.vendor === "claude") {
-    if (spec.vendor !== "claude") {
-      throw new Error(
-        `vendor mismatch: a claude adapter cannot launch a ${spec.vendor} spec`,
-      );
-    }
-    return worker.spawn(spec);
+function summarizeBlocking(findings: readonly ReviewFinding[]): string {
+  const blocking = findings.filter(
+    (finding) => finding.severity === "blocking",
+  );
+  if (blocking.length === 0) {
+    // Unreachable through `adjudicate`, which only rejects when at least one
+    // blocking finding exists. Stated rather than asserted so a future caller
+    // cannot produce an empty sentence.
+    return "(no blocking finding was recorded)";
   }
-  if (spec.vendor !== "codex") {
-    throw new Error(
-      `vendor mismatch: a codex adapter cannot launch a ${spec.vendor} spec`,
-    );
-  }
-  return worker.spawn(spec);
-}
-
-function isClaudeQuotaEvent(
-  event: QuotaWorkerEvent,
-): event is ClaudeQuotaWorkerEvent {
-  return event.snapshot.vendor === "claude";
-}
-
-function claudeOracle(
-  oracles: readonly AnyQuotaOracle[],
-): ClaudeQuotaOracle | null {
-  for (const oracle of oracles) {
-    // Only Claude's oracle is push-based. `typeof` guards a hand-rolled oracle
-    // that claims the vendor without implementing the push half.
-    if (oracle.vendor === "claude" && typeof oracle.ingest === "function") {
-      return oracle;
-    }
-  }
-  return null;
+  return blocking
+    .map((finding) => {
+      const where =
+        finding.path === null
+          ? ""
+          : finding.line === null
+            ? `${finding.path}: `
+            : `${finding.path}:${finding.line}: `;
+      return `${where}${finding.summary}`;
+    })
+    .join("; ");
 }
 
 function commitMessage(
@@ -1296,6 +1359,7 @@ function launchFailure(message: string): WorktreeOutcome {
     ok: false,
     workerRan: false,
     outcome: null,
+    review: null,
     failure: {
       kind: "WORKER_FAILED",
       message,
@@ -1329,12 +1393,29 @@ function launchFailure(message: string): WorktreeOutcome {
  * a different attempt number in it, and the report would show a duplicate
  * failure that reads like flakiness.
  *
+ * `REVIEW_REJECTED` IS THE MEMBER THIS WHOLE MECHANISM WAS BUILT FOR, and it is
+ * retryable without qualification. Decision #24 — "a slice that fails its gate
+ * re-routes to the next model up the competence table" — described a path that
+ * existed here and could not be reached, because until the cross-vendor gate
+ * landed nothing in this product was a gate. A rejection is the one failure
+ * that is unambiguously ABOUT THE MODEL: the worker finished, produced a diff,
+ * and a second vendor read it and said it was wrong. `#runInWorktree` records
+ * it with `workerRan: true`, so the failing pair goes on `excluded` and the
+ * second attempt is genuinely a different model at a higher rung rather than
+ * the same one asked twice.
+ *
  * The remaining members stay retryable on purpose, and each for a reason that
  * is specific rather than optimistic. `ROUTING_FAILED` on attempt 1 is re-asked
  * with `escalated: true`, which is the only thing that unlocks `xhigh`, so the
  * second ask genuinely differs from the first. `NO_CHANGES` and `COMMIT_FAILED`
  * describe a worker that did the wrong thing, which is the case escalation
  * exists for.
+ *
+ * THE FALL-THROUGH IS DELIBERATE BUT IT IS NOT SELF-CHECKING. A member added to
+ * `SliceFailure` becomes retryable here without stopping the build, because
+ * this reads `kind` rather than switching exhaustively on it. That is a known
+ * hazard of this function and the reason each retryable member is named above:
+ * the list is the check.
  */
 function isRetryable(failure: SliceFailure | null): boolean {
   if (failure === null) {
@@ -1380,25 +1461,15 @@ function appendNote(failure: SliceFailure, note: string): SliceFailure {
       };
     case "WORKER_FAILED":
       return { kind: "WORKER_FAILED", message, failure: failure.failure };
+    case "REVIEW_REJECTED":
+      // The verdict is copied rather than dropped for the same reason
+      // `WORKTREE_FAILED` keeps its marker: the findings are the diagnosis, and
+      // losing them because tidying up also failed would leave a user with a
+      // rejection they cannot evaluate.
+      return { kind: "REVIEW_REJECTED", message, review: failure.review };
     case "NO_CHANGES":
       return { kind: "NO_CHANGES", message };
     case "COMMIT_FAILED":
       return { kind: "COMMIT_FAILED", message };
   }
-}
-
-type Settled<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly error: unknown };
-
-async function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
-  try {
-    return { ok: true, value: await promise };
-  } catch (error) {
-    return { ok: false, error };
-  }
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

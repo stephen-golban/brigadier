@@ -387,6 +387,7 @@ function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
                 routed: null,
                 outcome: null,
                 commit: null,
+                review: null,
                 failure: {
                   kind: "NO_CHANGES",
                   message: `${input.slice.id} changed nothing`,
@@ -410,6 +411,7 @@ function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
               routed: null,
               outcome: null,
               commit: `commit-${input.slice.id}`,
+              review: null,
               failure: null,
               durationMs: 0,
             },
@@ -1475,6 +1477,7 @@ describe("the report", () => {
               routed: null,
               outcome: null,
               commit: "commit-a",
+              review: null,
               failure: null,
               durationMs: 0,
             },
@@ -1505,8 +1508,11 @@ describe("the report", () => {
     );
     expect(harness.log).toEqual([
       "run demo: 2 slice(s) in 1 wave(s)",
-      "slice a: ok brigadier/demo/slice-1 commit-a",
-      "slice b: ok brigadier/demo/slice-3 commit-b",
+      // The gate's verdict rides on the success line so that "committed after a
+      // review" and "committed because no review could run" never read alike.
+      // This fake runner records no review at all, which is what `none` says.
+      "slice a: ok brigadier/demo/slice-1 commit-a (review: none)",
+      "slice b: ok brigadier/demo/slice-3 commit-b (review: none)",
       "merge a: merged",
       "merge b: merged",
     ]);
