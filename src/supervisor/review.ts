@@ -369,9 +369,10 @@ async function reviewSlice(
  *   - CORRECTNESS FROM TASTE. The prompt asks for correctness only and forbids
  *     style, but nothing enforces it; a reviewer that marks a naming preference
  *     blocking will fail the slice.
- *   - AN INCOMPLETE SLICE FROM A WRONG ONE. The reviewer sees the owned paths'
- *     post-state, not the diff, so "this function was already here and is fine"
- *     and "this function was just written and is fine" look the same to it.
+ *   - AN INCOMPLETE CHANGE FROM A WRONG ONE. The reviewer sees the exact
+ *     sanitized diff `commit()` would record, but this adjudicator sees only
+ *     the findings it returned. It has no independent proof that an omitted
+ *     requirement is absent rather than intentionally outside the change.
  *
  * What it CAN tell apart, and this is the half that made a three-armed verdict
  * necessary: a review that happened from one that did not. A failed, cancelled
@@ -414,10 +415,10 @@ function otherVendor(
  * default model is the one the user told `brigadier init` they wanted from this
  * vendor, which is exactly the right answer to "who should read this".
  *
- * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. Decision #20 makes
- * `xhigh` an escalation earned by an observed gate failure, and a reviewer is
- * the thing that observes it — it can never itself have earned the rung. A
- * model whose ceiling is `medium` reviews at `medium`.
+ * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. Decision #20 reserves
+ * `xhigh` for a slice worker re-routed after a prior routed model ran and
+ * failed. A reviewer is not that re-routed slice worker, so it never receives
+ * the rung. A model whose ceiling is `medium` reviews at `medium`.
  */
 function reviewerIdentity(vendor: VendorConfig): ReviewerIdentity {
   const permitted = vendor.models.find(

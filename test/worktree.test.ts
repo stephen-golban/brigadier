@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -11,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { redactText } from "../src/worktree/engine.ts";
+import { createSecretRedactor, redactText } from "../src/worktree/engine.ts";
 import {
   type CreatedWorktree,
   GitWorktreeEngine,
@@ -555,6 +556,86 @@ describe("GitWorktreeEngine", () => {
     ).toBe(["before", "-[REDACTED]", "after"].join("\n"));
     expect(operations).toBe(5);
   });
+
+  test(
+    "builds a session-free redactor without creating files or refs",
+    async () => {
+      await withFixture(async ({ repository }) => {
+        await writeFile(
+          join(repository, ".planner.env"),
+          `PLANNER_SECRET="${PEM_SECRET}"\n`,
+        );
+        const filesBefore = (
+          await readdir(repository, { recursive: true })
+        ).sort();
+        const refsBefore = await headRefListing(repository);
+
+        const redact = await createSecretRedactor({
+          repositoryPath: repository,
+          linkedSecretPaths: [".env", ".planner.env"],
+        });
+        const artifact = redact(
+          [
+            `planner received ${SECRET}`,
+            `plain=${PEM_SECRET}`,
+            `diff=${PEM_SECRET.replaceAll("\n", "\n+")}`,
+          ].join("\n"),
+        );
+
+        expect(artifact.indexOf(SECRET)).toBe(-1);
+        expect(artifact.indexOf(PEM_SECRET)).toBe(-1);
+        expect(artifact).toBe(
+          [
+            "planner received [REDACTED]",
+            "plain=[REDACTED]",
+            "diff=[REDACTED]",
+          ].join("\n"),
+        );
+        expect(
+          await gitText(repository, [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/brigadier/",
+          ]),
+        ).toBe("");
+        expect(await headRefListing(repository)).toBe(refsBefore);
+        expect((await readdir(repository, { recursive: true })).sort()).toEqual(
+          filesBefore,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "keeps session-free multiline redaction work countable and bounded",
+    async () => {
+      await withFixture(async ({ repository }) => {
+        const multilineSecret = "unique-line\nsecond-line";
+        await writeFile(
+          join(repository, ".planner.env"),
+          `PLANNER_SECRET="${multilineSecret}"\n`,
+        );
+        let operations = 0;
+        const redact = await createSecretRedactor({
+          repositoryPath: repository,
+          linkedSecretPaths: [".planner.env"],
+          onScan: () => {
+            operations += 1;
+            if (operations > 16) {
+              throw new Error("redaction exceeded 16 scan operations");
+            }
+          },
+        });
+
+        expect(() =>
+          redact("unique-line\n!not-a-prefix\n".repeat(1_000)),
+        ).toThrow("redaction exceeded 16 scan operations");
+        expect(operations).toBe(17);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
 
   test(
     "captures an advanced submodule pointer in the scratch base commit",

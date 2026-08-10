@@ -321,7 +321,7 @@ const HOST_PLANS: readonly HostPlan[] = [
     ],
     notes: (roots) => [
       `NOTHING WAS INSTALLED INTO CLAUDE DESKTOP. Desktop installs a bundle by an explicit user action and brigadier does not forge those; the bundle was staged at ${DESKTOP_BUNDLE(roots)}.`,
-      `To finish: run \`bun run build:mcp\` to emit server/brigadier-mcp.js beside the manifest, zip that directory with manifest.json at the archive root, rename it brigadier.mcpb, and open it with Desktop.`,
+      `To finish: run \`bun run build:mcp\` to emit dist/mcp/server.js, copy it to server/brigadier-mcp.js beside the manifest, zip that directory with manifest.json at the archive root, rename it brigadier.mcpb, and open it with Desktop.`,
       `Desktop gets an MCP server rather than a skill because Desktop Skills execute server-side and cannot invoke a local binary, while Desktop MCP servers run locally with your full privileges and can spawn \`claude -p\`.`,
       `THE HANDOFF HOOK IS IMPOSSIBLE ON CLAUDE DESKTOP. It exposes no hook surface, and an MCP server is called by the model rather than by the transcript. There is no workaround.`,
     ],

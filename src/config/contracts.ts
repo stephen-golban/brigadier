@@ -46,8 +46,8 @@ export const EFFORT_LADDER = [
 
 /**
  * Decision #20: `high` is the default ceiling. `xhigh` remains reachable only
- * as an earned escalation after a slice fails its gate, whatever ceiling a user
- * records here.
+ * as an earned escalation after a routed model runs the slice and fails,
+ * whatever ceiling a user records here. A routing failure does not earn it.
  */
 export const DEFAULT_EFFORT_CEILING = "high" satisfies Effort;
 
@@ -156,7 +156,8 @@ export function narrowEfforts(
  * `null` means the model is not usable by brigadier at a proposed ceiling. That
  * happens when the narrowed ladder is empty (the vendor reports no rung
  * brigadier knows) or contains only `xhigh` (decision #20: `xhigh` is earned on
- * retry after a slice fails its gate and must never be predicted up front).
+ * retry after a routed model runs the slice and fails, and must never be
+ * predicted up front).
  * Writing `high` for such a model would record an effort the vendor does not
  * accept, so the caller must exclude the model instead.
  */

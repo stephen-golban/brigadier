@@ -61,6 +61,9 @@ import {
 } from "../supervisor/index.js";
 import { runInstall } from "../surfaces/install.js";
 import { createClaudeWorker, createCodexWorker } from "../worker/index.js";
+// Direct-module import on purpose: planning plumbing needs the read-only seam,
+// but it is not part of the package's public worktree API.
+import { createSecretRedactor } from "../worktree/engine.js";
 import type { MergeResult, WorktreeEngine } from "../worktree/index.js";
 import { GitWorktreeEngine } from "../worktree/index.js";
 import type { InputStream, OutputStream, PromptIo } from "./prompt.js";
@@ -104,7 +107,7 @@ export const EFFORT_CEILING_WARNING =
 
 /** Decision #20: the ceiling is a cap, not a pin, and xhigh stays earned. */
 const EFFORT_CEILING_NOTE =
-  "`xhigh` stays earned-on-retry regardless of this ceiling: brigadier reaches for it only after a slice fails its gate. Effort is never pinned per task tier.";
+  "`xhigh` stays earned-on-retry regardless of this ceiling: brigadier reaches for it only after a routed model runs the slice and fails. A routing failure, where no model ran, does not earn it. Effort is never pinned per task tier.";
 
 /** Decision #19 and #7, said out loud so the config is not mistaken for a router. */
 const ROUTER_NOTE =
@@ -671,8 +674,10 @@ Options for run:
                        For a task description this is also the largest number
                        of slices the planner may propose
       --slug <name>    names this run's branches (default: from the plan id)
-      --dry-run        plan and route every slice and report it; create no
-                       worktree, spawn no worker, write no commit
+      --dry-run        plan and route every slice and report it. A task-backed
+                       dry run still runs a planner model and costs tokens; it
+                       creates no slice worktree or ref, spawns no slice worker,
+                       and writes no commit
       --unsafe-in-place
                        run workers in this checkout instead of isolated
                        worktrees; every file here becomes visible to every worker
@@ -690,9 +695,10 @@ Exit codes:
   2  usage error
   3  the run started and did not succeed; the "run failed:" line names which
      stage stopped it, and each slice's line names what happened to it
-  4  the task was too ambiguous to plan, so brigadier refused to guess. It
-     spawned nothing and created nothing, and printed the questions it needs
-     answered. This is not a failed run: answer them and run it again
+  4  the planner model ran but found the task too ambiguous to plan, so
+     brigadier refused to guess and printed the questions it needs answered.
+     No slice worker, worktree, ref, or commit was created. This is not a
+     failed slice run: answer the questions and run it again
   130  the run was interrupted with SIGINT (Ctrl-C): every worker still running
      was terminated along with its whole process group, its worktree was
      removed, and the refs the run created were retired. Interrupt a second
@@ -887,9 +893,10 @@ const RUN_FAILED = 3;
  * landed when nothing was built. `1` means "could not start" and is right about
  * the facts but wrong about the remedy — every other 1 sends the user to look at
  * their config, their plan file, or their environment, and this one is a
- * question waiting for an answer. `3` means a run started and did not succeed,
- * and no run started here: no worktree was created, no ref was written, and no
- * worker was spawned for the task itself.
+ * question waiting for an answer. `3` means a slice run started and did not
+ * succeed, but no slice execution started here: the planner model ran, while no
+ * slice worktree was created, no ref was written, and no slice worker was
+ * spawned.
  *
  * A user who gets questions has not had a run fail, and the host-side skill
  * branches on exactly that distinction to re-invoke with the answers folded in.
@@ -1180,6 +1187,19 @@ async function resolvePlanFromTask(
     return { kind: "stop", code: RUN_NOT_STARTED };
   }
 
+  let redactPlannerText: (artifact: string) => string;
+  try {
+    redactPlannerText = await createSecretRedactor({
+      repositoryPath: options.cwd,
+      linkedSecretPaths: environment.config.linkedSecretPaths,
+    });
+  } catch (error) {
+    stderr.write(
+      `brigadier run: could not inventory linked secrets before planning: ${describe(error)}\n`,
+    );
+    return { kind: "stop", code: RUN_NOT_STARTED };
+  }
+
   const planner =
     options.harness?.planner ??
     createModelPlanner({
@@ -1189,7 +1209,7 @@ async function resolvePlanFromTask(
         createWorkerFactory(environment.config),
       env: environment.env,
       log: (line: string) => {
-        stdout.write(`${line}\n`);
+        stdout.write(`${redactPlannerText(line)}\n`);
       },
     });
 
@@ -1202,7 +1222,7 @@ async function resolvePlanFromTask(
   let outcome: PlannerOutcome;
   try {
     outcome = await planner.plan({
-      task,
+      task: redactPlannerText(task),
       cwd: options.cwd,
       maxSlices: invocation.maxWorkers,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -1220,14 +1240,14 @@ async function resolvePlanFromTask(
   }
 
   if (outcome.kind === "failed") {
-    stderr.write(`${outcome.message}\n`);
+    stderr.write(`${redactPlannerText(outcome.message)}\n`);
     return {
       kind: "stop",
       code: interruptedExitCode(options.signal) ?? RUN_NOT_STARTED,
     };
   }
   if (outcome.kind === "needs-human") {
-    renderNeedsHuman(stdout, outcome.questions);
+    renderNeedsHuman(stdout, outcome.questions.map(redactPlannerText));
     // An interrupt still outranks it: a user who pressed Ctrl-C during planning
     // is owed the signal's code, not a set of questions they did not wait for.
     return {
@@ -1236,34 +1256,52 @@ async function resolvePlanFromTask(
     };
   }
 
+  let redactedPlan: unknown;
+  let document: RunRequest["document"];
+  try {
+    redactedPlan = JSON.parse(outcome.json, (_key, value: unknown) =>
+      typeof value === "string" ? redactPlannerText(value) : value,
+    );
+    document = parsePlanDocument(redactedPlan);
+  } catch (error) {
+    stderr.write(
+      `brigadier run: the planner output could not be redacted into a valid plan: ${redactPlannerText(describe(error))}\n`,
+    );
+    return {
+      kind: "stop",
+      code: interruptedExitCode(options.signal) ?? RUN_NOT_STARTED,
+    };
+  }
+
   stdout.write(
     `\nplanned by ${outcome.planner.vendor}/${outcome.planner.model} at ${outcome.planner.effort} effort:\n`,
   );
-  stdout.write(`${outcome.json}\n`);
+  stdout.write(`${JSON.stringify(redactedPlan, null, 2)}\n`);
   return {
     kind: "ok",
-    document: outcome.document,
+    document,
     config: environment.config,
     env: environment.env,
   };
 }
 
 /**
- * DECISION #10 ON SCREEN: questions, and an explicit statement that nothing ran.
+ * DECISION #10 ON SCREEN: questions, and an explicit account of what ran.
  *
- * The "nothing was created" sentence is printed unconditionally because it is
- * the fact a user cannot check cheaply and would otherwise have to assume. The
- * trailing JSON line is for the host-side skill that re-invokes brigadier with
- * the answers folded in — the same "machine-readable last line" contract the
- * review gate asks of its reviewers, chosen for the same reason: parsing prose
- * to recover a question list is worse than emitting the list.
+ * The planner model has already run and cost tokens, while no slice worker,
+ * worktree, ref, or commit exists. Both facts are printed because neither is
+ * cheap for a user to infer. The trailing JSON line is for the host-side skill
+ * that re-invokes brigadier with the answers folded in — the same
+ * "machine-readable last line" contract the review gate asks of its reviewers,
+ * chosen for the same reason: parsing prose to recover a question list is worse
+ * than emitting the list.
  */
 function renderNeedsHuman(
   out: OutputStream,
   questions: readonly string[],
 ): void {
   out.write(
-    "\nbrigadier run: this task is ambiguous enough that planning it would mean guessing, so nothing was planned, nothing was created, and no worker was spawned.\n\nAnswer these and run it again:\n",
+    "\nbrigadier run: the planner model ran, but this task is ambiguous enough that producing a plan would mean guessing. No slice worker, worktree, ref, or commit was created.\n\nAnswer these and run it again:\n",
   );
   for (const [index, question] of questions.entries()) {
     out.write(`  ${index + 1}. ${question}\n`);

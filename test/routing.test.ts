@@ -575,35 +575,31 @@ describe("model exclusion", () => {
         vendor: "claude",
         model: "claude-opus-4-6",
         stage: "excluded",
-        reason:
-          "claude/claude-opus-4-6 already ran this slice and failed its gate",
+        reason: "claude/claude-opus-4-6 already ran this slice and failed",
       },
       {
         vendor: "claude",
         model: "claude-sonnet-5",
         stage: "excluded",
-        reason:
-          "claude/claude-sonnet-5 already ran this slice and failed its gate",
+        reason: "claude/claude-sonnet-5 already ran this slice and failed",
       },
       {
         vendor: "claude",
         model: "claude-haiku-5",
         stage: "excluded",
-        reason:
-          "claude/claude-haiku-5 already ran this slice and failed its gate",
+        reason: "claude/claude-haiku-5 already ran this slice and failed",
       },
       {
         vendor: "codex",
         model: "gpt-5.6-sol",
         stage: "excluded",
-        reason: "codex/gpt-5.6-sol already ran this slice and failed its gate",
+        reason: "codex/gpt-5.6-sol already ran this slice and failed",
       },
       {
         vendor: "codex",
         model: "gpt-5.6-terra",
         stage: "excluded",
-        reason:
-          "codex/gpt-5.6-terra already ran this slice and failed its gate",
+        reason: "codex/gpt-5.6-terra already ran this slice and failed",
       },
     ]);
   });
@@ -761,7 +757,7 @@ describe("effort", () => {
     );
     expect(routed.effort).toBe("xhigh");
     expect(routed.rationale[4]).toBe(
-      'effort: base "xhigh" from escalation after a failed gate; no clamp applied; final "xhigh"',
+      'effort: base "xhigh" from escalation after a routed model ran the slice and failed; no clamp applied; final "xhigh"',
     );
   });
 
@@ -779,7 +775,7 @@ describe("effort", () => {
     );
     expect(routed.effort).toBe("high");
     expect(routed.rationale[4]).toBe(
-      'effort: base "xhigh" from escalation after a failed gate; clamped down by the configured effort ceiling "high"; final "high"',
+      'effort: base "xhigh" from escalation after a routed model ran the slice and failed; clamped down by the configured effort ceiling "high"; final "high"',
     );
   });
 
