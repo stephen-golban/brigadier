@@ -4,11 +4,11 @@
 
 `brigadier install codex` registers the hook, but registration is not approval.
 Codex will not run a hook it has not been told to trust. Approving one is a
-manual, interactive click in Codex. The hook *definition is hashed*, so approval
-is bound to the exact definition you approved: edit `handoff.mjs` by one
-character and Codex requires approval again. That is a deliberate safety
-property of Codex. brigadier neither works around it nor pretends the hook is
-live immediately after installation.
+manual, interactive click in Codex. Approval is bound to the registration — the
+event, matcher, and command configuration — not to the contents of
+`handoff.mjs`. The script at that approved path can later change without Codex
+asking again. To re-review an edited script, deliberately change the registration
+and approve the new registration.
 
 On Claude Code the same hook installs with no click at all. That asymmetry is
 real, and it is the reason this file exists rather than a line in a table.
@@ -51,17 +51,22 @@ The installer copies the script to the absolute form of
 
 `PreCompact` is the Codex event fired before compaction. The command path is
 absolute and shell-quoted. `# brigadier-managed-hook` is the stable ownership
-marker: another install replaces or deduplicates only command hooks carrying
-that marker. All other events, entries, and unknown keys in the shared file are
-preserved. Malformed JSON is refused and left byte-for-byte unchanged.
+marker, but an entry is brigadier-owned only when it has no keys other than a
+`hooks` array containing exactly one `{ "type": "command", "command": "..." }`
+hook whose command ends with that marker. A marked hook with siblings, a matcher,
+or any other shape is foreign: brigadier preserves it and appends its own entry,
+even if that leaves the marker visible twice. All other events, entries, and
+unknown keys in the shared file are preserved. Malformed JSON is refused and
+left byte-for-byte unchanged.
 
 ## Approval is still required
 
 Start an interactive Codex session and approve the hook when Codex presents its
 hook-trust prompt. Until that approval is persisted, the hook is a silent no-op:
-Codex still exits 0, with no warning and no hook output. Because approval is
-bound to a hash of the hook definition, approve it again after any edit to
-`handoff.mjs`.
+Codex still exits 0, with no warning and no hook output. That persisted approval
+remains valid when `handoff.mjs` changes. Only changing the registration itself —
+the command string, event, or matcher — re-arms the prompt. To re-review an
+edited script, deliberately change the registration and approve it again.
 
 For vetted automation only, `codex exec --dangerously-bypass-hook-trust` runs
 enabled hooks for that invocation without persisted trust. The name is

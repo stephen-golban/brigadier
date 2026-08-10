@@ -30,9 +30,17 @@
  * so the whole command runs against a scratch `HOME` with nothing real on disk.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readlink, realpath } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readlink,
+  realpath,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import { basename, dirname, relative, sep } from "node:path";
 import type { ConfigEnvironment } from "../config/store.js";
 import { resolveConfigHome } from "../config/store.js";
@@ -58,6 +66,8 @@ const MANIFEST_VERSION = 1;
 const MANIFEST_FILE_NAME = "surfaces.json";
 const CODEX_HOOK_MARKER = "# brigadier-managed-hook";
 const CODEX_HOOKS_FILE_NAME = "hooks.json";
+const JSON_SCAN_WORK_MULTIPLIER = 8;
+const MINIMUM_JSON_SCAN_WORK = 64;
 
 /**
  * The filesystem operations the installer needs.
@@ -78,6 +88,13 @@ export interface SurfaceIo {
     mode: number,
     expected: SurfaceSnapshot | null,
   ): Promise<void>;
+  /** Atomic replacement for shared files that other products also modify. */
+  writeFileAtomic(
+    path: string,
+    contents: string,
+    mode: number,
+    expected: SurfaceSnapshot | null,
+  ): Promise<void>;
   realpath(path: string): Promise<string>;
   lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
   readlink(path: string): Promise<string>;
@@ -87,6 +104,8 @@ export interface SurfaceSnapshot {
   readonly contents: string;
   /** Opaque identity used only to prove the writer opened the inspected file. */
   readonly identity: string;
+  /** Permission bits captured with the contents and identity. */
+  readonly mode: number;
 }
 
 export const nodeSurfaceIo: SurfaceIo = {
@@ -100,6 +119,7 @@ export const nodeSurfaceIo: SurfaceIo = {
       return {
         contents: await handle.readFile("utf8"),
         identity: fileIdentity(entry.dev, entry.ino),
+        mode: entry.mode & 0o7777,
       };
     } finally {
       await handle.close();
@@ -126,26 +146,67 @@ export const nodeSurfaceIo: SurfaceIo = {
         }
       }
 
-      const bytes = Buffer.from(contents, "utf8");
       await handle.truncate(0);
-      let offset = 0;
-      while (offset < bytes.byteLength) {
-        const { bytesWritten } = await handle.write(
-          bytes,
-          offset,
-          bytes.byteLength - offset,
-          offset,
-        );
-        if (bytesWritten === 0) {
-          throw new Error(`could not finish writing ${path}`);
-        }
-        offset += bytesWritten;
-      }
+      const bytes = Buffer.from(contents, "utf8");
+      await writeAll(handle, bytes, path);
       await handle.truncate(bytes.byteLength);
       // Descriptor chmod cannot be redirected if the pathname is swapped.
       await handle.chmod(mode);
     } finally {
       await handle.close();
+    }
+  },
+  async writeFileAtomic(path, contents, mode, expected) {
+    const preservedMode = await verifyExpectedFile(path, expected, mode);
+    const temporaryPath = `${parentOf(path)}/.${basename(path)}.brigadier-tmp-${randomBytes(12).toString("hex")}`;
+    let temporaryExists = false;
+    let handle: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      handle = await open(
+        temporaryPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW,
+        preservedMode,
+      );
+      temporaryExists = true;
+      const bytes = Buffer.from(contents, "utf8");
+      await writeAll(handle, bytes, temporaryPath);
+      await handle.truncate(bytes.byteLength);
+      await handle.chmod(preservedMode);
+      await handle.sync();
+      await handle.close();
+      handle = null;
+
+      // Re-check immediately before publication. This catches content, identity,
+      // and permission changes made while the temporary file was being written.
+      await verifyExpectedFile(path, expected, mode);
+      await rename(temporaryPath, path);
+      temporaryExists = false;
+    } catch (error) {
+      let cleanupError: unknown = null;
+      if (handle !== null) {
+        try {
+          await handle.close();
+        } catch (closeError) {
+          cleanupError = closeError;
+        }
+      }
+      if (temporaryExists) {
+        try {
+          await unlink(temporaryPath);
+        } catch (unlinkError) {
+          cleanupError ??= unlinkError;
+        }
+      }
+      if (cleanupError !== null) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `atomic write to ${path} failed and its temporary file could not be cleaned up`,
+        );
+      }
+      throw error;
     }
   },
   realpath(path) {
@@ -158,6 +219,66 @@ export const nodeSurfaceIo: SurfaceIo = {
     return readlink(path);
   },
 };
+
+async function writeAll(
+  handle: Awaited<ReturnType<typeof open>>,
+  bytes: Buffer,
+  path: string,
+): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const { bytesWritten } = await handle.write(
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      offset,
+    );
+    if (bytesWritten === 0) {
+      throw new Error(`could not finish writing ${path}`);
+    }
+    offset += bytesWritten;
+  }
+}
+
+async function verifyExpectedFile(
+  path: string,
+  expected: SurfaceSnapshot | null,
+  defaultMode: number,
+): Promise<number> {
+  if (expected === null) {
+    try {
+      await lstat(path);
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return defaultMode;
+      }
+      throw error;
+    }
+    throw new Error(
+      `refusing to create ${path}: it appeared after brigadier inspected it`,
+    );
+  }
+
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const entry = await handle.stat();
+    const current = await handle.readFile("utf8");
+    const identity = fileIdentity(entry.dev, entry.ino);
+    const currentMode = entry.mode & 0o7777;
+    if (
+      identity !== expected.identity ||
+      current !== expected.contents ||
+      currentMode !== expected.mode
+    ) {
+      throw new Error(
+        `refusing to replace ${path}: it changed after brigadier inspected it`,
+      );
+    }
+    return expected.mode;
+  } finally {
+    await handle.close();
+  }
+}
 
 export interface InstallIo {
   readonly env: ConfigEnvironment;
@@ -281,7 +402,7 @@ const HOST_PLANS: readonly HostPlan[] = [
     ],
     notes: (roots) => [
       `~/.agents/skills is read by both Codex and opencode, so this one skill serves both.`,
-      `THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${appendPath(roots.codexHome, CODEX_HOOKS_FILE_NAME)}, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to a hash of the hook definition, so it is required again after any edit to handoff.mjs. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
+      `THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${appendPath(roots.codexHome, CODEX_HOOKS_FILE_NAME)}, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to the registration (event, matcher, and command), not to the contents of handoff.mjs, so editing the script leaves approval intact. To re-review an edited script, deliberately change the registration and approve it again. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
       `${appendPath(roots.codexHome, "AGENTS.md")} is loaded by Codex 0.145.0 into every session including brigadier's own workers, and no flag suppresses it. Keep it doctrine.`,
     ],
   },
@@ -595,7 +716,7 @@ async function applyCodexHookRegistration(
     if (!proof.ok) {
       return { verdict: "refused", path: prepared.path, detail: proof.message };
     }
-    await fs.writeFile(
+    await fs.writeFileAtomic(
       prepared.path,
       prepared.contents,
       FILE_MODE,
@@ -643,7 +764,8 @@ function mergeCodexHook(
 
   const preCompact = preCompactValue ?? [];
   const desired = codexHook(command);
-  const layouts = objectLayout(source, 0);
+  const budget = new JsonScanBudget(source);
+  const layouts = objectLayout(source, 0, budget);
   const hooksRange = layouts.properties.get("hooks");
   if (hooksRange === undefined) {
     return {
@@ -658,7 +780,7 @@ function mergeCodexHook(
     };
   }
 
-  const hooksLayout = objectLayout(source, hooksRange.start);
+  const hooksLayout = objectLayout(source, hooksRange.start, budget);
   const preCompactRange = hooksLayout.properties.get("PreCompact");
   if (preCompactRange === undefined) {
     return {
@@ -673,19 +795,18 @@ function mergeCodexHook(
     };
   }
 
-  const entries = arrayElements(source, preCompactRange.start);
-  const marked = entries.filter((range) =>
-    containsBrigadierHook(JSON.parse(source.slice(range.start, range.end))),
+  const entries = arrayElements(source, preCompactRange.start, budget);
+  const owned = entries.filter((range) =>
+    isBrigadierOwnedEntry(JSON.parse(source.slice(range.start, range.end))),
   );
   if (
-    marked.length === 1 &&
-    JSON.stringify(
-      JSON.parse(source.slice(marked[0]?.start, marked[0]?.end)),
-    ) === JSON.stringify(desired)
+    owned.length === 1 &&
+    JSON.stringify(JSON.parse(source.slice(owned[0]?.start, owned[0]?.end))) ===
+      JSON.stringify(desired)
   ) {
     return { ok: true, contents: source };
   }
-  if (marked.length === 0) {
+  if (owned.length === 0) {
     const insertion = `${preCompact.length === 0 ? "" : ","}\n${indentJson(
       JSON.stringify(desired, null, 2),
       6,
@@ -696,17 +817,23 @@ function mergeCodexHook(
     };
   }
 
-  const retained = entries
-    .filter((range) => !marked.includes(range))
-    .map((range) => source.slice(range.start, range.end));
-  const replacement = `[
-${[...retained, JSON.stringify(desired, null, 2)]
-  .map((entry) => indentJson(entry, 6))
-  .join(",\n")}
-    ]`;
+  const survivor = owned[0];
+  if (survivor === undefined) {
+    throw new Error("brigadier hook ownership scan lost its first entry");
+  }
+  let contents = source;
+  for (const duplicate of owned.slice(1).reverse()) {
+    const index = entries.indexOf(duplicate);
+    const previous = entries[index - 1];
+    if (previous === undefined) {
+      throw new Error("brigadier hook ownership scan lost an array delimiter");
+    }
+    contents = `${contents.slice(0, previous.end)}${contents.slice(duplicate.end)}`;
+  }
+  const replacement = JSON.stringify(desired);
   return {
     ok: true,
-    contents: `${source.slice(0, preCompactRange.start)}${replacement}${source.slice(preCompactRange.end)}`,
+    contents: `${contents.slice(0, survivor.start)}${replacement}${contents.slice(survivor.end)}`,
   };
 }
 
@@ -720,60 +847,100 @@ interface JsonObjectLayout {
   readonly properties: ReadonlyMap<string, JsonRange>;
 }
 
-function containsBrigadierHook(value: unknown): boolean {
+function isBrigadierOwnedEntry(value: unknown): boolean {
+  if (
+    !isJsonObject(value) ||
+    Object.keys(value).length !== 1 ||
+    !Array.isArray(value.hooks) ||
+    value.hooks.length !== 1
+  ) {
+    return false;
+  }
+  const hook = value.hooks[0];
   return (
-    isJsonObject(value) &&
-    Array.isArray(value.hooks) &&
-    value.hooks.some(
-      (hook) =>
-        isJsonObject(hook) &&
-        typeof hook.command === "string" &&
-        hook.command.endsWith(CODEX_HOOK_MARKER),
-    )
+    isJsonObject(hook) &&
+    Object.keys(hook).length === 2 &&
+    hook.type === "command" &&
+    typeof hook.command === "string" &&
+    hook.command.endsWith(CODEX_HOOK_MARKER)
   );
 }
 
-function objectLayout(source: string, start: number): JsonObjectLayout {
+class JsonScanBudget {
+  private remaining: number;
+
+  constructor(source: string) {
+    this.remaining = Math.max(
+      MINIMUM_JSON_SCAN_WORK,
+      source.length * JSON_SCAN_WORK_MULTIPLIER,
+    );
+  }
+
+  spend(): void {
+    this.remaining -= 1;
+    if (this.remaining < 0) {
+      throw new Error(
+        "Codex hooks.json scanner exceeded its input-sized work budget",
+      );
+    }
+  }
+}
+
+function objectLayout(
+  source: string,
+  start: number,
+  budget: JsonScanBudget,
+): JsonObjectLayout {
   const properties = new Map<string, JsonRange>();
-  let cursor = skipJsonWhitespace(source, start) + 1;
+  let cursor = skipJsonWhitespace(source, start, budget) + 1;
   for (;;) {
-    cursor = skipJsonWhitespace(source, cursor);
+    budget.spend();
+    cursor = skipJsonWhitespace(source, cursor, budget);
     if (source[cursor] === "}") {
       return { close: cursor, properties };
     }
-    const keyEnd = jsonStringEnd(source, cursor);
+    const keyEnd = jsonStringEnd(source, cursor, budget);
     const key = JSON.parse(source.slice(cursor, keyEnd)) as string;
-    cursor = skipJsonWhitespace(source, keyEnd) + 1;
-    const valueStart = skipJsonWhitespace(source, cursor);
-    const valueEnd = jsonValueEnd(source, valueStart);
+    cursor = skipJsonWhitespace(source, keyEnd, budget) + 1;
+    const valueStart = skipJsonWhitespace(source, cursor, budget);
+    const valueEnd = jsonValueEnd(source, valueStart, budget);
     properties.set(key, { start: valueStart, end: valueEnd });
-    cursor = skipJsonWhitespace(source, valueEnd);
+    cursor = skipJsonWhitespace(source, valueEnd, budget);
     if (source[cursor] === ",") {
       cursor += 1;
     }
   }
 }
 
-function arrayElements(source: string, start: number): readonly JsonRange[] {
+function arrayElements(
+  source: string,
+  start: number,
+  budget: JsonScanBudget,
+): readonly JsonRange[] {
   const elements: JsonRange[] = [];
-  let cursor = skipJsonWhitespace(source, start) + 1;
+  let cursor = skipJsonWhitespace(source, start, budget) + 1;
   for (;;) {
-    cursor = skipJsonWhitespace(source, cursor);
+    budget.spend();
+    cursor = skipJsonWhitespace(source, cursor, budget);
     if (source[cursor] === "]") {
       return elements;
     }
-    const end = jsonValueEnd(source, cursor);
+    const end = jsonValueEnd(source, cursor, budget);
     elements.push({ start: cursor, end });
-    cursor = skipJsonWhitespace(source, end);
+    cursor = skipJsonWhitespace(source, end, budget);
     if (source[cursor] === ",") {
       cursor += 1;
     }
   }
 }
 
-function jsonValueEnd(source: string, start: number): number {
+function jsonValueEnd(
+  source: string,
+  start: number,
+  budget: JsonScanBudget,
+): number {
   if (source[start] === '"') {
-    return jsonStringEnd(source, start);
+    return jsonStringEnd(source, start, budget);
   }
   if (source[start] === "{" || source[start] === "[") {
     const opening = source[start];
@@ -781,8 +948,9 @@ function jsonValueEnd(source: string, start: number): number {
     let depth = 1;
     let cursor = start + 1;
     while (depth > 0) {
+      budget.spend();
       if (source[cursor] === '"') {
-        cursor = jsonStringEnd(source, cursor);
+        cursor = jsonStringEnd(source, cursor, budget);
         continue;
       }
       if (source[cursor] === opening) {
@@ -796,22 +964,33 @@ function jsonValueEnd(source: string, start: number): number {
   }
   let cursor = start;
   while (!/[\s,}\]]/.test(source[cursor] ?? "")) {
+    budget.spend();
     cursor += 1;
   }
   return cursor;
 }
 
-function jsonStringEnd(source: string, start: number): number {
+function jsonStringEnd(
+  source: string,
+  start: number,
+  budget: JsonScanBudget,
+): number {
   let cursor = start + 1;
   while (source[cursor] !== '"') {
+    budget.spend();
     cursor += source[cursor] === "\\" ? 2 : 1;
   }
   return cursor + 1;
 }
 
-function skipJsonWhitespace(source: string, start: number): number {
+function skipJsonWhitespace(
+  source: string,
+  start: number,
+  budget: JsonScanBudget,
+): number {
   let cursor = start;
   while (/\s/.test(source[cursor] ?? "")) {
+    budget.spend();
     cursor += 1;
   }
   return cursor;

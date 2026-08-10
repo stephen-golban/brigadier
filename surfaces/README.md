@@ -50,8 +50,9 @@ tempted to keep grinding rather than delegate. It does not exist uniformly:
   See `opencode/plugin/brigadier.js` and `opencode/README.md`.
 - **Codex — registered, then trust-gated.** `brigadier install codex` merges a
   `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only
-  after you approve the hook definition. The definition is hashed, so approval
-  is required again after every edit to `handoff.mjs`. See `codex/hooks/`.
+  after you approve the registration. Approval is bound to the registration, not
+  to the contents of `handoff.mjs`, so editing the script does not prompt again.
+  See `codex/hooks/`.
 - **Claude Desktop — impossible.** Desktop exposes no hook surface at all. The
   MCP server is the only local seam it has, and an MCP server is called by the
   model, never by the transcript. There is nothing to install and no workaround.
