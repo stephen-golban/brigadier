@@ -235,6 +235,8 @@ async function reviewSlice(
   const startedAt = options.ports.now();
   const elapsed = (): number => options.ports.now() - startedAt;
   const sliceId = request.slice.id;
+  const redact = (artifact: string): string =>
+    options.ports.engine.redact(request.worktree, artifact);
 
   // The config carried by the run's own `RoutingInput` rather than the one this
   // reviewer was constructed with: a caller may legitimately run two plans
@@ -247,7 +249,9 @@ async function reviewSlice(
       verdict: "skipped",
       reviewer: null,
       reason: "NO_OTHER_VENDOR",
-      message: `slice ${sliceId} was built by ${request.builder.vendor} and no other vendor is configured, so no cross-vendor review was possible`,
+      message: redact(
+        `slice ${sliceId} was built by ${request.builder.vendor} and no other vendor is configured, so no cross-vendor review was possible`,
+      ),
       durationMs: elapsed(),
     };
   }
@@ -259,13 +263,17 @@ async function reviewSlice(
       verdict: "skipped",
       reviewer,
       reason: "NO_ADAPTER",
-      message: `slice ${sliceId} could not be reviewed: no worker adapter is configured for vendor "${other.vendor}"`,
+      message: redact(
+        `slice ${sliceId} could not be reviewed: no worker adapter is configured for vendor "${other.vendor}"`,
+      ),
       durationMs: elapsed(),
     };
   }
 
   options.ports.log(
-    `slice ${sliceId} attempt ${request.attempt}: reviewing ${request.builder.vendor}/${request.builder.model}'s work with ${reviewer.vendor}/${reviewer.model} at ${reviewer.effort} effort`,
+    redact(
+      `slice ${sliceId} attempt ${request.attempt}: reviewing ${request.builder.vendor}/${request.builder.model}'s work with ${reviewer.vendor}/${reviewer.model} at ${reviewer.effort} effort`,
+    ),
   );
 
   // Taken AFTER the two skip checks above: a run with one vendor configured
@@ -274,14 +282,14 @@ async function reviewSlice(
   const change = await readChange(options, request);
 
   const answer = await runOneShotPrompt(worker, {
-    id: `${sliceId}-review-${request.attempt}`,
+    id: redact(`${sliceId}-review-${request.attempt}`),
     vendor: reviewer.vendor,
     model: reviewer.model,
     effort: reviewer.effort,
-    prompt: reviewPrompt(request, change),
+    prompt: redact(reviewPrompt(request, change)),
     cwd: request.worktreePath,
     env: options.env,
-    purpose: `cross-vendor review of slice ${sliceId}`,
+    purpose: redact(`cross-vendor review of slice ${sliceId}`),
     timeoutMs: REVIEW_TIMEOUT_MS,
     maxTurns: REVIEW_MAX_TURNS,
     ...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -297,7 +305,12 @@ async function reviewSlice(
       // slice's: a reviewer that ran out of quota has formed no opinion about
       // anybody's code, and a message that blurred the two would send a user
       // looking for a bug that is not there.
-      message: `slice ${sliceId} was not reviewed: the ${reviewer.vendor}/${reviewer.model} reviewer failed with ${answer.failure.kind}: ${answer.failure.message}`,
+      message: redact(
+        `slice ${sliceId} was not reviewed: the ${reviewer.vendor}/${reviewer.model} reviewer failed with ${answer.failure.kind}: ${answer.failure.message}`,
+      ),
+      ...(answer.cleanupFailure === undefined
+        ? {}
+        : { cleanupFailure: redact(answer.cleanupFailure) }),
       durationMs: elapsed(),
     };
   }
@@ -308,12 +321,22 @@ async function reviewSlice(
       verdict: "skipped",
       reviewer,
       reason: "UNREADABLE_RESPONSE",
-      message: `slice ${sliceId} was not reviewed: the ${reviewer.vendor}/${reviewer.model} reviewer replied without a findings block this build could parse`,
+      message: redact(
+        `slice ${sliceId} was not reviewed: the ${reviewer.vendor}/${reviewer.model} reviewer replied without a findings block this build could parse`,
+      ),
       durationMs: elapsed(),
     };
   }
 
-  return adjudicate(findings, reviewer, elapsed());
+  return adjudicate(
+    findings.map((finding) => ({
+      ...finding,
+      path: finding.path === null ? null : redact(finding.path),
+      summary: redact(finding.summary),
+    })),
+    reviewer,
+    elapsed(),
+  );
 }
 
 /**
@@ -429,7 +452,9 @@ async function readChange(
   options: CrossVendorReviewerOptions,
   request: SliceReviewRequest,
 ): Promise<ReviewedChange> {
-  const where = `slice ${request.slice.id} attempt ${request.attempt}`;
+  const redact = (artifact: string): string =>
+    options.ports.engine.redact(request.worktree, artifact);
+  const where = redact(`slice ${request.slice.id} attempt ${request.attempt}`);
   const { engine } = options.ports;
   if (engine.diffUncommitted === undefined) {
     const reason = "this run's worktree engine cannot produce one";
@@ -446,7 +471,7 @@ async function readChange(
       maxCharacters: MAX_DIFF_CHARACTERS,
     });
   } catch (error) {
-    const reason = describeError(error);
+    const reason = redact(describeError(error));
     options.ports.log(
       `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
     );

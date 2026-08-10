@@ -28,7 +28,7 @@ import {
 } from "../config/index.js";
 import type { AnyWorker, Effort, Vendor } from "../contracts.js";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
-import { runMcpServer } from "../mcp/server.js";
+import { type McpRunControl, runMcpServer } from "../mcp/server.js";
 import type { Planner, PlannerOutcome } from "../planner/index.js";
 import { createModelPlanner } from "../planner/index.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
@@ -528,7 +528,7 @@ interface CliOptions {
    * that hangs on broken code never reports the breakage it was written to
    * catch. With this seam, the `mcp` dispatch is provable without a server.
    */
-  readonly mcpServer?: () => Promise<number>;
+  readonly mcpServer?: (control?: McpRunControl) => Promise<number>;
   readonly io?: ConfigIo;
   /** The repository `run` operates on. Defaults to `process.cwd()`. */
   readonly cwd?: string;
@@ -546,8 +546,9 @@ interface CliOptions {
    * Called at most once, at the exact moment this invocation acquires something
    * an interrupt would have to clean up. See `InterruptGate.arm`.
    *
-   * Only `run` calls it, and only immediately before it hands control to the
-   * orchestrator. `init` never does, which is the point: `init` creates no
+   * `run` calls it immediately before handing control to the orchestrator;
+   * `mcp` calls it immediately before dispatching a run tool. `init` never does,
+   * which is the point: `init` creates no
    * worktree and spawns no worker, so a Ctrl-C in it has nothing to wind down
    * and must kill brigadier on the first press.
    */
@@ -762,7 +763,12 @@ export async function runCli(options: CliOptions): Promise<number> {
       stderr.write(USAGE);
       return 2;
     }
-    return (options.mcpServer ?? runMcpServer)();
+    return (options.mcpServer ?? runMcpServer)({
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onCancellable === undefined
+        ? {}
+        : { onCancellable: options.onCancellable }),
+    });
   }
   if (command !== "init") {
     stderr.write(

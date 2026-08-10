@@ -39,6 +39,7 @@ import type { LaunchEnv } from "../src/supervisor/slice.js";
 import { buildClaudeCommand } from "../src/worker/claude.js";
 import { buildCodexCommand } from "../src/worker/codex.js";
 import type {
+  CreatedWorktree,
   UncommittedDiff,
   UncommittedDiffSpec,
 } from "../src/worktree/contracts.js";
@@ -158,6 +159,21 @@ const QUOTA_FAILURE: LaunchedWorkerOutcome = {
   },
 };
 
+const UNKNOWN_SHUTDOWN_OUTCOME: LaunchedWorkerOutcome = {
+  ok: false,
+  output: "",
+  usage: USAGE,
+  durationMs: 0,
+  exitCode: null,
+  signal: null,
+  failure: {
+    kind: "UNKNOWN_FAILURE",
+    message: "process group 4242 survived SIGKILL",
+    retryable: false,
+    statusCode: null,
+  },
+};
+
 function routingFor(config: BrigadierConfig): RoutingInput {
   return { config, capabilities: [], quota: [] };
 }
@@ -166,10 +182,24 @@ function requestFor(
   config: BrigadierConfig,
   builder: RoutedWorker,
 ): SliceReviewRequest {
+  const worktree: CreatedWorktree = {
+    repositoryPath: "/tmp/repository",
+    path: "/tmp/brigadier/slice-7",
+    branch: "brigadier/review/slice-7",
+    isolated: true,
+    session: {
+      repositoryPath: "/tmp/repository",
+      slug: "review",
+      baseCommit: "0".repeat(40),
+      baseBranch: "brigadier/review/base",
+      integrationBranch: "brigadier/review/integration",
+    },
+  };
   return {
     slice: SLICE,
     attempt: 1,
-    worktreePath: "/tmp/brigadier/slice-7",
+    worktree,
+    worktreePath: worktree.path,
     builder,
     routing: routingFor(config),
   };
@@ -263,14 +293,28 @@ interface FakeEngine {
   readonly specs: readonly UncommittedDiffSpec[];
 }
 
-function fakeEngine(answer: UncommittedDiff | Error | null): FakeEngine {
+function fakeEngine(
+  answer: UncommittedDiff | Error | null,
+  redactionValues: readonly string[] = [],
+): FakeEngine {
   const specs: UncommittedDiffSpec[] = [];
+  const redact = (_worktree: CreatedWorktree, artifact: string): string => {
+    let redacted = artifact;
+    for (const value of redactionValues) {
+      redacted = redacted.split(value).join("[REDACTED]");
+    }
+    return redacted;
+  };
   if (answer === null) {
-    return { engine: {} as SupervisorPorts["engine"], specs };
+    return {
+      engine: { redact } as SupervisorPorts["engine"],
+      specs,
+    };
   }
   return {
     specs,
     engine: {
+      redact,
       diffUncommitted: async (spec: UncommittedDiffSpec) => {
         specs.push(spec);
         if (answer instanceof Error) {
@@ -517,6 +561,31 @@ describe("runOneShotPrompt", () => {
     expect(result.ok).toBe(false);
     expect(result.ok ? "" : result.failure.kind).toBe("CANCELLED");
     expect(codex.cancels()).toBe(1);
+  });
+
+  test("a resolved cancel reports an UNKNOWN_FAILURE completion with the pid", async () => {
+    const controller = new AbortController();
+    const codex = fakeAdapter("codex", {
+      completionAfterDrain: true,
+      outcome: UNKNOWN_SHUTDOWN_OUTCOME,
+      events: [{ type: "message", text: "working", raw: {} }],
+      onEvent: () => {
+        controller.abort();
+      },
+    });
+
+    const result = await withBound(
+      runOneShotPrompt(codex.worker, oneShot({ signal: controller.signal })),
+      "unconfirmed one-shot cancellation",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.failure.message).toBe(
+      "a one-shot probe was cancelled while codex/gpt-5.6-sol was running; the codex/gpt-5.6-sol worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL",
+    );
+    expect(result.ok ? undefined : result.cleanupFailure).toBe(
+      "the codex/gpt-5.6-sol worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL",
+    );
   });
 });
 
@@ -947,6 +1016,78 @@ describe("createCrossVendorReviewer", () => {
     );
     expect(prompt).not.toContain("break");
     expect(prompt).not.toContain("attack");
+  });
+
+  test("redacts task metadata before it reaches the reviewer", async () => {
+    const secret = "sk-live-outbound-4815162342";
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH), [secret]);
+    const harness = makeHarness({ codex }, engine.engine);
+    const reviewer = createCrossVendorReviewer({
+      ports: harness.ports,
+      env: ENV,
+    });
+    const request = requestFor(BOTH_VENDORS, CLAUDE_BUILDER);
+
+    await withBound(
+      reviewer.review({
+        ...request,
+        slice: {
+          id: `slice-${secret}`,
+          title: `Implement ${secret}`,
+          prompt: `Use ${secret} in the authentication flow.`,
+          ownedPaths: [`src/${secret}.ts`],
+          dependsOn: [],
+        },
+      }),
+      "redacted outbound review",
+    );
+
+    const prompt = codex.specs[0]?.prompt ?? "";
+    expect(prompt).not.toContain(secret);
+    expect(prompt).toContain(
+      "# The task they were given (slice-[REDACTED]: Implement [REDACTED])",
+    );
+    expect(prompt).toContain("Use [REDACTED] in the authentication flow.");
+    expect(prompt).toContain("- src/[REDACTED].ts");
+    const logArtifact = harness.logs.join("\n");
+    expect(logArtifact).not.toContain(secret);
+    expect(logArtifact).toContain(
+      "slice slice-[REDACTED] attempt 1: reviewing claude/claude-opus-5's work with codex/gpt-5.6-sol at high effort",
+    );
+  });
+
+  test("redacts reviewer-returned paths and summaries in the review artifact", async () => {
+    const secret = "sk-live-inbound-10815";
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith(
+        `{"findings":[{"severity":"blocking","path":"config/${secret}.ts","line":17,"summary":"hard-coded ${secret}"}]}`,
+      ),
+    });
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH), [secret]);
+    const harness = makeHarness({ codex }, engine.engine);
+    const reviewer = createCrossVendorReviewer({
+      ports: harness.ports,
+      env: ENV,
+    });
+
+    const verdict = await withBound(
+      reviewer.review(requestFor(BOTH_VENDORS, CLAUDE_BUILDER)),
+      "redacted inbound review",
+    );
+
+    const artifact = JSON.stringify(verdict);
+    expect(artifact).not.toContain(secret);
+    expect(verdict.verdict === "rejected" ? verdict.findings : []).toEqual([
+      {
+        severity: "blocking",
+        path: "config/[REDACTED].ts",
+        line: 17,
+        summary: "hard-coded [REDACTED]",
+      },
+    ]);
   });
 
   test("the reviewer reads the builder's uncommitted worktree", async () => {

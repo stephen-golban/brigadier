@@ -800,16 +800,21 @@ export class DefaultSliceRunner implements SliceRunner {
     // rejected without leaving a commit behind, because `engine.commit` below
     // is irreversible through this engine's surface. See `review.ts` for why
     // the gate is here rather than after the commit and what that costs.
+    const redact = (artifact: string): string =>
+      this.#ports.engine.redact(created, artifact);
     const review = await this.#reviewQuietly({
       slice: input.slice,
       attempt,
+      worktree: created,
       worktreePath: created.path,
       builder: routed,
       routing: input.routing,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
     this.#ports.log(
-      `slice ${sliceId} attempt ${attempt}: review ${describeVerdict(review)}`,
+      redact(
+        `slice ${sliceId} attempt ${attempt}: review ${describeVerdict(review)}`,
+      ),
     );
     if (review.verdict === "rejected") {
       return {
@@ -826,12 +831,31 @@ export class DefaultSliceRunner implements SliceRunner {
         review,
         failure: {
           kind: "REVIEW_REJECTED",
-          message: `slice ${sliceId} attempt ${attempt}: ${review.reviewer.vendor}/${review.reviewer.model} found ${countBlocking(review.findings)} blocking issue(s) in ${routed.vendor}/${routed.model}'s work: ${summarizeBlocking(review.findings)}`,
+          message: redact(
+            `slice ${sliceId} attempt ${attempt}: ${review.reviewer.vendor}/${review.reviewer.model} found ${countBlocking(review.findings)} blocking issue(s) in ${routed.vendor}/${routed.model}'s work: ${summarizeBlocking(review.findings)}`,
+          ),
           review,
         },
       };
     }
-
+    if (review.verdict === "skipped" && review.reason === "CANCELLED") {
+      return {
+        ok: false,
+        workerRan: true,
+        cancelled: true,
+        outcome,
+        review,
+        ...(review.cleanupFailure === undefined
+          ? {}
+          : { cleanupFailure: review.cleanupFailure }),
+        failure: cancellationFailure(
+          input.signal,
+          redact(
+            `slice ${sliceId} attempt ${attempt} was cancelled during cross-vendor review: ${review.message}`,
+          ),
+        ),
+      };
+    }
     try {
       const result = await this.#ports.engine.commit({
         worktree: created,
@@ -913,11 +937,15 @@ export class DefaultSliceRunner implements SliceRunner {
     try {
       return await this.#review.review(request);
     } catch (error) {
+      const message = this.#ports.engine.redact(
+        request.worktree,
+        `slice ${request.slice.id} attempt ${request.attempt} was not reviewed: the reviewer threw instead of reporting: ${describeError(error)}`,
+      );
       return {
         verdict: "skipped",
         reviewer: null,
         reason: "REVIEWER_FAILED",
-        message: `slice ${request.slice.id} attempt ${request.attempt} was not reviewed: the reviewer threw instead of reporting: ${describeError(error)}`,
+        message,
         durationMs: this.#ports.now() - startedAt,
       };
     }

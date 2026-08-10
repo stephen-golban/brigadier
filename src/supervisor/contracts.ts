@@ -364,6 +364,12 @@ export type SliceReview =
       readonly reviewer: ReviewerIdentity | null;
       readonly reason: ReviewSkipReason;
       readonly message: string;
+      /**
+       * Present when cancelling the review did not confirm that its worker
+       * exited. Carried separately so the run cannot claim cleanup succeeded
+       * by parsing (or overlooking) prose in `message`.
+       */
+      readonly cleanupFailure?: string;
       readonly durationMs: number;
     };
 
@@ -378,6 +384,8 @@ export type SliceReview =
 export interface SliceReviewRequest {
   readonly slice: Slice;
   readonly attempt: number;
+  /** The live handle whose secret inventory redacts every review artifact. */
+  readonly worktree: CreatedWorktree;
   readonly worktreePath: string;
   /** The model whose work is being reviewed; the reviewer is never this one. */
   readonly builder: RoutedWorker;
