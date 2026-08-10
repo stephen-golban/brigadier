@@ -95,11 +95,30 @@ git push origin HEAD
 git push origin "v${VERSION}"
 ```
 
-`bun run build:mcp` currently fails because `src/mcp/server.ts` has not landed.
-Do not release the declared `brigadier-mcp` executable until that source exists,
-the script produces `dist/mcp/server.js`, and `brigadier-mcp --version` (or its
-documented health check) passes from an installed tarball. `bun run build` does
-not invoke `build:mcp`, so the existing four gates remain usable meanwhile.
+`src/mcp/server.ts` has landed and `bun run build:mcp` now bundles successfully.
+**It does not honour its `--outfile`.** Measured against Bun 1.3 on 2026-08-10,
+`bun run build:mcp` writes the bundle and its source map beside the entry point,
+as `src/mcp/server.js` and `src/mcp/server.js.map`, and leaves `dist/mcp/`
+holding only the `.d.ts` files `build:dist` emitted. `.git/info/exclude` carries
+a local `src/**/*.js` rule, so the stray bundle does not show up in
+`git status` — but `biome` still sees it, and **`bun run check` fails on the
+minified output until it is deleted**.
+
+So, until the script is fixed: move the emitted file to its intended location and
+remove both artifacts from `src/` before running the gates or tagging.
+
+```sh
+bun run build:mcp
+mkdir -p dist/mcp
+mv src/mcp/server.js dist/mcp/server.js
+rm -f src/mcp/server.js.map
+bun run check
+```
+
+`bun run build` does not invoke `build:mcp`, so the four ordinary gates remain
+usable without it. Before releasing the declared `brigadier-mcp` executable,
+confirm that it starts from an installed tarball and answers an MCP `initialize`
+request; the four gates do not cover the packaged launcher.
 
 The tag starts `.github/workflows/release.yml`. Before pushing it, confirm all
 secrets above are present. If `NPM_TOKEN` is absent, npm publication is skipped.
