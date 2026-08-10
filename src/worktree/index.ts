@@ -5,6 +5,8 @@ export type {
   LinkedSecretsPolicy,
   MergeResult,
   MergeSpec,
+  UncommittedDiff,
+  UncommittedDiffSpec,
   WorktreeEngine,
   WorktreeEngineOptions,
   WorktreeSession,
