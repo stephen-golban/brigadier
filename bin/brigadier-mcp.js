@@ -1,3 +1,5 @@
 #!/usr/bin/env node
 
-await import("../dist/mcp/server.js");
+const { runMcpServer } = await import("../dist/mcp/server.js");
+
+process.exitCode = await runMcpServer();
