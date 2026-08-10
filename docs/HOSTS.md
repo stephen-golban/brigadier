@@ -44,6 +44,14 @@ brigadier last wrote to each path:
 
 Running `brigadier install` twice does nothing the second time.
 
+The manifest governs the files brigadier writes whole. `$CODEX_HOME/hooks.json`
+is the one file it shares with other tools, so it is merged instead, and its
+protection is different: brigadier only ever touches the one entry carrying its
+own `# brigadier-managed-hook` marker, leaves everything else in the file
+untouched, and refuses the whole write if the JSON does not parse. It is not
+recorded in the manifest, and `--force` has no bearing on it — if you edit
+brigadier's own marked entry, the next install replaces it.
+
 A destination symlink is always refused, even with `--force`. The installer
 resolves the install root, refuses writes that escape it, and opens destination
 files with `O_NOFOLLOW` so a symlink swap cannot redirect the write.
@@ -79,14 +87,26 @@ marketplace, and no consent dialog. The handoff hook is registered against
 | handoff hook | `~/.agents/skills/brigadier/hooks/handoff.mjs` |
 | hook notes | `~/.agents/skills/brigadier/hooks/README.md` |
 | global doctrine | `$CODEX_HOME/AGENTS.md` |
+| hook registration | `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) |
 
 `~/.agents/skills` is read by both Codex and opencode, so this one skill serves
 both.
 
-brigadier does **not** write a Codex hook registration. The configuration key
-differs across Codex releases, and a guessed one is a silent no-op. Register the
-hook yourself against the installed `handoff.mjs`; the README next to it explains
-how.
+`brigadier install codex` **does** register the handoff hook: it merges one
+`PreCompact` entry naming the absolute path of the installed `handoff.mjs` into
+`$CODEX_HOME/hooks.json`. That file is shared with every other tool you have
+registered, so it is merged rather than written over — other events, other
+entries, and keys brigadier does not recognize are preserved byte-for-byte, and
+a `hooks.json` whose JSON does not parse is refused with nothing written. The
+entry carries a `# brigadier-managed-hook` marker in its command string, which
+is how a second install finds its own entry to replace instead of appending a
+duplicate.
+
+**Registration is not approval.** Codex will not run a hook you have not
+trusted, and the trust is bound to a hash of the hook definition, so the click
+is required again after any edit to `handoff.mjs`. Until you approve it, the
+hook is a silent no-op: Codex exits 0, with no warning and no hook output. The
+README installed beside `handoff.mjs` explains the approval step.
 
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
 including brigadier's own workers, and no flag suppresses it. Keep it doctrine.
@@ -103,8 +123,11 @@ the Claude Code or Codex surface already gave it the doctrine. This plugin adds
 the one thing a skill cannot be: the handoff hook.
 
 The plugin reacts to the bus events named in its `HANDOFF_EVENT_TYPES` array.
-Those names were **not** verified against a running opencode. If the hook never
-fires, that array is the one line to change.
+Those names are now verified against a running opencode 1.18.16. The exact names
+and what each one means live next to the plugin, in
+`surfaces/opencode/plugin/brigadier.js` and the README installed beside it, so
+there is one place to read them rather than two that can disagree. If the hook
+never fires on your build, that array is still the one line to change.
 
 ### `claude-desktop`
 
@@ -142,8 +165,8 @@ tempted to keep grinding rather than delegate. **It does not exist uniformly.**
 | Host | Status |
 | --- | --- |
 | Claude Code | **Works.** `PreCompact` receives the transcript path and the hook can write a message back into the session |
-| opencode | **Event binding unverified.** The plugin subscribes to the session event bus, but its event names have not been verified on a running opencode |
-| Codex | **Trust-gated.** Hooks run only after you click to trust the hook definition, and the definition is hashed — so the click is required again after every edit to the script. This is not seamless and is not presented as such |
+| opencode | **Event names verified.** The plugin subscribes to the session event bus against event names verified on a running opencode 1.18.16 |
+| Codex | **Registered, then trust-gated.** `brigadier install codex` writes the `PreCompact` registration, but hooks run only after you click to trust the hook definition, and the definition is hashed — so the click is required again after every edit to the script. Until then it is a silent no-op. This is not seamless and is not presented as such |
 | Claude Desktop | **Impossible.** Desktop exposes no hook surface at all, and an MCP server is called by the model, never by the transcript. There is no workaround |
 
 ## Using brigadier over MCP directly
@@ -157,11 +180,13 @@ bundle involved. It takes no runtime options; `-h`/`--help` prints usage.
 | `brigadier_route_plan` | Reads this machine's config. Reports the vendor, model and effort each slice would get, or why nothing can take it. Creates no worktree, spawns no worker |
 | `brigadier_run` | The real thing: worktrees, workers, commits, one integration branch |
 
-`brigadier_run` takes a non-empty `repositoryPath` plus the same `slug`,
-`maxWorkers`, `dryRun` and `unsafeInPlace` options the CLI does. Its schema calls
-the path absolute, but the current implementation enforces only that it is a
-non-empty string. Clients should pass an absolute path to avoid making the MCP
-server's working directory part of the request.
+`brigadier_run` takes a `repositoryPath` plus the same `slug`, `maxWorkers`,
+`dryRun` and `unsafeInPlace` options the CLI does. The path **must be absolute**,
+in the advertised schema and in the implementation alike: a relative path is
+refused rather than resolved, and so is a leading `~`, which nothing in the
+server expands. An MCP client gives nobody control over the server process's
+working directory, so a relative path would resolve against a directory the
+caller cannot see and could silently target the wrong repository.
 
 `brigadier_route_plan` routes against an empty quota snapshot, which the routing
 pipeline reads as "unknown" and therefore as available — so a drained model is

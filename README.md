@@ -177,7 +177,7 @@ doing it itself. The doctrine's whole message is *you are not the worker*.
 | Host | What lands | Where |
 | --- | --- | --- |
 | `claude-code` | a skill that auto-loads as a plugin, plus a `PreCompact` handoff hook | `~/.claude/skills/brigadier/` |
-| `codex` | a skill, a handoff hook, and global doctrine | `~/.agents/skills/brigadier/`, `$CODEX_HOME/AGENTS.md` |
+| `codex` | a skill, a handoff hook, its `PreCompact` registration, and global doctrine | `~/.agents/skills/brigadier/`, `$CODEX_HOME/AGENTS.md`, `$CODEX_HOME/hooks.json` |
 | `opencode` | a plugin (for the handoff hook a skill cannot provide) | `~/.config/opencode/plugin/brigadier.js` |
 | `claude-desktop` | an MCP bundle, **staged** for manual install | `~/.brigadier/surfaces/claude-desktop/` |
 
@@ -190,12 +190,17 @@ named, and left alone. A destination symlink is always refused, even with
 `--force`; writes use `O_NOFOLLOW` and may not escape the resolved install
 directory.
 
+`$CODEX_HOME/hooks.json` is shared with your other tools, so it is merged rather
+than replaced: brigadier's entry is marked, every other entry and event is
+preserved, and a file whose JSON does not parse is refused with nothing written.
+
 Full detail, including the honest limits of each host, is in
 [docs/HOSTS.md](docs/HOSTS.md). The headline is that **the handoff hook is not
-uniform**: it works on Claude Code; opencode's event binding is unverified; Codex
-is trust-gated — a click, required again after every edit because the definition
-is hashed — and it is **impossible on Claude Desktop**, which exposes no hook
-surface at all.
+uniform**: it works on Claude Code; on opencode it binds to event names verified
+against a running opencode 1.18.16; on Codex brigadier registers it but Codex
+trust-gates it — a click, required again after every edit because the definition
+is hashed, and a silent no-op until you give it — and it is **impossible on
+Claude Desktop**, which exposes no hook surface at all.
 
 ### `brigadier mcp`
 
@@ -486,7 +491,7 @@ at least one file was refused or could not be written, `2` usage error.
 
 ```sh
 bun install
-bun test          # 736 tests
+bun test
 bun run typecheck
 bun run check     # biome
 bun run build
