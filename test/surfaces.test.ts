@@ -95,12 +95,12 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3993,
   },
   "opencode/README.md": {
-    sha256: "b86a7ca88693a91bf255cc392d2399a29422313636f3197bf7b11a3d6a42e9ae",
-    bytes: 1731,
+    sha256: "ff104b1c8a612881244d802caf0b2f67b66ffb4e21330e5690d7f464899d946d",
+    bytes: 2142,
   },
   "opencode/plugin/brigadier.js": {
-    sha256: "782555e1df289d86ed570988c1f7e63e7210f85ad4c1c10a02c057b1508d68e6",
-    bytes: 3395,
+    sha256: "904cd29d686fa1113b352862144e66d0345ed35ca5f43f0efcb527ef9843e4b1",
+    bytes: 3358,
   },
 };
 
@@ -426,7 +426,7 @@ describe("the surface templates", () => {
     );
   });
 
-  test("opencode handoff status does not outrun its verification", () => {
+  test("the installed opencode status matches the verified evidence", () => {
     const index = readFileSync(join(surfacesRoot, "README.md"), "utf8");
     expect(textBetween(index, "- **opencode", "\n- **Codex")).toBe(
       "- **opencode — event binding unverified.** The plugin subscribes to the\n  session event bus, but its two event names have not been verified against a\n  running opencode build. See `opencode/plugin/brigadier.js`.",
@@ -434,7 +434,7 @@ describe("the surface templates", () => {
 
     const opencode = SURFACE_TEMPLATES["opencode/README.md"] ?? "";
     expect(paragraphContaining(opencode, "**Status:")).toBe(
-      "**Status: plugin installs; handoff event names are unverified.**",
+      "**Status: plugin and event names verified on opencode 1.18.16; no live\ncompaction was triggered.**",
     );
   });
 
@@ -554,11 +554,11 @@ describe("brigadier install", () => {
       expect(notes).toContain(
         `  note: THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${home}/.codex/hooks.json, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to a hash of the hook definition, so it is required again after any edit to handoff.mjs. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
       );
-      // opencode: works, and the unverified line is named as unverified.
+      // opencode: event names are verified, with the residual limits explicit.
       expect(
         notes.some((note) =>
           note.includes(
-            "Those names were NOT verified against a running opencode",
+            "was verified on 2026-08-10 against a running opencode 1.18.16 darwin-arm64 by fetching GET /doc",
           ),
         ),
       ).toBe(true);
@@ -1314,51 +1314,110 @@ describe("the handoff hook", () => {
 });
 
 describe("the opencode plugin", () => {
-  test("fires on exactly the two named events and on nothing else", async () => {
+  test("matches the verified event vocabulary exactly", async () => {
     const module = (await import(
       join(surfacesRoot, "opencode/plugin/brigadier.js")
     )) as {
       HANDOFF_EVENT_TYPES: readonly string[];
       isHandoffEvent: (event: unknown) => boolean;
-      buildHandoffMessage: (turns: unknown) => string;
-      readTurnCount: (event: unknown) => number | null;
     };
 
+    expect(module.isHandoffEvent({ type: "session.compacted" })).toBe(true);
+    expect(module.isHandoffEvent({ type: "session.compacting" })).toBe(false);
+    expect(
+      module.isHandoffEvent({ type: "session.next.compaction.started" }),
+    ).toBe(true);
     expect(module.HANDOFF_EVENT_TYPES).toEqual([
       "session.compacted",
-      "session.compacting",
+      "session.next.compaction.started",
     ]);
-    expect(module.isHandoffEvent({ type: "session.compacted" })).toBe(true);
-    expect(module.isHandoffEvent({ type: "session.compacting" })).toBe(true);
-    expect(module.isHandoffEvent({ type: "session.idle" })).toBe(false);
-    expect(module.isHandoffEvent({ type: "message.updated" })).toBe(false);
+    expect(module.isHandoffEvent({ type: "session.created" })).toBe(false);
     expect(module.isHandoffEvent(null)).toBe(false);
     expect(module.isHandoffEvent("session.compacted")).toBe(false);
+  });
 
-    expect(module.buildHandoffMessage(12)).toBe(
-      "brigadier: this session is out of context after 12 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
+  test("uses the verified compaction reason without inventing a turn count", async () => {
+    const module = (await import(
+      join(surfacesRoot, "opencode/plugin/brigadier.js")
+    )) as {
+      buildHandoffMessage: (reason: unknown) => string;
+      readCompactionReason: (event: unknown) => "auto" | "manual" | null;
+    };
+
+    const autoEvent = {
+      type: "session.next.compaction.started",
+      properties: {
+        timestamp: 1_786_311_000_000,
+        sessionID: "ses_verified",
+        messageID: "msg_verified",
+        reason: "auto",
+      },
+    };
+    const manualEvent = {
+      ...autoEvent,
+      properties: { ...autoEvent.properties, reason: "manual" },
+    };
+
+    expect(module.readCompactionReason(autoEvent)).toBe("auto");
+    expect(module.readCompactionReason(manualEvent)).toBe("manual");
+    expect(module.readCompactionReason({ type: "session.compacted" })).toBe(
+      null,
     );
-    expect(module.buildHandoffMessage(null)).toBe(
+    expect(
+      module.buildHandoffMessage(module.readCompactionReason(autoEvent)),
+    ).toBe(
       "brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
     );
-    expect(module.buildHandoffMessage(1.5)).toBe(
-      module.buildHandoffMessage(null),
+    expect(
+      module.buildHandoffMessage(module.readCompactionReason(manualEvent)),
+    ).toBe(
+      "brigadier: this session is being compacted at your request. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
     );
+    expect(module.buildHandoffMessage(null)).toBe(
+      "brigadier: this session was compacted. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
+    );
+  });
 
-    expect(module.readTurnCount({ properties: { messageCount: 9 } })).toBe(9);
-    expect(module.readTurnCount({ properties: { turns: 4 } })).toBe(4);
-    expect(module.readTurnCount({ properties: {} })).toBe(null);
-    expect(module.readTurnCount({})).toBe(null);
+  test("contains malformed event input and a rejected toast", async () => {
+    const module = (await import(
+      join(surfacesRoot, "opencode/plugin/brigadier.js")
+    )) as {
+      BrigadierPlugin: (input: unknown) => Promise<{
+        event: (input: unknown) => Promise<void>;
+      }>;
+    };
+    let toastAttempts = 0;
+    const plugin = await module.BrigadierPlugin({
+      client: {
+        tui: {
+          showToast: async () => {
+            toastAttempts += 1;
+            if (toastAttempts > 1) {
+              throw new Error("toast work budget exceeded");
+            }
+            throw new Error("toast unavailable");
+          },
+        },
+      },
+    });
+
+    await expect(plugin.event(null)).resolves.toBeUndefined();
+    await expect(
+      plugin.event({
+        event: { type: "session.compacted", properties: null },
+      }),
+    ).resolves.toBeUndefined();
+    expect(toastAttempts).toBe(1);
   });
 
   test("the doctrine sentence is the same on every host that can say it", async () => {
     const module = (await import(
       join(surfacesRoot, "opencode/plugin/brigadier.js")
-    )) as { buildHandoffMessage: (turns: unknown) => string };
+    )) as { buildHandoffMessage: (reason: unknown) => string };
     // The opencode plugin and the handoff.mjs hook must not say different
     // things: one doctrine, whatever the seam.
-    expect(module.buildHandoffMessage(3)).toBe(
-      "brigadier: this session is out of context after 3 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
+    expect(module.buildHandoffMessage("auto")).toBe(
+      "brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review.",
     );
   });
 });
