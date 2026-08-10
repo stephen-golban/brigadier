@@ -72,8 +72,19 @@ export interface CommitResult {
 export interface MergeSpec {
   readonly worktree: CreatedWorktree;
   readonly message?: string;
+  /**
+   * Defaults to true. Set false while reconciling an execution wave: the merge
+   * advances the session's scratch base, so worktrees created for later waves
+   * start from the accumulated result, without materializing the
+   * prefix-conflicting integration branch yet.
+   */
+  readonly finalize?: boolean;
 }
 
+/**
+ * `integrationBranch` always names the eventual final branch. A scratch merge
+ * (`finalize: false`) returns that name before the ref itself is materialized.
+ */
 export type MergeResult =
   | {
       readonly status: "merged";
@@ -87,15 +98,15 @@ export type MergeResult =
     }
   | {
       /**
-       * Provided nothing outside the engine writes into the
-       * `brigadier/<slug>/**` ref namespace while a run is live, a conflict is
-       * only reachable after an earlier merge materialized the integration
-       * branch: on the first merge its head is `baseCommit`, and every slice
-       * head descends from that commit. This invariant is not enforced;
-       * `commit()` reads the slice ref's current head without verifying it
-       * against the recorded head, so an external ref move can make the first
-       * merge conflict. A conflict leaves the existing integration ref
-       * unchanged and retires no ref.
+       * Before any scratch merge, a first merge cannot conflict provided
+       * nothing outside the engine writes into its ref namespace: both heads
+       * descend from `baseCommit`. After a `finalize: false` merge advances the
+       * scratch base, another slice from the same wave may genuinely conflict
+       * with it. The initial-merge property remains conditional rather than
+       * enforced: `commit()` reads the slice ref's current head without
+       * comparing it to the recorded head, so an external ref move can put the
+       * slice commit on a foreign parent. A conflict leaves the prospective
+       * head and every ref unchanged.
        */
       readonly status: "conflicted";
       readonly integrationBranch: string;
@@ -120,6 +131,11 @@ export interface WorktreeEngine {
   prepare(spec: WorktreeSessionSpec): Promise<WorktreeSession>;
   create(spec: WorktreeSpec): Promise<CreatedWorktree>;
   commit(spec: CommitSpec): Promise<CommitResult>;
+  /**
+   * With `finalize: false`, advances the scratch base used by subsequent
+   * `create()` calls. The default materializes and advances the final
+   * integration branch, after which no more slice worktrees may commit.
+   */
   merge(spec: MergeSpec): Promise<MergeResult>;
   redact(worktree: CreatedWorktree, artifact: string): string;
   remove(worktree: CreatedWorktree): Promise<void>;

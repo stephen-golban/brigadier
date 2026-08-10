@@ -744,6 +744,241 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
+    "branches a later wave from accumulated earlier-wave content and releases every scratch ref",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = await gitBuffer(fixture.repository, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        expect(
+          await gitBuffer(fixture.repository, ["symbolic-ref", "HEAD"]),
+        ).toEqual(Buffer.from("refs/heads/main\n"));
+        expect(
+          await gitBuffer(fixture.repository, [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]),
+        ).toEqual(
+          Buffer.from(
+            " M tracked.txt\n" +
+              `?? artifact-${SECRET}.txt\n` +
+              "?? base-leak.txt\n" +
+              "?? untracked.txt\n",
+          ),
+        );
+
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "two-waves",
+        );
+        const producer = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(producer.path, "helper.ts"),
+          'export const helper = "wave-one-output";\n',
+        );
+        await fixture.engine.commit({
+          worktree: producer,
+          message: "produce helper",
+        });
+        const accumulated = await fixture.engine.merge({
+          worktree: producer,
+          message: "accumulate wave 1",
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected wave 1 to accumulate cleanly");
+        }
+
+        const consumer = await createWorktree(fixture, session, 2);
+        const helperBytes = await readFile(join(consumer.path, "helper.ts"));
+        expect(helperBytes).toEqual(
+          Buffer.from('export const helper = "wave-one-output";\n'),
+        );
+        expect(await gitBuffer(consumer.path, ["rev-parse", "HEAD"])).toEqual(
+          Buffer.from(`${accumulated.commit}\n`),
+        );
+
+        await fixture.engine.remove(producer);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(producer), 1);
+        await fixture.engine.remove(consumer);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(consumer), 1);
+        await fixture.engine.release(session);
+        expect(
+          await gitText(fixture.repository, [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/brigadier/",
+          ]),
+        ).toBe("");
+        expect(
+          await gitBuffer(fixture.repository, ["branch", "--show-current"]),
+        ).toEqual(Buffer.from("main\n"));
+        expect(
+          await gitBuffer(fixture.repository, ["symbolic-ref", "HEAD"]),
+        ).toEqual(Buffer.from("refs/heads/main\n"));
+        expect(
+          await gitBuffer(fixture.repository, ["rev-parse", "HEAD"]),
+        ).toEqual(originalHead);
+        expect(await readFile(join(fixture.repository, "tracked.txt"))).toEqual(
+          Buffer.from("tracked in progress\n"),
+        );
+        expect(
+          await readFile(join(fixture.repository, "untracked.txt")),
+        ).toEqual(Buffer.from("untracked in progress\n"));
+        expect(
+          await gitBuffer(fixture.repository, [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]),
+        ).toEqual(
+          Buffer.from(
+            " M tracked.txt\n" +
+              `?? artifact-${SECRET}.txt\n` +
+              "?? base-leak.txt\n" +
+              "?? untracked.txt\n",
+          ),
+        );
+
+        console.log(
+          `two-wave proof: wave 2 helper.ts bytes = ${JSON.stringify(helperBytes.toString("utf8"))}`,
+        );
+        console.log(
+          'two-wave proof: user HEAD = "refs/heads/main\\n"; source tracked.txt bytes = "tracked in progress\\n"; refs/heads/brigadier/** after release = ""',
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "materializes the accumulated head before final reconciliation",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "finalize-waves",
+        );
+        const producer = await createWorktree(fixture, session, 1);
+        await writeFile(join(producer.path, "helper.ts"), "wave 1 helper\n");
+        await fixture.engine.commit({
+          worktree: producer,
+          message: "produce wave 1 helper",
+        });
+        const accumulated = await fixture.engine.merge({
+          worktree: producer,
+          message: "accumulate wave 1",
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected wave 1 to accumulate cleanly");
+        }
+
+        const consumer = await createWorktree(fixture, session, 2);
+        await writeFile(
+          join(consumer.path, "consumer.ts"),
+          "wave 2 consumer\n",
+        );
+        const consumerCommit = await fixture.engine.commit({
+          worktree: consumer,
+          message: "consume wave 1 helper",
+        });
+
+        const producerFinal = await fixture.engine.merge({
+          worktree: producer,
+        });
+        expect(producerFinal).toEqual({
+          status: "already-integrated",
+          commit: accumulated.commit,
+          integrationBranch: "brigadier/finalize-waves",
+        });
+        const consumerFinal = await fixture.engine.merge({
+          worktree: consumer,
+        });
+        expect(consumerFinal.status).toBe("merged");
+        if (consumerFinal.status !== "merged") {
+          throw new Error("expected wave 2 to merge cleanly");
+        }
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "brigadier/finalize-waves:helper.ts",
+          ]),
+        ).toBe("wave 1 helper\n");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "brigadier/finalize-waves:consumer.ts",
+          ]),
+        ).toBe("wave 2 consumer\n");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "-s",
+            "--format=%P",
+            consumerFinal.commit,
+          ]),
+        ).toBe(`${accumulated.commit} ${consumerCommit.commit}\n`);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "leaves the accumulated base unchanged after a scratch merge conflict",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "wave-conflict",
+        );
+        const accepted = await createWorktree(fixture, session, 1);
+        const rejected = await createWorktree(fixture, session, 2);
+        await writeFile(join(accepted.path, "tracked.txt"), "accepted wave\n");
+        await writeFile(join(rejected.path, "tracked.txt"), "rejected wave\n");
+        await fixture.engine.commit({
+          worktree: accepted,
+          message: "accepted slice",
+        });
+        await fixture.engine.commit({
+          worktree: rejected,
+          message: "conflicting slice",
+        });
+
+        const accumulated = await fixture.engine.merge({
+          worktree: accepted,
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected the first scratch merge to succeed");
+        }
+        const conflict = await fixture.engine.merge({
+          worktree: rejected,
+          finalize: false,
+        });
+        expect(conflict.status).toBe("conflicted");
+        expect(
+          await gitText(fixture.repository, ["rev-parse", session.baseBranch]),
+        ).toBe(`${accumulated.commit}\n`);
+
+        const laterWave = await createWorktree(fixture, session, 3);
+        expect(
+          await readFile(join(laterWave.path, "tracked.txt"), "utf8"),
+        ).toBe("accepted wave\n");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     "reports merge conflicts and leaves the integration branch unchanged",
     async () => {
       await withFixture(async (fixture) => {
