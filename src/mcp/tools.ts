@@ -18,6 +18,7 @@
  * spawn `claude` is ever replaced.
  */
 
+import { isAbsolute } from "node:path";
 import type { BrigadierConfig } from "../config/contracts.js";
 import { validatePlan } from "../plan/validate.js";
 import type { RoutedWorker, RoutingDecision } from "../routing/contracts.js";
@@ -142,7 +143,7 @@ export function createTools(
           repositoryPath: {
             type: "string",
             description:
-              "Non-empty string naming the git repository to run in.",
+              "Absolute path to the git repository to run in. Must be absolute: this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. A leading ~ is not expanded.",
           },
           slug: {
             type: "string",
@@ -315,6 +316,10 @@ async function runTool(
       isError: true,
     };
   }
+  const notAbsolute = refuseRelativeRepositoryPath(repositoryPath);
+  if (notAbsolute !== null) {
+    return notAbsolute;
+  }
 
   const slug = resolveSlug(record.slug, document.plan.id);
   if (slug === null) {
@@ -340,6 +345,47 @@ async function runTool(
     dryRun: record.dryRun === true,
     unsafeInPlace: record.unsafeInPlace === true,
   });
+}
+
+/**
+ * A RELATIVE `repositoryPath` IS REFUSED, NEVER RESOLVED.
+ *
+ * An MCP client — Claude Desktop above all — gives nobody any control over this
+ * server process's working directory: it is whatever the client's launcher
+ * happened to inherit. A relative path would therefore resolve against a
+ * directory the caller cannot see, name, or predict, and the failure that
+ * produces is the worst one this tool has — running a plan, spawning workers,
+ * and writing commits into the WRONG repository, silently. An absolute path is
+ * the only thing an MCP client can state unambiguously, so it is the only thing
+ * accepted.
+ *
+ * TWO MESSAGES, NOT ONE. The empty/non-string refusal above stays exactly as it
+ * was and this is a separate one, because they are separate mistakes with
+ * separate repairs: the first caller forgot the argument, the second wrote a
+ * path that looks fine and would have run somewhere else. Folding them into one
+ * string would make each half wrong for the caller who hit the other.
+ *
+ * `isAbsolute` is the whole test, and it is deliberately the whole test. A
+ * trailing slash (`/repo/`) and an interior `..` (`/repo/../other`) are both
+ * absolute and both accepted here; the worktree engine already resolves and
+ * realpaths what it is given and refuses anything that is not a repository
+ * root. `~/repo` is NOT absolute — nothing expands tilde in this process, since
+ * no shell is involved — so it is refused, with the reason spelled out, because
+ * a caller who typed `~` believes it means their home directory.
+ *
+ * Returns the refusal, or `null` when the path is absolute.
+ */
+function refuseRelativeRepositoryPath(value: string): ToolResult | null {
+  if (isAbsolute(value)) {
+    return null;
+  }
+  const tilde = value.startsWith("~")
+    ? " A leading ~ is not expanded here, because no shell is involved; spell the home directory out in full."
+    : "";
+  return {
+    text: `repositoryPath must be an absolute path, because this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. Received ${JSON.stringify(value)}.${tilde}`,
+    isError: true,
+  };
 }
 
 /**

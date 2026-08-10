@@ -504,7 +504,7 @@ describe("the MCP server over stdio", () => {
           repositoryPath: {
             type: "string",
             description:
-              "Non-empty string naming the git repository to run in.",
+              "Absolute path to the git repository to run in. Must be absolute: this server's working directory is not the client's, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. A leading ~ is not expanded.",
           },
           slug: {
             type: "string",
