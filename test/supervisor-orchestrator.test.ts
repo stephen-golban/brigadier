@@ -33,9 +33,11 @@ import type { BrigadierConfig } from "../src/config/contracts.js";
 import { CONFIG_VERSION, parseConfig } from "../src/config/contracts.js";
 import type {
   Capability,
+  LaunchedWorkerOutcome,
   QuotaSnapshot,
   Slice,
   Vendor,
+  Worker,
 } from "../src/contracts.js";
 import type { AnyQuotaOracle } from "../src/quota/contracts.js";
 import type { SliceDifficulty } from "../src/routing/contracts.js";
@@ -55,6 +57,7 @@ import {
   createRunner,
   runBounded,
 } from "../src/supervisor/orchestrator.js";
+import { createSliceRunner } from "../src/supervisor/slice.js";
 import type {
   CommitResult,
   CommitSpec,
@@ -66,6 +69,7 @@ import type {
   WorktreeSessionSpec,
   WorktreeSpec,
 } from "../src/worktree/contracts.js";
+import { GitWorktreeEngine } from "../src/worktree/engine.js";
 
 /* ------------------------------ the bound -------------------------------- */
 
@@ -179,6 +183,8 @@ interface FakeEngine {
   readonly engine: WorktreeEngine;
   /** Every port call in the order it happened. */
   readonly ops: readonly string[];
+  /** Every session policy handed to prepare, retained byte-for-byte. */
+  readonly preparations: readonly WorktreeSessionSpec[];
 }
 
 interface FakeEngineOptions {
@@ -203,8 +209,10 @@ interface FakeEngineOptions {
 
 function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
   const ops: string[] = [];
+  const preparations: WorktreeSessionSpec[] = [];
   const engine: WorktreeEngine = {
     prepare: async (spec: WorktreeSessionSpec): Promise<WorktreeSession> => {
+      preparations.push(spec);
       ops.push(
         `prepare ${spec.repositoryPath} ${spec.slug} consent=${String(spec.secrets.consentToLink)} linked=${spec.secrets.linkedPaths.length}`,
       );
@@ -223,7 +231,9 @@ function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
       throw new Error("the orchestrator must not call commit");
     },
     merge: async (spec: MergeSpec): Promise<MergeResult> => {
-      ops.push(`merge ${spec.worktree.branch}`);
+      ops.push(
+        `merge ${spec.worktree.branch}${spec.finalize === false ? " finalize=false" : ""}`,
+      );
       if (options.mergeThrows?.includes(spec.worktree.branch) === true) {
         throw new Error(`merge exploded for ${spec.worktree.branch}`);
       }
@@ -255,7 +265,7 @@ function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
       }
     },
   };
-  return { engine, ops };
+  return { engine, ops, preparations };
 }
 
 /** An engine on which every call is a test failure waiting to be asserted. */
@@ -274,7 +284,7 @@ function forbiddenEngine(): FakeEngine {
     remove: refuse("remove"),
     release: refuse("release"),
   };
-  return { engine, ops };
+  return { engine, ops, preparations: [] };
 }
 
 /* ------------------------------- fake ports ------------------------------ */
@@ -589,10 +599,9 @@ describe("plan validation", () => {
     expect(harness.report.planIssues.map((issue) => issue.code)).toEqual([
       "PATH_CONFLICT",
       "UNKNOWN_DEPENDENCY",
-      "DEPENDENCIES_UNSUPPORTED",
     ]);
     expect(harness.report.failure?.message).toBe(
-      "plan plan-1 cannot be scheduled: PATH_CONFLICT, UNKNOWN_DEPENDENCY, DEPENDENCIES_UNSUPPORTED",
+      "plan plan-1 cannot be scheduled: PATH_CONFLICT, UNKNOWN_DEPENDENCY",
     );
   });
 });
@@ -889,18 +898,37 @@ describe("session preparation", () => {
     );
   });
 
-  test("the secrets policy comes from the config's consent flag", async () => {
+  test("secret paths are inventoried for redaction even without link consent", async () => {
+    const config = parseConfig({
+      version: CONFIG_VERSION,
+      secretsConsent: false,
+      linkedSecretPaths: [".env", "secrets/runtime.env"],
+      allowDegradedRouting: false,
+      vendors: [
+        {
+          vendor: "claude",
+          executable: "/usr/local/bin/claude",
+          version: "1.0.0",
+          defaultModel: "claude-sonnet-5",
+          models: [{ id: "claude-sonnet-5", effortCeiling: "high" }],
+        },
+      ],
+    });
     const engine = fakeEngine({ prepareError: "stop here" });
     await execute(
       runRequest(planDocument([slice("a")]), 2),
       engine,
       fakeRunner(),
-      makeConfig(["claude-sonnet-5"]),
-      buildCapabilities(makeConfig(["claude-sonnet-5"])),
+      config,
+      buildCapabilities(config),
     );
     expect(engine.ops).toEqual([
-      "prepare /repo/demo demo consent=true linked=0",
+      "prepare /repo/demo demo consent=false linked=2",
     ]);
+    expect(engine.preparations[0]?.secrets).toEqual({
+      linkedPaths: [".env", "secrets/runtime.env"],
+      consentToLink: false,
+    });
   });
 });
 
@@ -1017,7 +1045,7 @@ describe("bounded concurrency", () => {
     ]);
   });
 
-  test("the orchestrator refuses later waves before touching a port", async () => {
+  test("the orchestrator accumulates prerequisites before starting dependents", async () => {
     const slices = [
       slice("a"),
       slice("b"),
@@ -1027,26 +1055,72 @@ describe("bounded concurrency", () => {
     const runner = fakeRunner({ hops: { a: 6, b: 1, c: 1, d: 1 } });
     const harness = await execute(
       runRequest(planDocument(slices), 2),
-      forbiddenEngine(),
+      fakeEngine(),
       runner,
     );
-    expect(harness.report.ok).toBe(false);
-    expect(harness.report.failure).toEqual({
-      reason: "PLAN_INVALID",
-      message:
-        "plan plan-1 cannot be scheduled: DEPENDENCIES_UNSUPPORTED, DEPENDENCIES_UNSUPPORTED",
-    });
-    expect(harness.report.planIssues.map((issue) => issue.sliceIds)).toEqual([
-      ["c"],
-      ["d"],
+    expect(harness.report.ok).toBe(true);
+    expect(harness.report.failure).toBeNull();
+    expect(harness.report.planIssues).toEqual([]);
+    expect(harness.runner.maxLive()).toBe(2);
+    expect(harness.runner.completions().slice(0, 2).sort()).toEqual(["a", "b"]);
+    expect(harness.runner.inputs().map((input) => input.slice.id)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
     ]);
-    expect(harness.runner.maxLive()).toBe(0);
-    expect(harness.runner.completions()).toEqual([]);
-    expect(harness.ops).toEqual([]);
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "merge brigadier/demo/slice-1 finalize=false",
+      "merge brigadier/demo/slice-3 finalize=false",
+      "merge brigadier/demo/slice-1",
+      "merge brigadier/demo/slice-3",
+      "merge brigadier/demo/slice-5",
+      "merge brigadier/demo/slice-7",
+      "remove brigadier/demo/slice-1",
+      "remove brigadier/demo/slice-3",
+      "remove brigadier/demo/slice-5",
+      "remove brigadier/demo/slice-7",
+      "release demo",
+    ]);
   });
 });
 
 describe("wave failure", () => {
+  test("a failed prerequisite prevents every later wave from starting", async () => {
+    const slices = [
+      slice("producer"),
+      slice("consumer", ["producer"]),
+      slice("after-consumer", ["consumer"]),
+    ];
+    const runner = fakeRunner({ failing: ["producer"] });
+    const harness = await execute(
+      runRequest(planDocument(slices), 2),
+      fakeEngine(),
+      runner,
+    );
+
+    expect(harness.runner.inputs().map((input) => input.slice.id)).toEqual([
+      "producer",
+    ]);
+    expect(harness.report.slices.map((result) => result.sliceId)).toEqual([
+      "producer",
+      "consumer",
+      "after-consumer",
+    ]);
+    expect(harness.report.slices[1]?.attempts).toEqual([]);
+    expect(harness.report.slices[1]?.cancelled).toBeUndefined();
+    expect(harness.report.slices[2]?.attempts).toEqual([]);
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message:
+        "3 slice(s) did not complete: producer, consumer, after-consumer",
+    });
+    expect(harness.log).toContain(
+      "wave stopped: skipping 2 slice(s) consumer, after-consumer",
+    );
+  });
+
   test("a failed slice does not stop later items in its independent wave", async () => {
     const slices = [slice("a"), slice("b"), slice("c")];
     const runner = fakeRunner({ failing: ["a"] });
@@ -1152,6 +1226,43 @@ describe("wave failure", () => {
 });
 
 describe("reconciliation", () => {
+  test("a scratch conflict prevents the next wave but keeps reconciling its independent siblings", async () => {
+    const slices = [slice("a"), slice("b"), slice("consumer", ["a"])];
+    const engine = fakeEngine({
+      conflictBranches: ["brigadier/demo/slice-1"],
+    });
+    const harness = await execute(
+      runRequest(planDocument(slices), 2),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.runner.inputs().map((input) => input.slice.id)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message: "1 slice(s) did not complete: consumer",
+    });
+    expect(harness.report.merges.map((record) => record.result.status)).toEqual(
+      ["conflicted", "merged"],
+    );
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "merge brigadier/demo/slice-1 finalize=false",
+      "merge brigadier/demo/slice-3 finalize=false",
+      "merge brigadier/demo/slice-1",
+      "merge brigadier/demo/slice-3",
+      "remove brigadier/demo/slice-1",
+      "remove brigadier/demo/slice-3",
+      "release demo",
+    ]);
+    expect(harness.log).toContain("accumulate a: conflicted");
+    expect(harness.log).toContain("accumulate b: merged");
+    expect(harness.log).toContain("wave stopped: skipping 1 slice(s) consumer");
+  });
+
   test("merges in sliceNumber order, not completion order and not wave order", async () => {
     // Plan order c, a, b gives sliceNumbers c=1, a=3, b=5. The wave arrives
     // dependency-sorted as a, b, c, and the hop counts make them COMPLETE as
@@ -1637,11 +1748,9 @@ describe("cancellation", () => {
   });
 
   /**
-   * A later wave cannot currently exist: `validatePlan` refuses any slice
-   * declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every schedulable
-   * plan is exactly one wave. The wave-level guard is still reachable when an
-   * abort lands during `prepare`; the test below proves that first wave never
-   * starts. The per-slice guard above covers an abort after a wave has started.
+   * The wave-level guard is reachable before wave one when an abort lands
+   * during `prepare`; the test below proves that first wave never starts. The
+   * per-slice guard above covers an abort after a wave has started.
    */
 
   test("an abort during prepare starts no slice and reports every slice cancelled", async () => {
@@ -1960,6 +2069,266 @@ afterAll(async () => {
   for (const directory of scaffoldTemporaries) {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+async function realGit(
+  cwd: string,
+  args: readonly string[],
+  env?: Readonly<Record<string, string>>,
+): Promise<string> {
+  const child = Bun.spawn(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(
+      `git ${args.join(" ")} exited ${exitCode}: ${stderr.trim()}`,
+    );
+  }
+  return stdout;
+}
+
+function repositorySubprocessWorker(): Worker<"codex"> {
+  return {
+    vendor: "codex",
+    processCompletion: "self-exits",
+    spawn: async (spec) => {
+      const script =
+        spec.id === "producer"
+          ? `printf '%s' 'export const helper = "producer-output";\n' > helper.ts`
+          : spec.id === "consumer"
+            ? `[ ! -e .env ] && /bin/cp helper.ts consumer-observed.txt && /bin/cat helper.ts`
+            : `exit 97`;
+      const child = Bun.spawn(["/bin/sh", "-c", script], {
+        cwd: spec.cwd,
+        env: spec.environment,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const completion: Promise<LaunchedWorkerOutcome> = (async () => {
+        const [output, stderr, exitCode] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        const common = {
+          output,
+          usage: {
+            input: { total: 0, uncached: 0, cacheRead: 0, cacheWrite: 0 },
+            output: { total: 0, reasoning: null },
+          },
+          durationMs: 0,
+          exitCode,
+          signal: null,
+        } as const;
+        return exitCode === 0
+          ? { ...common, ok: true as const }
+          : {
+              ...common,
+              ok: false as const,
+              failure: {
+                kind: "UNKNOWN_FAILURE" as const,
+                message: `repository test worker exited ${exitCode}: ${stderr.trim()}`,
+                retryable: false,
+                statusCode: null,
+              },
+            };
+      })();
+      return {
+        pid: child.pid,
+        events: (async function* () {})(),
+        completion,
+        cancel: async () => {
+          child.kill("SIGTERM");
+          await completion;
+        },
+      };
+    },
+  };
+}
+
+describe("real repository dependency and redaction proof", () => {
+  test("a dependent worktree receives exact producer bytes and persisted commit text is redacted", async () => {
+    const root = await mkdtemp(
+      join(import.meta.dir, ".supervisor-orchestrator-proof-"),
+    );
+    scaffoldTemporaries.push(root);
+    const repositoryPath = join(root, "repository");
+    await mkdir(repositoryPath, { recursive: true });
+    await realGit(repositoryPath, [
+      "init",
+      "--quiet",
+      "--initial-branch=main",
+      "--object-format=sha1",
+    ]);
+    await realGit(repositoryPath, ["config", "user.name", "Brigadier Test"]);
+    await realGit(repositoryPath, [
+      "config",
+      "user.email",
+      "brigadier@example.invalid",
+    ]);
+    await writeFile(join(repositoryPath, ".gitignore"), ".env\n");
+    await writeFile(join(repositoryPath, "tracked.txt"), "tracked at head\n");
+    await realGit(repositoryPath, ["add", ".gitignore", "tracked.txt"]);
+    await realGit(repositoryPath, ["commit", "--quiet", "-m", "initial"], {
+      GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+      GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+    });
+
+    const secret = "orchestrator-secret-value-9f41";
+    await writeFile(join(repositoryPath, ".env"), `API_TOKEN=${secret}\n`);
+    await writeFile(
+      join(repositoryPath, "tracked.txt"),
+      "user working tree bytes\n",
+    );
+    await writeFile(
+      join(repositoryPath, "user-note.txt"),
+      "user untracked bytes\n",
+    );
+
+    const config = parseConfig({
+      version: CONFIG_VERSION,
+      secretsConsent: false,
+      linkedSecretPaths: [".env"],
+      allowDegradedRouting: false,
+      vendors: [
+        {
+          vendor: "codex",
+          executable: "/usr/local/bin/codex",
+          version: "1.0.0",
+          defaultModel: "gpt-5.6-sol",
+          models: [{ id: "gpt-5.6-sol", effortCeiling: "high" }],
+        },
+      ],
+    });
+    const engine = new GitWorktreeEngine({ commandTimeoutMs: 5000 });
+    const producer: Slice = {
+      ...slice("producer"),
+      title: `Produce ${secret}`,
+      ownedPaths: ["helper.ts"],
+    };
+    const consumer: Slice = {
+      ...slice("consumer", ["producer"]),
+      ownedPaths: ["consumer-observed.txt"],
+    };
+    const worker = repositorySubprocessWorker();
+    const ports: SupervisorPorts = {
+      engine,
+      workerFor: (vendor) => (vendor === "codex" ? worker : null),
+      oracles: [],
+      now: () => NOW,
+      log: () => undefined,
+    };
+    const report = await withinBound(
+      createRunner({
+        ports,
+        config,
+        capabilities: buildCapabilities(config),
+        sliceRunner: createSliceRunner({
+          ports,
+          env: {
+            HOME: root,
+            PATH: "/usr/bin:/bin",
+            USER: "brigadier-test",
+          },
+        }),
+      }).run({
+        document: planDocument([producer, consumer]),
+        repositoryPath,
+        slug: "real-waves",
+        maxWorkers: 2,
+      }),
+      15_000,
+    );
+
+    expect(report.ok).toBe(true);
+    expect(report.failure).toBeNull();
+    expect(report.slices.map((result) => result.sliceId)).toEqual([
+      "producer",
+      "consumer",
+    ]);
+    expect(report.merges.map((record) => record.result.status)).toEqual([
+      "already-integrated",
+      "merged",
+    ]);
+    expect(report.slices[1]?.attempts[0]?.outcome?.output).toBe(
+      'export const helper = "producer-output";\n',
+    );
+    expect(
+      await realGit(repositoryPath, [
+        "show",
+        "brigadier/real-waves:consumer-observed.txt",
+      ]),
+    ).toBe('export const helper = "producer-output";\n');
+
+    expect(await realGit(repositoryPath, ["branch", "--show-current"])).toBe(
+      "main\n",
+    );
+    expect(await realGit(repositoryPath, ["symbolic-ref", "HEAD"])).toBe(
+      "refs/heads/main\n",
+    );
+    expect(await realGit(repositoryPath, ["rev-parse", "HEAD"])).toBe(
+      "9aaf3dddc8685e6c14789c60b5557dfca1df7442\n",
+    );
+    expect(
+      await realGit(repositoryPath, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]),
+    ).toBe(" M tracked.txt\n?? user-note.txt\n");
+    expect(await readFile(join(repositoryPath, "tracked.txt"), "utf8")).toBe(
+      "user working tree bytes\n",
+    );
+    expect(await readFile(join(repositoryPath, "user-note.txt"), "utf8")).toBe(
+      "user untracked bytes\n",
+    );
+
+    expect(
+      await realGit(repositoryPath, [
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/brigadier/real-waves/",
+      ]),
+    ).toBe("");
+    expect(
+      await realGit(repositoryPath, [
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/brigadier/",
+      ]),
+    ).toBe("refs/heads/brigadier/real-waves\n");
+
+    const producerCommit = report.slices[0]?.commit;
+    if (producerCommit === null || producerCommit === undefined) {
+      throw new Error("producer commit was not reported");
+    }
+    const persistedSubject = await realGit(repositoryPath, [
+      "show",
+      "-s",
+      "--format=%s",
+      producerCommit,
+    ]);
+    expect(persistedSubject).toBe("producer: Produce [REDACTED]\n");
+    expect(persistedSubject.includes(secret)).toBe(false);
+
+    console.log(
+      `real orchestrator dependency proof: consumer helper.ts bytes = ${JSON.stringify(report.slices[1]?.attempts[0]?.outcome?.output)}`,
+    );
+    console.log(
+      `real orchestrator redaction proof: producer commit subject = ${JSON.stringify(persistedSubject)}; exact secret absent = ${String(!persistedSubject.includes(secret))}`,
+    );
+    console.log(
+      'real orchestrator checkout proof: branch = "main\\n"; HEAD = "9aaf3dddc8685e6c14789c60b5557dfca1df7442\\n"; status = " M tracked.txt\\n?? user-note.txt\\n"; internal refs = ""; integration ref = "refs/heads/brigadier/real-waves\\n"',
+    );
+  }, 20_000);
 });
 
 interface Scaffold {
