@@ -303,7 +303,7 @@ const HOST_PLANS: readonly HostPlan[] = [
     ],
     notes: () => [
       `opencode reads ~/.claude/skills and ~/.agents/skills natively, so \`brigadier install claude-code\` or \`brigadier install codex\` already gave it the doctrine. This plugin adds the one thing a skill cannot be: the handoff hook.`,
-      `The plugin reacts to the bus events named in HANDOFF_EVENT_TYPES. Those names were NOT verified against a running opencode; if the hook never fires, that array is the one line to change.`,
+      `HANDOFF_EVENT_TYPES was verified on 2026-08-10 against a running opencode 1.18.16 darwin-arm64 by fetching GET /doc and enumerating its OpenAPI event union. No live compaction was triggered, only 1.18.16 was tested, and the event vocabulary is version-dependent; if a future build renames either event, that array remains the one line to change.`,
     ],
   },
   {
