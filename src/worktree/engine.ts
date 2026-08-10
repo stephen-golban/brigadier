@@ -65,6 +65,7 @@ interface SessionState {
   redactionValues: readonly string[];
   readonly sliceHeads: Map<string, string>;
   readonly activeWorktrees: Set<CreatedWorktree>;
+  accumulatedHead: string;
   integrationMaterialized: boolean;
   refsReleased: boolean;
 }
@@ -232,6 +233,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       redactionValues,
       sliceHeads: new Map(),
       activeWorktrees: new Set(),
+      accumulatedHead: baseCommit,
       integrationMaterialized: false,
       refsReleased: false,
     });
@@ -265,14 +267,12 @@ export class GitWorktreeEngine implements WorktreeEngine {
       branch,
       sessionState.redactionValues,
     );
-    const zeroObjectId = "0".repeat(spec.session.baseCommit.length);
-    await this.#git(
-      ["update-ref", branchRef, spec.session.baseCommit, zeroObjectId],
-      {
-        cwd: spec.session.repositoryPath,
-        redactionValues: sessionState.redactionValues,
-      },
-    );
+    const sliceBase = sessionState.accumulatedHead;
+    const zeroObjectId = "0".repeat(sliceBase.length);
+    await this.#git(["update-ref", branchRef, sliceBase, zeroObjectId], {
+      cwd: spec.session.repositoryPath,
+      redactionValues: sessionState.redactionValues,
+    });
 
     try {
       if (!unsafeInPlace) {
@@ -309,7 +309,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       session: spec.session,
     }) satisfies CreatedWorktree;
     this.#worktrees.set(worktree, { sessionState });
-    sessionState.sliceHeads.set(branch, spec.session.baseCommit);
+    sessionState.sliceHeads.set(branch, sliceBase);
     sessionState.activeWorktrees.add(worktree);
     return worktree;
   }
@@ -399,28 +399,31 @@ export class GitWorktreeEngine implements WorktreeEngine {
     await this.#refreshRedactionValues(state.sessionState);
     const { session, redactionValues } = state.sessionState;
     const repositoryPath = session.repositoryPath;
-    const integrationRef = `refs/heads/${session.integrationBranch}`;
-    const integrationHead = await this.#materializeIntegrationBranch(
-      state.sessionState,
-    );
+    const finalize = spec.finalize !== false;
+    const prospectiveRef = finalize
+      ? `refs/heads/${session.integrationBranch}`
+      : `refs/heads/${session.baseBranch}`;
+    const prospectiveHead = finalize
+      ? await this.#materializeIntegrationBranch(state.sessionState)
+      : await this.#verifiedAccumulatedHead(state.sessionState);
     const sliceHead = state.sessionState.sliceHeads.get(spec.worktree.branch);
     if (sliceHead === undefined) {
       throw new Error(`missing recorded head for ${spec.worktree.branch}`);
     }
     const ancestor = await this.#git(
-      ["merge-base", "--is-ancestor", sliceHead, integrationHead],
+      ["merge-base", "--is-ancestor", sliceHead, prospectiveHead],
       { cwd: repositoryPath, redactionValues, allowedExitCodes: [0, 1] },
     );
     if (ancestor.exitCode === 0) {
       return {
         status: "already-integrated",
-        commit: integrationHead,
+        commit: prospectiveHead,
         integrationBranch: session.integrationBranch,
       };
     }
 
     const merge = await this.#git(
-      ["merge-tree", "--write-tree", integrationHead, sliceHead],
+      ["merge-tree", "--write-tree", prospectiveHead, sliceHead],
       { cwd: repositoryPath, redactionValues, allowedExitCodes: [0, 1] },
     );
     if (merge.exitCode === 1) {
@@ -447,14 +450,17 @@ export class GitWorktreeEngine implements WorktreeEngine {
     const commit = await this.#commitTree(
       repositoryPath,
       tree,
-      [integrationHead, sliceHead],
+      [prospectiveHead, sliceHead],
       message,
       redactionValues,
     );
-    await this.#git(["update-ref", integrationRef, commit, integrationHead], {
+    await this.#git(["update-ref", prospectiveRef, commit, prospectiveHead], {
       cwd: repositoryPath,
       redactionValues,
     });
+    if (!finalize) {
+      state.sessionState.accumulatedHead = commit;
+    }
     return {
       status: "merged",
       commit,
@@ -508,7 +514,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
     await this.#refreshRedactionValues(state);
     const expectedRefs = new Map<string, string>([
-      [`refs/heads/${session.baseBranch}`, session.baseCommit],
+      [`refs/heads/${session.baseBranch}`, state.accumulatedHead],
       ...[...state.sliceHeads].map(
         ([branch, head]) => [`refs/heads/${branch}`, head] as const,
       ),
@@ -602,16 +608,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
     }
 
     const baseRef = `refs/heads/${session.baseBranch}`;
-    const baseHead = await this.#revParse(
-      session.repositoryPath,
-      baseRef,
-      redactionValues,
-    );
-    if (baseHead !== session.baseCommit) {
-      throw new Error(
-        `scratch base branch ${session.baseBranch} moved unexpectedly`,
-      );
-    }
+    const baseHead = await this.#verifiedAccumulatedHead(state);
     for (const worktree of state.activeWorktrees) {
       if (!worktree.isolated) {
         continue;
@@ -625,7 +622,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       }
     }
 
-    const transaction = ["start", `delete ${baseRef} ${session.baseCommit}`];
+    const transaction = ["start", `delete ${baseRef} ${baseHead}`];
     for (const [branch, head] of state.sliceHeads) {
       transaction.push(`delete refs/heads/${branch} ${head}`);
     }
@@ -635,14 +632,14 @@ export class GitWorktreeEngine implements WorktreeEngine {
       input: transaction.join("\n"),
       redactionValues,
     });
-    const zeroObjectId = "0".repeat(session.baseCommit.length);
+    const zeroObjectId = "0".repeat(baseHead.length);
     try {
-      await this.#git(
-        ["update-ref", integrationRef, session.baseCommit, zeroObjectId],
-        { cwd: session.repositoryPath, redactionValues },
-      );
+      await this.#git(["update-ref", integrationRef, baseHead, zeroObjectId], {
+        cwd: session.repositoryPath,
+        redactionValues,
+      });
     } catch (error) {
-      const restore = ["start", `create ${baseRef} ${session.baseCommit}`];
+      const restore = ["start", `create ${baseRef} ${baseHead}`];
       for (const [branch, head] of state.sliceHeads) {
         restore.push(`create refs/heads/${branch} ${head}`);
       }
@@ -655,7 +652,22 @@ export class GitWorktreeEngine implements WorktreeEngine {
       throw error;
     }
     state.integrationMaterialized = true;
-    return session.baseCommit;
+    return baseHead;
+  }
+
+  async #verifiedAccumulatedHead(state: SessionState): Promise<string> {
+    const { session, redactionValues } = state;
+    const head = await this.#revParse(
+      session.repositoryPath,
+      `refs/heads/${session.baseBranch}`,
+      redactionValues,
+    );
+    if (head !== state.accumulatedHead) {
+      throw new Error(
+        `scratch base branch ${session.baseBranch} moved unexpectedly`,
+      );
+    }
+    return head;
   }
 
   async #changedPaths(
