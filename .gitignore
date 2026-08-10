@@ -1,4 +1,8 @@
-brigadier
+# The compiled executable, and ONLY it. Anchored with a leading slash because a
+# bare `brigadier` is a pattern that matches any path component of that name at
+# any depth — which silently ignored `surfaces/codex/skills/brigadier/`, a real
+# shipped asset, until `git status` was read carefully.
+/brigadier
 dist/
 *.js.map
 node_modules/
