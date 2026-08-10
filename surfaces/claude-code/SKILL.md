@@ -12,8 +12,12 @@ session is disposable and starts clean.
 
 ## What to do
 
-1. **Decompose.** Two slices are independent when no file is owned by both.
-   Partition by file ownership, not by topic.
+1. **Decompose.** Disjoint `ownedPaths` are necessary, but they do not by
+   themselves make slices independent. If one slice needs another's committed
+   output, declare that real dependency in `dependsOn`. Dependencies place work
+   in later serial waves; independent slices share a wave and can run
+   concurrently, up to `--max-workers`. Partition by file ownership, not by
+   topic.
 2. **Write a plan document** (JSON):
 
    ```json
@@ -71,7 +75,8 @@ it `brigadier run` exits 1 and tells you to run `init`.
 
 ## Exit codes worth branching on
 
-`0` succeeded · `1` never started (no config, bad plan file, missing HOME/PATH/USER)
-· `2` usage error · `3` the run started and did not succeed · `4` needs human input
-(the task was too ambiguous to plan; questions were printed and no run started) ·
-`130`/`143` interrupted.
+`0` succeeded · `1` setup or planning failed, or the runner threw before returning
+a report · `2` usage error · `3` a run report says the run failed, including
+schedulability or routing failures that created no worktree · `4` the planner needs
+human input (questions were printed; no slice worker, ref, or worktree was created)
+· `130`/`143` interrupted.

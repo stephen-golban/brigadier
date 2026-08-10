@@ -141,7 +141,8 @@ export function createTools(
           plan: PLAN_SCHEMA,
           repositoryPath: {
             type: "string",
-            description: "Absolute path to the git repository to run in.",
+            description:
+              "Non-empty string naming the git repository to run in.",
           },
           slug: {
             type: "string",

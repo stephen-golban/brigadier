@@ -17,12 +17,12 @@ reason Desktop is the one host where the tiny doctrine file is not the answer.
 
 ## The handoff hook does not exist here
 
-Design decision #10's transcript-watching handoff works on Claude Code, works on
-opencode, and is trust-gated on Codex. On Desktop it is **impossible**, not
-merely unimplemented: Desktop exposes no hook surface of any kind, and an MCP
-server is invoked by the model when the model chooses to invoke it — never by the
-transcript, and never at the moment the context fills. There is no workaround and
-none is offered.
+Design decision #10's transcript-watching handoff works on Claude Code, has
+unverified event names on opencode, and is trust-gated on Codex. On Desktop it is
+**impossible**, not merely unimplemented: Desktop exposes no hook surface of any
+kind, and an MCP server is invoked by the model when the model chooses to invoke
+it — never by the transcript, and never at the moment the context fills. There is
+no workaround and none is offered.
 
 ## Installing
 
@@ -33,11 +33,13 @@ explicit user action and brigadier does not forge those.
 
 To produce the installable `.mcpb`:
 
-1. `bun run build:mcp` — emits the server next to this manifest at
-   `server/brigadier-mcp.js`.
-2. Zip the staged directory with `manifest.json` at the archive root and rename
+1. `bun run build:mcp` — emits `dist/mcp/server.js`; it does not populate the
+   staged bundle.
+2. Copy that output into the staged directory as `server/brigadier-mcp.js`, the
+   path named by `manifest.json`.
+3. Zip the staged directory with `manifest.json` at the archive root and rename
    it `brigadier.mcpb`.
-3. Open it with Claude Desktop, or drop it into Desktop's extensions pane.
+4. Open it with Claude Desktop, or drop it into Desktop's extensions pane.
 
 The server is zero-dependency: it speaks JSON-RPC 2.0 over stdio against the MCP
 spec directly, with no SDK. There is nothing to `npm install` inside the bundle.

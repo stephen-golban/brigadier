@@ -55,8 +55,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
-    bytes: 3648,
+    sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
+    bytes: 3993,
   },
   "claude-code/hooks/README.md": {
     sha256: "db99e47da941e8e4a6f33e7f85222b83703be4929cb199c1ac3417184e923b25",
@@ -71,16 +71,16 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 236,
   },
   "claude-desktop/README.md": {
-    sha256: "e429ca8a5cbba12f82bf63e7a2de20a413fb2a7cc573269219b8a9f9be5fa741",
-    bytes: 2718,
+    sha256: "d58ff809ee708670a93b7a7e7eea694d66801878ecab2556aca494e0acf61d54",
+    bytes: 2852,
   },
   "claude-desktop/manifest.json": {
     sha256: "3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f",
     bytes: 1597,
   },
   "codex/AGENTS.md": {
-    sha256: "feeb444d4a86eb128c6826caa228b996b59913e2459e3cc90a38fa5fc9ddbe85",
-    bytes: 2869,
+    sha256: "eb9d52fe05e048b5d2a9124604b014959f4d8078aed501fc02c56fa841999a91",
+    bytes: 3127,
   },
   "codex/hooks/README.md": {
     sha256: "64cdc2af24479711b36664d89e6646e8a2b95e0d192672164ebf95d84d33a88d",
@@ -91,8 +91,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 4570,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
-    bytes: 3648,
+    sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
+    bytes: 3993,
   },
   "opencode/README.md": {
     sha256: "b86a7ca88693a91bf255cc392d2399a29422313636f3197bf7b11a3d6a42e9ae",
@@ -352,6 +352,9 @@ describe("the surface templates", () => {
     const codexAgents = SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "";
 
     for (const doctrine of [claude, codexSkill]) {
+      expect(textBetween(doctrine, "1. **Decompose.**", "\n2. **Write")).toBe(
+        "1. **Decompose.** Disjoint `ownedPaths` are necessary, but they do not by\n   themselves make slices independent. If one slice needs another's committed\n   output, declare that real dependency in `dependsOn`. Dependencies place work\n   in later serial waves; independent slices share a wave and can run\n   concurrently, up to `--max-workers`. Partition by file ownership, not by\n   topic.",
+      );
       expect(
         textBetween(
           doctrine,
@@ -366,11 +369,22 @@ describe("the surface templates", () => {
       ).toBe(
         '- Do not invent commands. brigadier has exactly four: `init`, `run`,\n  `install`, and `mcp`. `brigadier run "<task description>"` asks a model to\n  decompose the task, then sends the result through the same validator used for\n  `--plan`. On genuine ambiguity it exits 4 with `status: "needs_human"` and\n  structured questions; no worktree is created and no slice worker is spawned.',
       );
-      expect(paragraphContaining(doctrine, "`4` needs human input")).toBe(
-        "`0` succeeded · `1` never started (no config, bad plan file, missing HOME/PATH/USER)\n· `2` usage error · `3` the run started and did not succeed · `4` needs human input\n(the task was too ambiguous to plan; questions were printed and no run started) ·\n`130`/`143` interrupted.\n",
+      expect(
+        paragraphContaining(doctrine, "`1` setup or planning failed"),
+      ).toBe(
+        "`0` succeeded · `1` setup or planning failed, or the runner threw before returning\na report · `2` usage error · `3` a run report says the run failed, including\nschedulability or routing failures that created no worktree · `4` the planner needs\nhuman input (questions were printed; no slice worker, ref, or worktree was created)\n· `130`/`143` interrupted.\n",
       );
     }
 
+    expect(
+      textBetween(
+        codexAgents,
+        "1. **Decompose by file ownership.**",
+        "\n2. **Write",
+      ),
+    ).toBe(
+      "1. **Decompose by file ownership.** Disjoint `ownedPaths` are necessary, but do\n   not by themselves make slices independent. If one slice needs another's\n   committed output, declare that real dependency in `dependsOn`. Dependencies\n   place work in later serial waves; independent slices share a wave and can run\n   concurrently, up to `--max-workers`.",
+    );
     expect(
       textBetween(
         codexAgents,
@@ -421,6 +435,22 @@ describe("the surface templates", () => {
     const opencode = SURFACE_TEMPLATES["opencode/README.md"] ?? "";
     expect(paragraphContaining(opencode, "**Status:")).toBe(
       "**Status: plugin installs; handoff event names are unverified.**",
+    );
+  });
+
+  test("Desktop doctrine keeps the unverified hook and staged-build limits explicit", () => {
+    const desktop = SURFACE_TEMPLATES["claude-desktop/README.md"] ?? "";
+    expect(paragraphContaining(desktop, "unverified event names")).toBe(
+      "Design decision #10's transcript-watching handoff works on Claude Code, has\nunverified event names on opencode, and is trust-gated on Codex. On Desktop it is\n**impossible**, not merely unimplemented: Desktop exposes no hook surface of any\nkind, and an MCP server is invoked by the model when the model chooses to invoke\nit — never by the transcript, and never at the moment the context fills. There is\nno workaround and none is offered.",
+    );
+    expect(
+      textBetween(
+        desktop,
+        "1. `bun run build:mcp`",
+        "\n\nThe server is zero-dependency",
+      ),
+    ).toBe(
+      "1. `bun run build:mcp` — emits `dist/mcp/server.js`; it does not populate the\n   staged bundle.\n2. Copy that output into the staged directory as `server/brigadier-mcp.js`, the\n   path named by `manifest.json`.\n3. Zip the staged directory with `manifest.json` at the archive root and rename\n   it `brigadier.mcpb`.\n4. Open it with Claude Desktop, or drop it into Desktop's extensions pane.",
     );
   });
 
@@ -567,7 +597,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
+        "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -594,7 +624,7 @@ describe("brigadier install", () => {
         `${skill}/hooks/hooks.json`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
+        "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
       );
     } finally {
       await rm(home, { recursive: true, force: true });

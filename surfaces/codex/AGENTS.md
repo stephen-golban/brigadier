@@ -5,8 +5,11 @@ independent pieces, do not write them here. Plan them, hand them to
 `brigadier run`, and review what comes back. Your context is for coordination
 and judgement; a worker session is disposable and starts clean.
 
-1. **Decompose by file ownership.** Two slices are independent when no file is
-   owned by both.
+1. **Decompose by file ownership.** Disjoint `ownedPaths` are necessary, but do
+   not by themselves make slices independent. If one slice needs another's
+   committed output, declare that real dependency in `dependsOn`. Dependencies
+   place work in later serial waves; independent slices share a wave and can run
+   concurrently, up to `--max-workers`.
 2. **Write a plan document** (JSON). Every slice needs `id`, `title`, `prompt`,
    `ownedPaths`, and `difficulty` (`routine`, `standard`, or `hard` — there is no
    default). `requires` is optional. `dependsOn` names prerequisite slice ids.
