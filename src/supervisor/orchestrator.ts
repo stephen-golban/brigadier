@@ -176,7 +176,6 @@ interface SlicePlan {
 
 interface Preflight {
   readonly slice: Slice;
-  readonly directive: SliceDirective;
   readonly decision: RoutingDecision;
   readonly durationMs: number;
 }
@@ -338,7 +337,6 @@ async function executeRun(
     );
     preflights.push({
       slice,
-      directive,
       decision,
       durationMs: ports.now() - routeStartedAt,
     });
@@ -448,18 +446,13 @@ async function executeRun(
   try {
     for (const wave of validation.waves) {
       if (interrupted()) {
-        // STOP STARTING WAVES. Unlike the dependency case below, the slices
+        // STOP STARTING WAVES. An abort can land during `prepare`, after the
+        // pre-prepare check and before this first wave. This guard keeps that
+        // wave from starting; it also stops later waves when dependency
+        // scheduling lands. Unlike the dependency case below, the slices
         // already in flight are NOT left to finish: the runner is terminating
         // them, because the user asked for the run to stop rather than for its
         // remainder to be skipped.
-        //
-        // UNREACHABLE TODAY, AND KEPT ANYWAY. `validatePlan` rejects any slice
-        // declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every plan
-        // that gets this far is a single wave and this condition is false on
-        // the only iteration there is. The guard that actually stops work now
-        // is the per-slice one below, which the pool consults every time a slot
-        // frees. This one is the same rule at the wave level, in place for the
-        // day dependency waves land.
         skipped.push(...wave);
         continue;
       }
@@ -488,10 +481,8 @@ async function executeRun(
             return cancelledResult(sliceId, []);
           }
           try {
-            const entry = byId.get(sliceId);
-            if (entry === undefined) {
-              throw new Error(`wave named unknown slice ${sliceId}`);
-            }
+            // biome-ignore lint/style/noNonNullAssertion: `coverDirectives` and `validatePlan` derive every wave id from this exact map.
+            const entry = byId.get(sliceId)!;
             const input: SliceRunInput = {
               slice: entry.plan.slice,
               directive: entry.plan.directive,
@@ -719,7 +710,7 @@ export async function runBounded<T, R>(
   limit: number,
   run: (item: T) => Promise<R>,
 ): Promise<readonly R[]> {
-  const slots = new Array<R | undefined>(items.length).fill(undefined);
+  const slots = new Array<R>(items.length);
   let cursor = 0;
   const workerCount = Math.max(1, Math.min(limit, items.length));
   const workers: Promise<void>[] = [];
@@ -729,23 +720,14 @@ export async function runBounded<T, R>(
         while (cursor < items.length) {
           const index = cursor;
           cursor += 1;
-          const item = items[index];
-          if (item === undefined) {
-            continue;
-          }
-          slots[index] = await run(item);
+          // biome-ignore lint/style/noNonNullAssertion: the cursor claims every index below `items.length` exactly once.
+          slots[index] = await run(items[index]!);
         }
       })(),
     );
   }
   await Promise.all(workers);
-  const settled: R[] = [];
-  for (const value of slots) {
-    if (value !== undefined) {
-      settled.push(value);
-    }
-  }
-  return settled;
+  return slots;
 }
 
 /**

@@ -130,8 +130,11 @@ export interface EnforcedSandbox {
     readonly workspaceAccess: "read" | "edit";
     /**
      * Neutral path globs that an adapter maps to effective edit controls.
-     * Claude must emit `Edit(glob)` rules; its accepted `Write(glob)` rules are
-     * not consulted and therefore cannot enforce worker lanes.
+     * Claude must emit both an `Edit(glob)` and a `Write(glob)` rule per path:
+     * measured against claude 2.1.226 under `--permission-mode dontAsk`, an
+     * in-lane `Write` created a file that did not exist and an out-of-lane one
+     * was denied and left nothing on disk, so both rule kinds are consulted and
+     * both enforce worker lanes.
      */
     readonly editablePaths: readonly string[];
   };

@@ -24,6 +24,22 @@ const fakeBin = resolve(repositoryRoot, "scripts/fakes");
 const prompt = "Return exactly ok.";
 const temporaryDirectories: string[] = [];
 
+/**
+ * The anti-hang bound for a real subprocess settling.
+ *
+ * Every wait in this file is bounded so a wedged adapter FAILS the suite instead
+ * of wedging it. The bound is a hang detector and nothing else — it is not a
+ * latency assertion, because each of these promises is waiting on a child that
+ * has already produced its terminal record.
+ *
+ * One second did not mean only that. It flakes under ordinary parallel load —
+ * three worktrees running their suites at once was enough, and the same three
+ * tests fail on unmodified `main` — which turns a hang detector into a false
+ * alarm. Five seconds is still a hard bound and still orders of magnitude below
+ * anything a real deadlock would take.
+ */
+const SETTLE_BOUND_MS = 5_000;
+
 afterEach(async () => {
   for (const directory of temporaryDirectories.splice(0)) {
     await rm(directory, { force: true, recursive: true });
@@ -111,7 +127,7 @@ describe("ClaudeWorker", () => {
 
     const outcome = await within(
       spawned.completion,
-      1_000,
+      SETTLE_BOUND_MS,
       "Claude terminal result",
     );
     expect(outcome.ok).toBeTrue();
@@ -131,7 +147,11 @@ describe("ClaudeWorker", () => {
     }
 
     expect(
-      await within(spawned.completion, 1_000, "shutdown-throw completion"),
+      await within(
+        spawned.completion,
+        SETTLE_BOUND_MS,
+        "shutdown-throw completion",
+      ),
     ).toMatchObject({
       ok: false,
       failure: {
@@ -406,7 +426,7 @@ describe("CodexWorker", () => {
     try {
       const [outcome, events] = await within(
         Promise.all([spawned.completion, collect(spawned.events)]),
-        1_000,
+        SETTLE_BOUND_MS,
         "Codex grandchild completion",
       );
       expect(outcome).toMatchObject({
@@ -468,9 +488,9 @@ test("Claude argv is an absolute contract for mandatory flags and edit lanes", (
     "--tools",
     "Read,Edit",
     "--allowedTools",
-    "Edit(src/worker/**)",
+    "Edit(src/worker/**),Write(src/worker/**)",
     "--disallowedTools",
-    "Write,WebFetch,WebSearch",
+    "WebFetch,WebSearch",
     "--setting-sources",
     "",
     "--add-dir",
@@ -559,7 +579,7 @@ test("Claude maxTurns succeeds at the limit and fails only over the limit", asyn
   expect(
     await within<WorkerOutcome>(
       atLimit.completion,
-      1_000,
+      SETTLE_BOUND_MS,
       "Claude at-limit completion",
     ),
   ).toMatchObject({ ok: true, output: "ok" });
@@ -579,7 +599,7 @@ test("Claude maxTurns succeeds at the limit and fails only over the limit", asyn
   expect(
     await within<WorkerOutcome>(
       overLimit.completion,
-      1_000,
+      SETTLE_BOUND_MS,
       "Claude over-limit completion",
     ),
   ).toMatchObject({

@@ -17,7 +17,8 @@ import type { RoutedWorker } from "../routing/contracts.js";
 const DEFAULT_WORKER_TIMEOUT_MS = 3_600_000;
 
 /**
- * Claude's lane is enforced by `Edit(glob)` tool rules, not an OS sandbox.
+ * Claude's lane is enforced by `Edit(glob)` and `Write(glob)` tool rules, not an
+ * OS sandbox.
  * `Bash` is outside those rules and could write anywhere on the machine, so
  * granting it would silently widen the lane to the whole filesystem. This is
  * deliberately stricter than Codex, whose subprocesses run under a real
@@ -26,10 +27,13 @@ const DEFAULT_WORKER_TIMEOUT_MS = 3_600_000;
  * a one-line tool-list edit.
  *
  * Read, Glob, and Grep cover repository inspection; Edit changes existing owned
- * files. Write remains absent because buildClaudeCommand disallows it
- * unconditionally, so the supervisor must create any new files before launch.
+ * files and Write creates new ones. Write is confined to the same lane by the
+ * same mechanism: buildClaudeCommand emits `Write(<path>)` beside `Edit(<path>)`
+ * for every owned path, and measurement against claude 2.1.226 showed both rules
+ * consulted identically — an in-lane Write created a file that did not exist, an
+ * out-of-lane one was denied and never reached the disk.
  */
-const CLAUDE_TOOLS = ["Edit", "Glob", "Grep", "Read"] as const;
+const CLAUDE_TOOLS = ["Edit", "Glob", "Grep", "Read", "Write"] as const;
 
 export interface SpecBuildInput {
   readonly slice: Slice;
@@ -51,11 +55,11 @@ export interface SpecBuildInput {
  * reach one inside an owned path.
  *
  * WHAT THE TWO GRAMMARS ARE. Claude's lane is a single `--allowedTools`
- * argument built as `Edit(<path>)` items joined with commas, so `(`, `)` and
- * `,` each end one rule early or begin another: an owned path spelled
- * `owned),Edit(package.json` yields `Edit(owned),Edit(package.json)`, which is
- * two rules, the second of them granting edit access to a file the slice does
- * not own. Codex's lane is a TOML table passed to `-c`, in which every path is
+ * argument built as `Edit(<path>)` and `Write(<path>)` items joined with commas,
+ * so `(`, `)` and `,` each end one rule early or begin another: an owned path
+ * spelled `owned),Edit(package.json` yields `Edit(owned),Edit(package.json)`,
+ * which is two rules, the second of them granting edit access to a file the
+ * slice does not own. Codex's lane is a TOML table passed to `-c`, in which every path is
  * a quoted basic string, so `"` and `\` are the two characters that can close
  * or re-open that quoting; `{`, `}` and `=` are inert while the quoting holds,
  * and refusing `"` and `\` is exactly what makes it hold. Control characters
@@ -64,8 +68,7 @@ export interface SpecBuildInput {
  *
  * WHY THIS EXISTS HERE AS WELL AS AT THE PLAN GATE. `validatePlan` is the first
  * layer and rejects these paths before a run ever starts. This is the second,
- * and deliberately so, matching the reasoning already written into
- * `planPlaceholders`: a guarantee made three modules away is not something the
+ * and deliberately so: a guarantee made three modules away is not something the
  * code performing the dangerous operation can verify. This function is the last
  * place an owned path is seen before it becomes a vendor permission rule, so it
  * re-proves the property rather than assuming an upstream stage ran.

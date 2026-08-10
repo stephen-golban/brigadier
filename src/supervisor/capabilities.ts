@@ -33,7 +33,7 @@ import {
 import type { Capability, Effort, Vendor } from "../contracts.js";
 
 /** A vendor/model-id pattern plus the capability facts emitted for a match. */
-export interface CapabilityRule {
+interface CapabilityRule {
   readonly vendor: Vendor;
   readonly pattern: RegExp;
   readonly supportedEfforts: readonly Effort[];

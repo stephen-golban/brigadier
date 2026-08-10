@@ -271,11 +271,9 @@ const ACCOUNT_SCOPE: QuotaScope = Object.freeze({ kind: "account" });
  *
  * `result.rateLimits` is the aggregate the adapter has always read. It is the
  * shared Sol/Terra/Luna bucket, so it is account-scoped. `rateLimitsByLimitId`
- * is a map of *independent* buckets that the adapter used to drop on the floor
- * entirely — R-11 §2b observed a model-named bucket sitting at 0% while the
- * general bucket was 72% drained, with a different reset time, which is a live
- * instance of "one model has quota while the account's general bucket does
- * not". Every bucket in that map other than the general one is model-scoped.
+ * repeats that aggregate under the general `codex` id and may contain other
+ * buckets under opaque codenames. Only the general bucket has a scope brigadier
+ * can map without guessing, so other ids are ignored.
  */
 export function normalizeCodexRateLimits(
   result: unknown,
@@ -303,7 +301,7 @@ export function normalizeCodexRateLimits(
   }
 
   for (const [limitId, value] of Object.entries(byLimitId ?? {})) {
-    if (seen.has(limitId)) {
+    if (seen.has(limitId) || limitId !== GENERAL_LIMIT_ID) {
       continue;
     }
     seen.add(limitId);
@@ -312,11 +310,7 @@ export function normalizeCodexRateLimits(
       continue;
     }
     windows.push(
-      ...collectWindows(
-        bucket,
-        limitId === GENERAL_LIMIT_ID ? ACCOUNT_SCOPE : modelScope(limitId),
-        bucket.rateLimitReachedType,
-      ),
+      ...collectWindows(bucket, ACCOUNT_SCOPE, bucket.rateLimitReachedType),
     );
   }
 
@@ -399,50 +393,6 @@ function effectiveReachedType(
   return hasProperty(aggregate, "rateLimitReachedType")
     ? aggregate?.rateLimitReachedType
     : resultObject?.rateLimitReachedType;
-}
-
-/**
- * The tier token for a non-general bucket, derived from `limitId` ALONE.
- *
- * `limitName` used to be preferred when present, and that was a defect, not a
- * shortcut. `limitName` is the vendor's arbitrary display string, and
- * `modelQuotaStatus` matches a label against model ids: a bucket whose
- * `limitName` reads `"GPT"` produced the label `"gpt"`, and one independent
- * bucket's exhaustion then reported BOTH `gpt-5.6-sol` and `gpt-5.6-terra` dead.
- * `"Codex"` or `"Claude"` do the same. Untrusted display prose was being handed
- * to a matcher with the authority to remove a whole fleet from routing.
- *
- * The frozen `src/contracts.ts` already forbade this outright: `QuotaScope.label`
- * is documented as "a normalized tier token ... never the vendor's display
- * prose", derived "from the stable wire identifier instead". The adapter was
- * violating its own contract. `limitId` is that stable wire identifier — it is
- * the map key the vendor itself uses to tell buckets apart, and unlike
- * `limitName` it is not free text a rendering change can rewrite.
- *
- * The cost is real and is accepted deliberately. Every `limitId` observed so far
- * is an opaque codename (`codex_bengalfox`, R-11 §2b) whose stripped label
- * matches no model id, so Codex model-scoped windows now constrain nothing in
- * practice — including the one bucket whose `limitName` genuinely did name a
- * model. The window is still emitted and still carries the evidence; nothing
- * matches it. That is the safe direction: under-matching costs one launch the
- * vendor refuses and the supervisor observes, while over-matching turns vendor
- * prose into a fleet-wide kill switch and can strand brigadier with
- * `ALL_VENDORS_EXHAUSTED` while every model is in fact available.
- *
- * R-11 §5 is why the gap is not closed here: `limitId` values are not enumerable
- * in advance, so a codename-to-model table written now would be brigadier
- * guessing. A hand-curated table in a reviewed diff — the `COMPETENCE_TABLE`
- * shape — is the right eventual fix, and it is out of scope for this unit.
- */
-function modelScope(limitId: string): QuotaScope {
-  const label = (
-    limitId.startsWith(`${GENERAL_LIMIT_ID}_`)
-      ? limitId.slice(GENERAL_LIMIT_ID.length + 1)
-      : limitId
-  )
-    .trim()
-    .toLowerCase();
-  return { kind: "model", label };
 }
 
 /**

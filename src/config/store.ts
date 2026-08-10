@@ -21,7 +21,7 @@ import type { BrigadierConfig } from "./contracts.js";
 import { ConfigValidationError, parseConfig } from "./contracts.js";
 
 export const CONFIG_HOME_VARIABLE = "BRIGADIER_HOME";
-export const CONFIG_DIRECTORY_NAME = ".brigadier";
+const CONFIG_DIRECTORY_NAME = ".brigadier";
 export const CONFIG_FILE_NAME = "config.json";
 
 const DIRECTORY_MODE = 0o700;

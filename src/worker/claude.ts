@@ -252,14 +252,23 @@ export function buildClaudeCommand(
     command.push("--max-budget-usd", String(spec.maxBudgetUsd));
   }
   command.push("--tools", spec.tools.join(","));
+  // Two rules per owned path, because Claude consults `Edit(glob)` and
+  // `Write(glob)` separately and enforces both the same way: without the Write
+  // rule a worker can change existing files but cannot create the ones its
+  // slice is supposed to add. Both are denied outside the lane — measured
+  // against claude 2.1.226 under `--permission-mode dontAsk`, where an
+  // out-of-lane Write was refused and left nothing on disk.
   const editRules =
     spec.sandbox.filesystem.workspaceAccess === "edit"
-      ? spec.sandbox.filesystem.editablePaths.map((path) => `Edit(${path})`)
+      ? spec.sandbox.filesystem.editablePaths.flatMap((path) => [
+          `Edit(${path})`,
+          `Write(${path})`,
+        ])
       : [];
   if (editRules.length > 0) {
     command.push("--allowedTools", editRules.join(","));
   }
-  command.push("--disallowedTools", "Write,WebFetch,WebSearch");
+  command.push("--disallowedTools", "WebFetch,WebSearch");
 
   const settingSources: string[] = [];
   if (spec.instructionFiles.user === "include") {

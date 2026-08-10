@@ -168,7 +168,7 @@ export function defaultEffortCeiling(
   return null;
 }
 
-export function isEffort(value: unknown): value is Effort {
+function isEffort(value: unknown): value is Effort {
   return (
     typeof value === "string" &&
     (EFFORT_LADDER as readonly string[]).includes(value)

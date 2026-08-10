@@ -217,7 +217,7 @@ describe("Codex quota oracle", () => {
   );
 
   test(
-    "emits one window per rateLimitsByLimitId bucket, scoped by limit id",
+    "emits only the general rateLimitsByLimitId bucket",
     async () => {
       const response = await readFixtureRecord("quota-codex-by-limit-id.jsonl");
       const snapshot = normalizeCodexRateLimits(
@@ -226,12 +226,8 @@ describe("Codex quota oracle", () => {
       );
 
       // The aggregate is repeated inside the map under `limitId: "codex"`; it
-      // must be emitted once, as the account bucket, not twice.
-      //
-      // The model bucket's label is `"bengalfox"`, from its `limitId`, and NOT
-      // `"gpt-5.3-codex-spark"` from its `limitName`. The display string is the
-      // richer of the two and it is still refused: see the prose-label test
-      // below for what that string was doing to unrelated models.
+      // must be emitted once, as the account bucket, not twice. The opaque
+      // `codex_bengalfox` bucket has no safe scope and is not emitted.
       expect(snapshot).toEqual({
         vendor: "codex",
         status: "available",
@@ -245,14 +241,6 @@ describe("Codex quota oracle", () => {
             remainingFraction: 0.28,
             resetsAtMs: 1_786_548_345_000,
           },
-          {
-            kind: "weekly",
-            scope: { kind: "model", label: "bengalfox" },
-            status: "available",
-            durationMinutes: 10_080,
-            remainingFraction: 1,
-            resetsAtMs: 1_786_720_479_000,
-          },
         ],
         isUsingOverage: null,
       } satisfies QuotaSnapshot);
@@ -261,12 +249,23 @@ describe("Codex quota oracle", () => {
   );
 
   test(
-    "a drained model bucket leaves the Codex account available",
+    "non-general buckets constrain no Codex model while the general bucket constrains all",
     async () => {
       const response = await readFixtureRecord("quota-codex-by-limit-id.jsonl");
       const result = asObject(response.result);
       const byLimitId = asObject(result.rateLimitsByLimitId);
-      const drained = normalizeCodexRateLimits(
+      const codexModels = [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-wm",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
+      ] as const;
+      const nonGeneralDrained = normalizeCodexRateLimits(
         {
           ...result,
           rateLimitsByLimitId: {
@@ -285,73 +284,87 @@ describe("Codex quota oracle", () => {
         1_800_000_000_000,
       );
 
-      expect(drained.status).toBe("available");
-      expect(drained.windows[1]).toEqual({
-        kind: "weekly",
-        scope: { kind: "model", label: "bengalfox" },
-        status: "exhausted",
-        durationMinutes: 10_080,
-        remainingFraction: 0,
-        resetsAtMs: 1_786_720_479_000,
-      } satisfies QuotaWindow);
-      // The declared cost of refusing display prose as a label, pinned so nobody
-      // has to rediscover it. This bucket's `limitName` reads
-      // "GPT-5.3-Codex-Spark" and it really does meter that model, but the only
-      // wire *identifier* for it is the codename `codex_bengalfox`, which names
-      // no model. The exhaustion is preserved in `windows` and constrains
-      // nothing; closing that gap needs a reviewed codename-to-model table, not
-      // a matcher pointed at a vendor's display string.
-      expect(modelQuotaStatus(drained, "gpt-5.3-codex-spark")).toBe(
-        "available",
-      );
-      expect(modelQuotaStatus(drained, "gpt-5.6-sol")).toBe("available");
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  test("an opaque bucket codename becomes a label that constrains no model", () => {
-    const snapshot = normalizeCodexRateLimits(
-      {
-        rateLimitsByLimitId: {
-          codex: {
-            limitId: "codex",
-            limitName: null,
-            primary: {
-              usedPercent: 10,
-              windowDurationMins: 300,
-              resetsAt: 1_786_026_000,
-            },
-            rateLimitReachedType: null,
+      expect(nonGeneralDrained).toEqual({
+        vendor: "codex",
+        status: "available",
+        observedAtMs: 1_800_000_000_000,
+        windows: [
+          {
+            kind: "weekly",
+            scope: { kind: "account" },
+            status: "available",
+            durationMinutes: 10_080,
+            remainingFraction: 0.28,
+            resetsAtMs: 1_786_548_345_000,
           },
-          codex_bengalfox: {
-            limitId: "codex_bengalfox",
-            limitName: null,
+        ],
+        isUsingOverage: null,
+      } satisfies QuotaSnapshot);
+      expect(
+        codexModels.filter(
+          (model) => modelQuotaStatus(nonGeneralDrained, model) === "available",
+        ),
+      ).toEqual([
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-wm",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
+      ]);
+
+      const generalDrained = normalizeCodexRateLimits(
+        {
+          ...result,
+          rateLimits: {
+            ...asObject(result.rateLimits),
             primary: {
               usedPercent: 100,
               windowDurationMins: 10_080,
-              resetsAt: 1_786_720_479,
+              resetsAt: 1_786_548_345,
             },
             rateLimitReachedType: "primary",
           },
         },
-      },
-      1_800_000_000_000,
-    );
-
-    expect(snapshot.windows[1]).toEqual({
-      kind: "weekly",
-      scope: { kind: "model", label: "bengalfox" },
-      status: "exhausted",
-      durationMinutes: 10_080,
-      remainingFraction: 0,
-      resetsAtMs: 1_786_720_479_000,
-    } satisfies QuotaWindow);
-    // brigadier refuses to invent a codename-to-model table, so the label
-    // matches nothing and restricts nobody.
-    expect(snapshot.status).toBe("available");
-    expect(modelQuotaStatus(snapshot, "gpt-5.6-sol")).toBe("available");
-    expect(modelQuotaStatus(snapshot, "gpt-5.6-terra")).toBe("available");
-  });
+        1_800_000_000_000,
+      );
+      expect(generalDrained).toEqual({
+        vendor: "codex",
+        status: "exhausted",
+        observedAtMs: 1_800_000_000_000,
+        windows: [
+          {
+            kind: "weekly",
+            scope: { kind: "account" },
+            status: "exhausted",
+            durationMinutes: 10_080,
+            remainingFraction: 0,
+            resetsAtMs: 1_786_548_345_000,
+          },
+        ],
+        isUsingOverage: null,
+      } satisfies QuotaSnapshot);
+      expect(
+        codexModels.filter(
+          (model) => modelQuotaStatus(generalDrained, model) === "exhausted",
+        ),
+      ).toEqual([
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-wm",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
 
   /**
    * DEFECT 2. The adapter used to set `status: "exhausted"` from a bare
@@ -422,38 +435,6 @@ describe("Codex quota oracle", () => {
    * numbers, never absent evidence.
    */
   test("a partial bucket that reports a reached limit keeps its exhaustion", () => {
-    const model = normalizeCodexRateLimits(
-      {
-        rateLimitsByLimitId: {
-          codex_bengalfox: {
-            limitName: "GPT-5.3-Codex-Spark",
-            primary: null,
-            rateLimitReachedType: "primary",
-          },
-        },
-      },
-      123,
-    );
-    expect(model).toEqual({
-      vendor: "codex",
-      // No account-scoped window, so the account itself is still unknown.
-      status: "unknown",
-      observedAtMs: 123,
-      windows: [
-        {
-          kind: "unknown",
-          scope: { kind: "model", label: "bengalfox" },
-          status: "exhausted",
-          durationMinutes: null,
-          remainingFraction: null,
-          resetsAtMs: null,
-        },
-      ],
-      isUsingOverage: null,
-    } satisfies QuotaSnapshot);
-
-    // The routing-visible half of the same defect: when the partial bucket is
-    // the general one, the account really is refused and every model must see it.
     const account = normalizeCodexRateLimits(
       {
         rateLimitsByLimitId: {
@@ -513,56 +494,6 @@ describe("Codex quota oracle", () => {
         resetsAtMs: null,
       },
     ] satisfies QuotaWindow[]);
-  });
-
-  /**
-   * DEFECT 4. `limitName` is the vendor's arbitrary display string, and it was
-   * being fed straight into a matcher with the authority to remove a model from
-   * routing. A bucket named "GPT" reported the whole GPT fleet exhausted on
-   * evidence about one independent bucket.
-   */
-  test("a bucket's display prose never becomes its label", () => {
-    const snapshot = normalizeCodexRateLimits(
-      {
-        rateLimits: {
-          limitId: "codex",
-          primary: {
-            usedPercent: 10,
-            windowDurationMins: 300,
-            resetsAt: 1_786_026_000,
-          },
-          rateLimitReachedType: null,
-        },
-        rateLimitsByLimitId: {
-          codex_wide: {
-            limitId: "codex_wide",
-            limitName: "GPT",
-            primary: {
-              usedPercent: 100,
-              windowDurationMins: 10_080,
-              resetsAt: 1_786_720_479,
-            },
-            rateLimitReachedType: "primary",
-          },
-        },
-      },
-      123,
-    );
-
-    expect(snapshot.windows[1]).toEqual({
-      kind: "weekly",
-      // From `limitId`, the vendor's own map key. Before this fix the label was
-      // `"gpt"`, taken from `limitName`.
-      scope: { kind: "model", label: "wide" },
-      status: "exhausted",
-      durationMinutes: 10_080,
-      remainingFraction: 0,
-      resetsAtMs: 1_786_720_479_000,
-    } satisfies QuotaWindow);
-    // Both of these read `"exhausted"` before the fix, on evidence about a
-    // bucket that meters neither of them.
-    expect(modelQuotaStatus(snapshot, "gpt-5.6-sol")).toBe("available");
-    expect(modelQuotaStatus(snapshot, "gpt-5.6-terra")).toBe("available");
   });
 
   test(

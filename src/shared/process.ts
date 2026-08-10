@@ -13,7 +13,7 @@ export type DetachedProcess = ChildProcessWithoutNullStreams & {
   readonly pid: number;
 };
 
-export interface ProcessExit {
+interface ProcessExit {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
 }
@@ -82,7 +82,7 @@ export async function shutdownProcessGroup(pid: number): Promise<void> {
   }
 }
 
-export function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
   } catch (error) {

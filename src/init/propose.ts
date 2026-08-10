@@ -326,7 +326,7 @@ function carryCeiling(
 }
 
 /** Selectable models only, best first, ties broken by discovery order. */
-export function rankModels(
+function rankModels(
   models: readonly DiscoveredModel[],
 ): readonly RankedModel[] {
   return models

@@ -219,7 +219,7 @@ export class ClaudeQuotaOracle implements ClaudeQuotaOracleContract {
   }
 }
 
-export interface ClaudeQuotaOracleOptions {
+interface ClaudeQuotaOracleOptions {
   /** Injectable clock; the oracle reads it only to age expired windows out. */
   readonly now?: () => number;
 }

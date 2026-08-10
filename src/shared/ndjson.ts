@@ -1,4 +1,4 @@
-export interface NdjsonOptions<T = unknown> {
+interface NdjsonOptions<T = unknown> {
   /** Called once for every stream chunk, including chunks without a full line. */
   readonly onActivity?: () => void;
   /** Validates or transforms each parsed JSON value before it is emitted. */

@@ -71,7 +71,6 @@ interface SessionState {
 
 interface WorktreeState {
   readonly sessionState: SessionState;
-  readonly worktree: CreatedWorktree;
 }
 
 export class LinkedSecretCommitError extends Error {
@@ -92,8 +91,6 @@ export class NoChangesToCommitError extends Error {
 }
 
 class GitCommandError extends Error {
-  readonly exitCode: number;
-
   constructor(
     args: readonly string[],
     result: GitResult,
@@ -104,7 +101,6 @@ class GitCommandError extends Error {
     const detail = stderr || stdout || "no diagnostic output";
     super(`git ${args[0] ?? "command"} failed (${result.exitCode}): ${detail}`);
     this.name = "GitCommandError";
-    this.exitCode = result.exitCode;
   }
 }
 
@@ -312,7 +308,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       isolated: !unsafeInPlace,
       session: spec.session,
     }) satisfies CreatedWorktree;
-    this.#worktrees.set(worktree, { sessionState, worktree });
+    this.#worktrees.set(worktree, { sessionState });
     sessionState.sliceHeads.set(branch, spec.session.baseCommit);
     sessionState.activeWorktrees.add(worktree);
     return worktree;

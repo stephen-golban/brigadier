@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -1256,37 +1257,41 @@ describe("DefaultSliceRunner retry policy", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Owned-path pre-creation
+// Owned-path creation
 // ---------------------------------------------------------------------------
 
-describe("DefaultSliceRunner owned-path pre-creation", () => {
-  test("missing owned paths exist at spawn and untouched placeholders are gone before commit", async () => {
+describe("DefaultSliceRunner owned-path creation", () => {
+  /**
+   * THE RUNNER CREATES NOTHING IN THE WORKTREE, AND THAT IS THE FIX.
+   *
+   * It used to pre-create every owned path as an empty placeholder, because a
+   * Claude worker was believed unable to create a file, and then delete the
+   * ones still empty before the commit so untouched placeholders never reached
+   * it. That cost a slice whose job is to add a legitimately EMPTY file — an
+   * empty barrel, a deliberately blank fixture — its entire deliverable, and
+   * size alone cannot tell that file apart from an untouched placeholder.
+   *
+   * `Write(glob)` is enforced exactly as `Edit(glob)` is (measured against
+   * claude 2.1.226), so the worker creates its own files and every file in the
+   * worktree is by construction one the worker made. This test is the old bug
+   * stated as a requirement: it fails against the placeholder code, where
+   * `src/empty.ts` is unlinked before `commit` is ever called.
+   */
+  test("an empty file the worker creates survives to the commit and after it", async () => {
     const world = await makeWorld();
     const worktree = join(world.root, "wt", "slice-7");
     const slice: Slice = {
       ...SLICE,
-      ownedPaths: [
-        "src/added.ts",
-        "docs/deep/notes.md",
-        "src/already-empty.ts",
-      ],
+      ownedPaths: ["src/empty.ts", "src/added.ts"],
     };
-    // A file that already exists and is empty must survive: it is not ours to
-    // delete, and `wx` is what tells the two apart.
-    await mkdir(join(worktree, "src"), { recursive: true });
-    await writeFile(join(worktree, "src", "already-empty.ts"), "");
 
-    const spawnState: Record<string, boolean> = {};
     const adapter = claudeAdapter([
       {
         onSpawn: async (spec) => {
-          spawnState["src/added.ts"] = await exists(
-            join(spec.cwd, "src", "added.ts"),
-          );
-          spawnState["docs/deep/notes.md"] = await exists(
-            join(spec.cwd, "docs", "deep", "notes.md"),
-          );
-          // The worker edits one owned file and never touches the other.
+          // Exactly what the Write tool does for a path that does not exist:
+          // make the parent, then write the file.
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(join(spec.cwd, "src", "empty.ts"), "");
           await writeFile(
             join(spec.cwd, "src", "added.ts"),
             "export const added = true;\n",
@@ -1296,17 +1301,12 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
     ]);
     const engine = new FakeEngine();
     // Sampled synchronously inside `commit`, so this asserts the ORDERING —
-    // that the untouched placeholder was gone before the commit was taken, not
-    // merely that it is gone by the time the run returns.
+    // that the empty file was still there when the commit was taken, not merely
+    // that it is there once the run has returned.
     const atCommit: Record<string, boolean> = {};
     engine.onCommit = () => {
+      atCommit["src/empty.ts"] = existsSync(join(worktree, "src", "empty.ts"));
       atCommit["src/added.ts"] = existsSync(join(worktree, "src", "added.ts"));
-      atCommit["docs/deep/notes.md"] = existsSync(
-        join(worktree, "docs", "deep", "notes.md"),
-      );
-      atCommit["src/already-empty.ts"] = existsSync(
-        join(worktree, "src", "already-empty.ts"),
-      );
     };
     const harness = makeHarness({
       engine,
@@ -1332,28 +1332,89 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
     );
 
     expect(result.ok).toBe(true);
-    expect(spawnState).toEqual({
-      "src/added.ts": true,
-      "docs/deep/notes.md": true,
-    });
     expect(atCommit).toEqual({
+      "src/empty.ts": true,
       "src/added.ts": true,
-      "docs/deep/notes.md": false,
-      "src/already-empty.ts": true,
     });
-    // The successful worktree is left live, so its files can be inspected.
+    // The successful worktree is left live, so its files can be read back.
+    expect(await readFile(join(worktree, "src", "empty.ts"), "utf8")).toBe("");
     expect(await readFile(join(worktree, "src", "added.ts"), "utf8")).toBe(
       "export const added = true;\n",
     );
+  });
+
+  /**
+   * The other half of the same change: with nothing pre-created, an owned path
+   * the worker never writes simply does not exist. It is not a file that has to
+   * be cleaned up before the commit, which is why there is no cleanup left.
+   */
+  test("an owned path the worker never writes never exists at all", async () => {
+    const world = await makeWorld();
+    const worktree = join(world.root, "wt", "slice-7");
+    const slice: Slice = {
+      ...SLICE,
+      ownedPaths: ["src/added.ts", "docs/deep/notes.md"],
+    };
+
+    const seenAtSpawn: Record<string, boolean> = {};
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          seenAtSpawn["src/added.ts"] = existsSync(
+            join(spec.cwd, "src", "added.ts"),
+          );
+          seenAtSpawn["docs/deep/notes.md"] = existsSync(
+            join(spec.cwd, "docs", "deep", "notes.md"),
+          );
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(
+            join(spec.cwd, "src", "added.ts"),
+            "export const added = true;\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(true);
+    // Nothing is pre-created, so the worker sees an empty lane rather than two
+    // zero-byte files it did not write.
+    expect(seenAtSpawn).toEqual({
+      "src/added.ts": false,
+      "docs/deep/notes.md": false,
+    });
     expect(await exists(join(worktree, "docs", "deep", "notes.md"))).toBe(
       false,
     );
-    expect(await exists(join(worktree, "src", "already-empty.ts"))).toBe(true);
+    expect(await exists(join(worktree, "docs", "deep"))).toBe(false);
   });
 
-  test("an owned path escaping the worktree root is refused before anything is created", async () => {
+  /**
+   * An owned path that could rewrite the vendor's lane grammar is still refused,
+   * and now `buildWorkerSpec` is the only thing standing there — the placeholder
+   * planner used to reject a few of these on its way past. The refusal is a
+   * `LAUNCH_FAILURE`, and no worker is spawned.
+   */
+  test("a lane-hostile owned path is refused before any worker is spawned", async () => {
     const world = await makeWorld();
-    const worktree = join(world.root, "wt", "slice-7");
     const adapter = claudeAdapter([]);
     const harness = makeHarness({ workers: { claude: adapter.worker } });
     const runner = new DefaultSliceRunner({
@@ -1364,7 +1425,10 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
 
     const result = await withBound(
       runner.run({
-        slice: { ...SLICE, ownedPaths: ["src/ok.ts", "../escape.ts"] },
+        slice: {
+          ...SLICE,
+          ownedPaths: ["src/ok.ts", "owned),Edit(package.json"],
+        },
         directive: DIRECTIVE,
         session: world.session,
         attemptSlots: firstSlot(world),
@@ -1377,36 +1441,542 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
 
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
-      kind: "WORKTREE_FAILED",
-      message: `refusing to pre-create owned path "../escape.ts": it resolves to ${join(world.root, "wt", "escape.ts")}, outside worktree root ${worktree}`,
+      kind: "WORKER_FAILED",
+      message:
+        'could not build a worker spec for claude/claude-opus-5: refusing to build a worker spec for slice "slice-auth": owned path "owned),Edit(package.json" contains U+0028, U+0029, U+002C, which can alter a vendor\'s lane grammar',
+      failure: {
+        kind: "LAUNCH_FAILURE",
+        message:
+          'could not build a worker spec for claude/claude-opus-5: refusing to build a worker spec for slice "slice-auth": owned path "owned),Edit(package.json" contains U+0028, U+0029, U+002C, which can alter a vendor\'s lane grammar',
+        retryable: false,
+        statusCode: null,
+      },
     });
     expect(adapter.specs.length).toBe(0);
-    expect(await exists(join(world.root, "wt", "escape.ts"))).toBe(false);
-    // The refusal happens before any file is created, so the safe sibling path
-    // is not left behind either.
-    expect(await exists(join(worktree, "src", "ok.ts"))).toBe(false);
+    expect(harness.engine.removes.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Worktree containment
+//
+// The property under test: no worker is ever handed a lane rule for a path that
+// does not really land inside its own worktree. Isolation is the only thing the
+// worktree design buys, and a write that leaves the worktree is both
+// unrecoverable and INVISIBLE — `git status` inside the worktree sees nothing,
+// so the slice is reported as NO_CHANGES while a file outside the repository
+// has already been overwritten.
+//
+// This block exists as its own section because the last version of this check
+// lived inside the function that pre-created owned paths as empty placeholders.
+// When that subsystem was deleted the containment proof went with it, the whole
+// suite stayed green, and only the compiled binary found the hole. Containment
+// is stated here as a requirement in its own right so that deleting the guard
+// fails a test that names it.
+// ---------------------------------------------------------------------------
+
+describe("DefaultSliceRunner worktree containment", () => {
+  /**
+   * THE REGRESSION. A repository can legitimately contain a committed symlinked
+   * directory — `src -> ../shared/src` is an ordinary layout — and `git
+   * checkout` reproduces that symlink inside every worktree. An owned path
+   * underneath it passes every lexical test there is: it is relative, it has no
+   * `..`, it has no glob and no control character. `resolve` and `relative`
+   * never touch a disk, so only `realpath` can see where it actually leads.
+   *
+   * Without the guard this run spawns a worker, the worker's in-lane `Write`
+   * lands outside the repository, and the slice is reported as `NO_CHANGES`.
+   */
+  test("an owned path leading through a symlinked directory is refused before any worker is spawned", async () => {
+    const world = await makeWorld();
+    const outside = join(world.root, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "victim.ts"), "ORIGINAL SECRET CONTENT\n");
+
+    const worktree = world.slots[0].worktreePath;
+    const engine = new FakeEngine();
+    // Exactly what checking out a committed symlink into a fresh worktree does,
+    // fired after the worktree exists and before the runner can spawn into it.
+    // The root's real path is sampled here because the failed attempt removes
+    // the worktree, and the message under test names that real path.
+    let realWorktree = "";
+    engine.onCreate = () => {
+      mkdirSync(join(worktree, "src"), { recursive: true });
+      symlinkSync(outside, join(worktree, "src", "link"), "dir");
+      realWorktree = realpathSync(worktree);
+    };
+
+    // Scripted to do exactly what a lane-scoped worker does with the path it was
+    // granted. If the guard is ever removed this runs, and the assertions below
+    // fail on the overwritten bytes rather than on a message.
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          await writeFile(
+            join(spec.cwd, "src", "link", "victim.ts"),
+            "OVERWRITTEN BY THE WORKER\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/link/victim.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    // The real path the message must name. Resolved from the filesystem rather
+    // than assembled lexically, because the temp root itself sits under
+    // `/var/folders`, which is reached through the `/var -> /private/var`
+    // symlink on macOS.
+    const realVictim = await realpath(join(outside, "victim.ts"));
+    expect(realWorktree).toBe(
+      join(await realpath(world.root), "wt", "slice-7"),
+    );
+
+    // Asserted first because it is the whole point: the file outside the
+    // worktree is untouched, byte for byte, and nothing was created beside it.
+    expect(await readFile(join(outside, "victim.ts"), "utf8")).toBe(
+      "ORIGINAL SECRET CONTENT\n",
+    );
+    expect((await readdir(outside)).sort()).toEqual(["victim.ts"]);
+    // No subprocess ever existed, so nothing was ever told it could write there.
+    expect(adapter.specs.length).toBe(0);
+    expect(result.ok).toBe(false);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/victim.ts": an existing path component is a symbolic link leading to ${realVictim}, outside worktree root ${realWorktree}`,
+    });
+    // The refused attempt still tears its worktree down.
     expect(harness.engine.removes.length).toBe(1);
   });
 
   /**
-   * The lexical proof — `resolve` plus `relative` — never touches a disk, so a
-   * symlinked directory component passes it and the placeholder is then written
-   * wherever the link points. Real repositories contain symlinked directories,
-   * so this needs no adversary: it is brigadier writing into a shared location
-   * while believing the worker is isolated, which is the one guarantee the
-   * worktree design exists to make.
+   * THE CASE THAT BREAKS THE FIX WHILE THE SUITE STAYS GREEN. On macOS `/tmp`
+   * is a symlink to `/private/tmp` and `/var` to `/private/var`, so a worktree
+   * root reached THROUGH a symlink is the ordinary case, not an edge case.
+   *
+   * A guard that resolves the child but compares it against an unresolved root
+   * computes `relative("/tmp/x/slice-7", "/private/tmp/x/slice-7/src/added.ts")`
+   * — which starts with `..` — and reports an escape for every legitimate path
+   * on the platform brigadier runs on. This test drives a root whose parent is a
+   * symlink and requires an ordinary owned path to PASS.
    */
-  test("an owned path under a symlinked directory is refused and nothing is written outside", async () => {
+  test("a worktree root reached through a symlink still contains an ordinary owned path", async () => {
     const world = await makeWorld();
-    const worktree = join(world.root, "wt", "slice-7");
+    const realParent = join(world.root, "real-worktrees");
+    await mkdir(join(realParent, "slice-7"), { recursive: true });
+    const linkedParent = join(world.root, "linked-worktrees");
+    await symlink(realParent, linkedParent, "dir");
+    const worktree = join(linkedParent, "slice-7");
+
+    // The premise of the test, asserted rather than assumed: this root really is
+    // reached through a symlink, so a lexical root comparison really would fail.
+    expect(await realpath(worktree)).toBe(
+      join(await realpath(realParent), "slice-7"),
+    );
+    expect(await realpath(worktree)).not.toBe(worktree);
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(
+            join(spec.cwd, "src", "added.ts"),
+            "export const added = true;\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/added.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: [{ sliceNumber: 7, worktreePath: worktree }],
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    expect(attemptAt(result, 0).failure).toBe(null);
+    expect(result.ok).toBe(true);
+    expect(result.commit).toBe("commit-1");
+    // It really did spawn, into the linked path it was given.
+    expect(adapter.specs.length).toBe(1);
+    expect(await readFile(join(worktree, "src", "added.ts"), "utf8")).toBe(
+      "export const added = true;\n",
+    );
+  });
+
+  /**
+   * A symlink is not itself a violation; leaving the worktree is. A worktree
+   * whose `src` is a symlink to another directory INSIDE the same worktree
+   * resolves to a path still under the root, so the slice runs.
+   */
+  test("a symlinked directory that stays inside the worktree is allowed", async () => {
+    const world = await makeWorld();
+    const worktree = world.slots[0].worktreePath;
+    const engine = new FakeEngine();
+    engine.onCreate = () => {
+      mkdirSync(join(worktree, "actual"), { recursive: true });
+      symlinkSync(join(worktree, "actual"), join(worktree, "src"), "dir");
+    };
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          await writeFile(
+            join(spec.cwd, "src", "added.ts"),
+            "export const added = true;\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/added.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    expect(attemptAt(result, 0).failure).toBe(null);
+    expect(result.ok).toBe(true);
+    expect(adapter.specs.length).toBe(1);
+    // Written through the symlink, landing in the real directory beside it.
+    expect(await readFile(join(worktree, "actual", "added.ts"), "utf8")).toBe(
+      "export const added = true;\n",
+    );
+  });
+
+  /**
+   * A DANGLING SYMBOLIC LINK IS NOT A MISSING FILE, AND CONFUSING THE TWO LETS
+   * A WRITE LEAVE THE WORKTREE.
+   *
+   * `realpath` answers ENOENT for two completely different situations: a name
+   * that is genuinely absent, and a name that EXISTS as a symbolic link whose
+   * target is absent. The containment walk treats ENOENT as "not created yet"
+   * and steps past it, which is right for the first and catastrophic for the
+   * second — it rejoins the link's name lexically, as though it were an
+   * ordinary directory entry the worker will create inside an already-proven
+   * parent, and reports a path that looks contained.
+   *
+   * It is not contained. A write to a dangling link FOLLOWS the link and
+   * creates the file at its target, so when the owned path IS the dangling
+   * link, the worker's in-lane `Write` lands outside the repository entirely
+   * and `git status` inside the worktree reports nothing. This test scripts a
+   * worker that does exactly that, so with the guard removed it fails on the
+   * escaped bytes rather than on a message.
+   */
+  test("an owned path that is itself a dangling symlink is refused before any worker is spawned", async () => {
+    const world = await makeWorld();
     const outside = join(world.root, "outside");
     await mkdir(outside, { recursive: true });
-    await mkdir(worktree, { recursive: true });
-    // The ordinary shape: a directory inside the worktree is a link elsewhere.
-    await symlink(outside, join(worktree, "src"), "dir");
-    const realOutside = await realpath(outside);
-    const realWorktree = await realpath(worktree);
+    // Deliberately NOT created: that absence is the whole point. The link
+    // exists, its target does not, and `realpath` cannot tell you which.
+    const danglingTarget = join(outside, "not-created.ts");
 
+    const worktree = world.slots[0].worktreePath;
+    const ownedPath = join(worktree, "src", "link.ts");
+    const engine = new FakeEngine();
+    engine.onCreate = () => {
+      mkdirSync(join(worktree, "src"), { recursive: true });
+      symlinkSync(danglingTarget, ownedPath, "file");
+    };
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          await writeFile(
+            join(spec.cwd, "src", "link.ts"),
+            "OVERWRITTEN BY THE WORKER\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/link.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    // Asserted first because it is the breach: nothing was created outside the
+    // worktree, at the link's target or anywhere beside it.
+    expect(await readdir(outside)).toEqual([]);
+    expect(existsSync(danglingTarget)).toBe(false);
+    // No subprocess ever existed, so the user's quota was never spent on a lane
+    // that could only have written somewhere it was never allowed to.
+    expect(adapter.specs.length).toBe(0);
+    expect(result.ok).toBe(false);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      message: `slice slice-auth attempt 1: refusing to grant owned path "src/link.ts": the real path of ${ownedPath} could not be resolved: path component ${ownedPath} is a symbolic link to ${danglingTarget}, whose target could not be resolved`,
+    });
+    expect(harness.engine.removes.length).toBe(1);
+  });
+
+  /**
+   * The same confusion one component higher up, where it costs quota rather
+   * than containment.
+   *
+   * With the dangling link in the MIDDLE of the owned path, a worker writing
+   * there gets `EEXIST` from a recursive `mkdir` — it does not follow the link
+   * to create the target — and then `ENOENT` from the write, so nothing lands
+   * outside. What it costs instead is a real vendor subprocess, the user's paid
+   * quota, and a lane that could not possibly have worked. Before the
+   * placeholder subsystem was deleted, the recursive `mkdir` that pre-created
+   * owned paths hit this link and failed the slice BEFORE any worker launched;
+   * that pre-spawn refusal is what regressed.
+   *
+   * The deeper reason to refuse is that this function's job is to PROVE
+   * containment, and through an unresolvable link it can prove nothing. A
+   * validation that cannot establish its property must refuse, not pass.
+   */
+  test("an owned path leading through a dangling symlink is refused before any worker is spawned", async () => {
+    const world = await makeWorld();
+    const outside = join(world.root, "outside");
+    await mkdir(outside, { recursive: true });
+    const danglingTarget = join(outside, "not-created");
+
+    const worktree = world.slots[0].worktreePath;
+    const linkPath = join(worktree, "src", "link");
+    const engine = new FakeEngine();
+    engine.onCreate = () => {
+      mkdirSync(join(worktree, "src"), { recursive: true });
+      symlinkSync(danglingTarget, linkPath, "dir");
+    };
+
+    const spawnAttempts: string[] = [];
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          spawnAttempts.push(spec.cwd);
+          await writeFile(
+            join(spec.cwd, "src", "link", "victim.ts"),
+            "OVERWRITTEN BY THE WORKER\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/link/victim.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    // The spawn count IS the property under test here, since the worker's write
+    // would have failed on its own. Nothing was spawned, so nothing was spent.
+    expect(adapter.specs.length).toBe(0);
+    expect(spawnAttempts).toEqual([]);
+    expect(await readdir(outside)).toEqual([]);
+    expect(result.ok).toBe(false);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/victim.ts": the real path of ${join(worktree, "src", "link", "victim.ts")} could not be resolved: path component ${linkPath} is a symbolic link to ${danglingTarget}, whose target could not be resolved`,
+    });
+    expect(harness.engine.removes.length).toBe(1);
+  });
+
+  /**
+   * THE CASE A CARELESS FIX BREAKS. Owned paths are normally absent when this
+   * check runs — the worker creates its own files, parent directories and all —
+   * so a guard that stopped the walk at every ENOENT rather than only at an
+   * ENOENT that hides an existing component would refuse every ordinary slice
+   * in the product.
+   *
+   * Stated separately from the read-only test below because it is a different
+   * requirement: not merely that nothing is created, but that a deeply absent
+   * path is ACCEPTED and the worker really does spawn.
+   */
+  test("an owned path whose parent directories do not exist is still accepted", async () => {
+    const world = await makeWorld();
+    const worktree = world.slots[0].worktreePath;
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          // Nothing above this existed at the moment containment was proven.
+          expect(existsSync(join(spec.cwd, "src"))).toBe(false);
+          await mkdir(join(spec.cwd, "src", "deep", "nested"), {
+            recursive: true,
+          });
+          await writeFile(
+            join(spec.cwd, "src", "deep", "nested", "added.ts"),
+            "export const added = true;\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/deep/nested/added.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    expect(attemptAt(result, 0).failure).toBe(null);
+    expect(result.ok).toBe(true);
+    expect(result.commit).toBe("commit-1");
+    expect(adapter.specs.length).toBe(1);
+    expect(
+      await readFile(
+        join(worktree, "src", "deep", "nested", "added.ts"),
+        "utf8",
+      ),
+    ).toBe("export const added = true;\n");
+  });
+
+  /**
+   * THE PROOF IS READ-ONLY, AND A MISSING PATH IS NOT A VIOLATION.
+   *
+   * Both halves matter. Owned paths are normally absent at this moment — the
+   * worker creates its own files — so a guard that treated "does not exist" as
+   * an escape would refuse every ordinary slice, and a guard that resolved a
+   * missing path by creating it would resurrect the placeholder subsystem this
+   * unit deleted. The worker reads the worktree the instant it is spawned and
+   * finds it exactly as the engine left it: empty.
+   */
+  test("the containment proof creates no file and no directory", async () => {
+    const world = await makeWorld();
+    const worktree = world.slots[0].worktreePath;
+    const worktreeAtSpawn: string[][] = [];
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          worktreeAtSpawn.push((await readdir(spec.cwd)).sort());
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(join(spec.cwd, "src", "added.ts"), "ok\n");
+        },
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: {
+          ...SLICE,
+          ownedPaths: ["src/added.ts", "docs/very/deep/notes.md"],
+        },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    expect(result.ok).toBe(true);
+    // The guard ran between `create` and `spawn` and left nothing behind: not
+    // the owned files, not the `docs/very/deep` chain it had to walk up.
+    expect(worktreeAtSpawn).toEqual([[]]);
+    expect(await exists(join(worktree, "docs"))).toBe(false);
+  });
+
+  /**
+   * An absolute owned path is refused by name here too. `validatePlan` rejects
+   * it three modules away, but this is the code that is about to declare the
+   * path writable, so it is the code that has to be able to prove the claim.
+   */
+  test("an absolute owned path is refused by name", async () => {
+    const world = await makeWorld();
+    const worktree = world.slots[0].worktreePath;
     const adapter = claudeAdapter([]);
     const harness = makeHarness({ workers: { claude: adapter.worker } });
     const runner = new DefaultSliceRunner({
@@ -1417,55 +1987,87 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
 
     const result = await withBound(
       runner.run({
-        slice: { ...SLICE, ownedPaths: ["docs/safe.md", "src/c.ts"] },
+        slice: { ...SLICE, ownedPaths: ["/etc/hosts"] },
         directive: DIRECTIVE,
         session: world.session,
         attemptSlots: firstSlot(world),
         routing: ROUTING,
         unsafeInPlace: false,
       }),
-      2000,
+      5000,
       "run",
     );
 
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
-      message: `refusing to pre-create owned path "src/c.ts": an existing path component is a symbolic link leading to ${join(realOutside, "c.ts")}, outside worktree root ${realWorktree}`,
+      message: `slice slice-auth attempt 1: refusing to grant owned path "/etc/hosts": it is absolute and does not belong to worktree root ${worktree}`,
     });
-    // The file the lexical check would have allowed does not exist.
-    expect(await exists(join(outside, "c.ts"))).toBe(false);
-    expect(await exists(join(realOutside, "c.ts"))).toBe(false);
-    // Refused before any write, so the earlier safe path is not left behind.
-    expect(await exists(join(worktree, "docs", "safe.md"))).toBe(false);
     expect(adapter.specs.length).toBe(0);
   });
 
   /**
-   * The containment proof compares real paths against the REAL root, which
-   * matters because on macOS the root is normally reached through a symlink
-   * (`/var -> /private/var`, `/tmp -> /private/tmp`). Comparing a realpath'd
-   * target against a lexical root would refuse every legitimate owned path on
-   * the platform brigadier runs on.
+   * THE REGRESSION FOR THE SECOND HALF OF THE SAME HOLE. `resolve` collapses
+   * `..` LEXICALLY, before any filesystem call, so `src/link/../victim.ts`
+   * becomes `<root>/src/victim.ts` and the `link` component is erased. Every
+   * check downstream then agrees the path is contained — because it is asking
+   * about a path the operating system will never follow. The OS resolving
+   * `link/..` walks to the parent of the symlink's TARGET, not back to the
+   * root, so the write lands outside the worktree exactly as it does through a
+   * plain symlinked directory.
+   *
+   * `validatePlan` rejects `..` three modules away, so a plan cannot carry one;
+   * this is reachable through `createSliceRunner(...).run(...)` directly, and
+   * the guard's own contract is that it restates rather than trusts. It already
+   * restates the empty, NUL and absolute checks. This test states the missing
+   * one.
+   *
+   * Driven through the runner rather than against the helper, because the point
+   * is not that a predicate returns false — it is that no subprocess is ever
+   * told it may write there.
    */
-  test("a worktree root reached through a symlink still pre-creates its owned paths", async () => {
+  test("an owned path with a .. segment stepping out through a symlink is refused before any worker is spawned", async () => {
     const world = await makeWorld();
-    const real = join(world.root, "real-wt");
-    const linked = join(world.root, "linked-wt");
-    await mkdir(real, { recursive: true });
-    await symlink(real, linked, "dir");
+    const outside = join(world.root, "outside");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "victim.ts"), "ORIGINAL SECRET CONTENT\n");
 
+    const worktree = world.slots[0].worktreePath;
+    const engine = new FakeEngine();
+    // `src/link` points at a directory outside the worktree, so the OS reading
+    // `src/link/..` lands in `outside`'s parent — `world.root` — and the file
+    // written beside it is `world.root/outside/victim.ts`.
+    engine.onCreate = () => {
+      mkdirSync(join(worktree, "src"), { recursive: true });
+      symlinkSync(
+        join(outside, "nested"),
+        join(worktree, "src", "link"),
+        "dir",
+      );
+      mkdirSync(join(outside, "nested"), { recursive: true });
+    };
+
+    // Scripted to do exactly what a lane-scoped worker does with the path it
+    // was granted. With the guard removed this runs, and the assertions below
+    // fail on the overwritten bytes rather than on a message.
     const adapter = claudeAdapter([
       {
         onSpawn: async (spec) => {
+          // Concatenated, NOT `join`ed. `join` collapses `..` lexically exactly
+          // as `resolve` does, so joining here would write to `src/victim.ts`
+          // and quietly stage a version of this test that cannot fail. The
+          // whole defect is that the string handed to the OS keeps its `..`.
           await writeFile(
-            join(spec.cwd, "src", "added.ts"),
-            "export const added = true;\n",
+            `${spec.cwd}/src/link/../victim.ts`,
+            "OVERWRITTEN BY THE WORKER\n",
           );
         },
       },
     ]);
-    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
     const runner = new DefaultSliceRunner({
       ports: harness.ports,
       env: ENV,
@@ -1474,104 +2076,96 @@ describe("DefaultSliceRunner owned-path pre-creation", () => {
 
     const result = await withBound(
       runner.run({
-        slice: SLICE,
-        directive: DIRECTIVE,
-        session: world.session,
-        attemptSlots: [{ sliceNumber: 7, worktreePath: linked }],
-        routing: ROUTING,
-        unsafeInPlace: false,
-      }),
-      2000,
-      "run",
-    );
-
-    expect(result.ok).toBe(true);
-    expect(attemptAt(result, 0).failure).toBe(null);
-    expect(await readFile(join(real, "src", "added.ts"), "utf8")).toBe(
-      "export const added = true;\n",
-    );
-  });
-
-  /**
-   * Containment, not link-freedom, is the property. A link that lands back
-   * inside the worktree is an ordinary repository layout and must still work.
-   */
-  test("a symlinked directory that stays inside the worktree is allowed", async () => {
-    const world = await makeWorld();
-    const worktree = join(world.root, "wt", "slice-7");
-    await mkdir(join(worktree, "packages", "core"), { recursive: true });
-    await symlink(
-      join(worktree, "packages", "core"),
-      join(worktree, "src"),
-      "dir",
-    );
-
-    const adapter = claudeAdapter([
-      {
-        onSpawn: async (spec) => {
-          await writeFile(
-            join(spec.cwd, "src", "added.ts"),
-            "export const added = true;\n",
-          );
-        },
-      },
-    ]);
-    const harness = makeHarness({ workers: { claude: adapter.worker } });
-    const runner = new DefaultSliceRunner({
-      ports: harness.ports,
-      env: ENV,
-      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
-    });
-
-    const result = await withBound(
-      runner.run({
-        slice: SLICE,
+        slice: { ...SLICE, ownedPaths: ["src/link/../victim.ts"] },
         directive: DIRECTIVE,
         session: world.session,
         attemptSlots: firstSlot(world),
         routing: ROUTING,
         unsafeInPlace: false,
       }),
-      2000,
+      5000,
       "run",
     );
 
-    expect(result.ok).toBe(true);
-    expect(adapter.specs.length).toBe(1);
-    expect(
-      await readFile(join(worktree, "packages", "core", "added.ts"), "utf8"),
-    ).toBe("export const added = true;\n");
-  });
-
-  test("an absolute owned path is refused", async () => {
-    const world = await makeWorld();
-    const worktree = join(world.root, "wt", "slice-7");
-    const adapter = claudeAdapter([]);
-    const harness = makeHarness({ workers: { claude: adapter.worker } });
-    const runner = new DefaultSliceRunner({
-      ports: harness.ports,
-      env: ENV,
-      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
-    });
-
-    const result = await withBound(
-      runner.run({
-        slice: { ...SLICE, ownedPaths: ["/etc/passwd"] },
-        directive: DIRECTIVE,
-        session: world.session,
-        attemptSlots: firstSlot(world),
-        routing: ROUTING,
-        unsafeInPlace: false,
-      }),
-      2000,
-      "run",
+    // Asserted first because it is the whole point: the file outside the
+    // worktree is untouched, byte for byte.
+    expect(await readFile(join(outside, "victim.ts"), "utf8")).toBe(
+      "ORIGINAL SECRET CONTENT\n",
     );
-
+    // No subprocess ever existed, so nothing was ever told it could write there.
+    expect(adapter.specs.length).toBe(0);
+    expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
-      message: `refusing to pre-create owned path "/etc/passwd": it is absolute and does not belong to worktree root ${worktree}`,
+      message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/../victim.ts": it contains a ".." segment, which may leave worktree root ${worktree} through a symbolic link`,
     });
-    expect(adapter.specs.length).toBe(0);
+    // The refused attempt still tears its worktree down.
+    expect(harness.engine.removes.length).toBe(1);
+  });
+
+  /**
+   * THE CASE THAT BREAKS THE FIX WHILE THE SUITE STAYS GREEN. `..` is refused
+   * as a path SEGMENT, never as a substring. `..hidden.ts` is an ordinary
+   * dotfile and `a..b.ts` an ordinary name — a guard that reached for
+   * `includes("..")` would refuse both and fail closed on real repositories,
+   * with every traversal test still passing.
+   */
+  test("owned paths whose filenames merely contain .. are allowed", async () => {
+    const world = await makeWorld();
+    const worktree = world.slots[0].worktreePath;
+
+    const adapter = claudeAdapter([
+      {
+        onSpawn: async (spec) => {
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(
+            join(spec.cwd, "src", "a..b.ts"),
+            "export const a = 1;\n",
+          );
+          await writeFile(
+            join(spec.cwd, "src", "..hidden.ts"),
+            "export const h = 2;\n",
+          );
+        },
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: {
+          ...SLICE,
+          ownedPaths: [
+            "src/a..b.ts",
+            "src/..hidden.ts",
+            "docs/..deep../notes.md",
+          ],
+        },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "run",
+    );
+
+    expect(attemptAt(result, 0).failure).toBe(null);
+    expect(result.ok).toBe(true);
+    expect(result.commit).toBe("commit-1");
+    expect(adapter.specs.length).toBe(1);
+    expect(await readFile(join(worktree, "src", "a..b.ts"), "utf8")).toBe(
+      "export const a = 1;\n",
+    );
+    expect(await readFile(join(worktree, "src", "..hidden.ts"), "utf8")).toBe(
+      "export const h = 2;\n",
+    );
   });
 });
 

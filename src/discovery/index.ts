@@ -36,7 +36,7 @@ const MAX_STDOUT_CHARS = 8 * 1_024 * 1_024;
 const MAX_STDERR_CHARS = 64 * 1_024;
 
 /** Every vendor discovery knows how to look for. */
-export const VENDOR_CATALOG_SOURCES: readonly VendorCatalogSource[] = [
+const VENDOR_CATALOG_SOURCES: readonly VendorCatalogSource[] = [
   CLAUDE_CATALOG_SOURCE,
   CODEX_CATALOG_SOURCE,
 ];
@@ -232,7 +232,7 @@ export function createDiscoverer(
   return new VendorDiscoverer(options);
 }
 
-export interface CommandRunnerOptions {
+interface CommandRunnerOptions {
   readonly timeoutMs?: number | undefined;
   readonly cwd?: string | undefined;
   readonly environment?:
@@ -248,9 +248,7 @@ export interface CommandRunnerOptions {
  * forever — and ignoring stdin makes a hang impossible rather than unlikely.
  * The timeout is a second guard for a CLI that wedges without reading stdin.
  */
-export function createCommandRunner(
-  options: CommandRunnerOptions = {},
-): RunCommand {
+function createCommandRunner(options: CommandRunnerOptions = {}): RunCommand {
   const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
   return (executable, args) =>
     new Promise<CommandResult>((resolve, reject) => {

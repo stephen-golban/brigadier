@@ -171,6 +171,8 @@ interface FakeEngine {
 
 interface FakeEngineOptions {
   readonly prepareError?: string;
+  /** Runs after `prepare` has started and before it returns its session. */
+  readonly onPrepare?: () => void;
   /** Slice branches whose merge conflicts instead of merging. */
   readonly conflictBranches?: readonly string[];
   /** Slice branches whose merge throws. */
@@ -188,6 +190,7 @@ function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
       ops.push(
         `prepare ${spec.repositoryPath} ${spec.slug} consent=${String(spec.secrets.consentToLink)} linked=${spec.secrets.linkedPaths.length}`,
       );
+      options.onPrepare?.();
       if (options.prepareError !== undefined) {
         throw new Error(options.prepareError);
       }
@@ -260,6 +263,7 @@ function forbiddenEngine(): FakeEngine {
 interface FakePorts {
   readonly ports: SupervisorPorts;
   readonly log: readonly string[];
+  nowCalls(): number;
 }
 
 function fakePorts(
@@ -267,17 +271,22 @@ function fakePorts(
   oracles: readonly AnyQuotaOracle[] = [],
 ): FakePorts {
   const log: string[] = [];
+  let nowCalls = 0;
   return {
     ports: {
       engine,
       workerFor: (_vendor: Vendor) => null,
       oracles,
-      now: () => NOW,
+      now: () => {
+        nowCalls += 1;
+        return NOW;
+      },
       log: (line: string) => {
         log.push(line);
       },
     },
     log,
+    nowCalls: () => nowCalls,
   };
 }
 
@@ -407,6 +416,7 @@ interface Harness {
   readonly report: RunReport;
   readonly ops: readonly string[];
   readonly log: readonly string[];
+  nowCalls(): number;
   readonly runner: FakeRunner;
 }
 
@@ -430,6 +440,7 @@ async function execute(
     report,
     ops: engineFake.ops,
     log: portsFake.log,
+    nowCalls: portsFake.nowCalls,
     runner: runnerFake,
   };
 }
@@ -1601,14 +1612,74 @@ describe("cancellation", () => {
   });
 
   /**
-   * There is no "a later wave is not started after an abort" test here, and the
-   * reason is that a later wave cannot currently exist: `validatePlan` refuses
-   * any slice declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every
-   * schedulable plan is exactly one wave. The orchestrator's wave-level guard
-   * is unreachable today and is kept for the day dependency waves land; the
-   * guard that actually stops work now is the per-slice one, proven above by
-   * the exact input count.
+   * A later wave cannot currently exist: `validatePlan` refuses any slice
+   * declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every schedulable
+   * plan is exactly one wave. The wave-level guard is still reachable when an
+   * abort lands during `prepare`; the test below proves that first wave never
+   * starts. The per-slice guard above covers an abort after a wave has started.
    */
+
+  test("an abort during prepare starts no slice and reports every slice cancelled", async () => {
+    const controller = new AbortController();
+    const engine = fakeEngine({
+      onPrepare: () => {
+        controller.abort(SIGINT_REASON);
+      },
+    });
+    const harness = await execute(
+      interruptibleRequest(
+        planDocument([slice("a"), slice("b")]),
+        2,
+        controller.signal,
+      ),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "release demo",
+    ]);
+    expect(harness.runner.inputs()).toEqual([]);
+    // Start, two routing brackets per slice, and finish: entering the wave
+    // would add one `now()` call for each slice before its per-slice guard.
+    expect(harness.nowCalls()).toBe(6);
+    expect(harness.report).toEqual({
+      ok: false,
+      slug: "demo",
+      dryRun: false,
+      interrupted: true,
+      cleanupFailures: [],
+      integrationBranch: null,
+      slices: [
+        {
+          sliceId: "a",
+          ok: false,
+          cancelled: true,
+          branch: null,
+          commit: null,
+          worktree: null,
+          attempts: [],
+        },
+        {
+          sliceId: "b",
+          ok: false,
+          cancelled: true,
+          branch: null,
+          commit: null,
+          worktree: null,
+          attempts: [],
+        },
+      ],
+      merges: [],
+      planIssues: [],
+      failure: {
+        reason: "SLICE_FAILED",
+        message: "2 slice(s) cancelled by brigadier received SIGINT: a, b",
+      },
+      durationMs: 0,
+    });
+  });
 
   test("cancelled slices are counted apart from slices that failed on their own", async () => {
     const controller = new AbortController();

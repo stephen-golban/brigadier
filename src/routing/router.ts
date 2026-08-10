@@ -127,7 +127,6 @@ interface EffortResolution {
 interface Selection {
   readonly candidate: ScoredModel;
   readonly effort: Effort;
-  readonly base: Effort;
   readonly floor: number;
   /** Candidates that cleared competence, best-value first. */
   readonly eligible: readonly ScoredModel[];
@@ -776,7 +775,6 @@ function selectWorker(
       selection: {
         candidate,
         effort: resolved.effort,
-        base,
         floor,
         eligible,
         usedUnranked,

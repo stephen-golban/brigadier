@@ -4,7 +4,7 @@ import {
   shutdownProcessGroup,
 } from "../shared/process.ts";
 
-export interface WorkerLifecycleOptions {
+interface WorkerLifecycleOptions {
   readonly processHandle: DetachedProcess;
   readonly idleTimeoutMs: number;
   readonly timeoutMs: number | null;

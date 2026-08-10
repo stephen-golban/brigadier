@@ -81,7 +81,7 @@ describe("buildWorkerSpec", () => {
       maxTurns: null,
       maxBudgetUsd: null,
       excludeDynamicSystemPromptSections: true,
-      tools: ["Edit", "Glob", "Grep", "Read"],
+      tools: ["Edit", "Glob", "Grep", "Read", "Write"],
       extraDirectories: [],
       mcp: { configFiles: [], strict: true },
     });
@@ -187,38 +187,50 @@ describe("buildWorkerSpec", () => {
     }
     if (spec.tools.includes("Bash")) {
       throw new Error(
-        "Claude tools must exclude Bash: Edit(glob) rules do not constrain shell writes, so Bash would widen the worker lane to the whole filesystem",
+        "Claude tools must exclude Bash: Edit(glob) and Write(glob) rules do not constrain shell writes, so Bash would widen the worker lane to the whole filesystem",
       );
     }
 
-    expect(spec.tools).toEqual(["Edit", "Glob", "Grep", "Read"]);
+    expect(spec.tools).toEqual(["Edit", "Glob", "Grep", "Read", "Write"]);
   });
 
   /**
    * The injection this guard exists for. Claude's lane is one `--allowedTools`
-   * argument of comma-joined `Edit(<path>)` rules, so an owned path spelled
-   * `owned),Edit(package.json` closes its own rule and opens a second one for a
-   * file the slice does not own. The plan gate rejects these first; this is the
-   * second layer, at the last point an owned path is seen before it becomes a
-   * vendor permission rule.
+   * argument of comma-joined `Edit(<path>)` and `Write(<path>)` rules, so an
+   * owned path spelled `owned),Edit(package.json` closes its own rule and opens
+   * a second one for a file the slice does not own. The plan gate rejects these
+   * first; this is the second layer, at the last point an owned path is seen
+   * before it becomes a vendor permission rule.
+   *
+   * BOTH RULE KINDS ARE ATTACKABLE THE SAME WAY, which is why the `Write` spelling
+   * is here beside the `Edit` one: the payload that forges a create permission for
+   * `package.json` is exactly as damaging as the one that forges an edit
+   * permission for it, and the guard is a property of the characters rather than
+   * of the rule name, so neither can be refused without the other.
    */
   test("refuses an owned path that would inject a second Claude permission rule", () => {
-    const injected: Slice = {
-      ...SLICE,
-      ownedPaths: ["src/auth.ts", "owned),Edit(package.json"],
-    };
+    const payloads = [
+      "owned),Edit(package.json",
+      "owned),Write(package.json",
+    ] as const;
 
-    for (const routed of [CLAUDE_ROUTE, CODEX_ROUTE]) {
-      expect(() =>
-        buildWorkerSpec({
-          slice: injected,
-          routed,
-          worktreePath: "/worktrees/run-17/slice-auth",
-          env: ENV,
-        }),
-      ).toThrow(
-        'refusing to build a worker spec for slice "slice-auth": owned path "owned),Edit(package.json" contains U+0028, U+0029, U+002C, which can alter a vendor\'s lane grammar',
-      );
+    for (const payload of payloads) {
+      const injected: Slice = {
+        ...SLICE,
+        ownedPaths: ["src/auth.ts", payload],
+      };
+      for (const routed of [CLAUDE_ROUTE, CODEX_ROUTE]) {
+        expect(() =>
+          buildWorkerSpec({
+            slice: injected,
+            routed,
+            worktreePath: "/worktrees/run-17/slice-auth",
+            env: ENV,
+          }),
+        ).toThrow(
+          `refusing to build a worker spec for slice "slice-auth": owned path ${JSON.stringify(payload)} contains U+0028, U+0029, U+002C, which can alter a vendor's lane grammar`,
+        );
+      }
     }
   });
 
@@ -355,11 +367,11 @@ describe("buildWorkerSpec", () => {
       "--permission-mode",
       "dontAsk",
       "--tools",
-      "Edit,Glob,Grep,Read",
+      "Edit,Glob,Grep,Read,Write",
       "--allowedTools",
-      "Edit(src/auth.ts),Edit(test/auth.test.ts)",
+      "Edit(src/auth.ts),Write(src/auth.ts),Edit(test/auth.test.ts),Write(test/auth.test.ts)",
       "--disallowedTools",
-      "Write,WebFetch,WebSearch",
+      "WebFetch,WebSearch",
       "--setting-sources",
       "project,local",
       "--strict-mcp-config",

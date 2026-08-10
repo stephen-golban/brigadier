@@ -93,11 +93,11 @@ export const EFFORT_CEILING_WARNING =
   "Warning: above `high`, models take longer, burn more tokens, hallucinate more, and do worse work.";
 
 /** Decision #20: the ceiling is a cap, not a pin, and xhigh stays earned. */
-export const EFFORT_CEILING_NOTE =
+const EFFORT_CEILING_NOTE =
   "`xhigh` stays earned-on-retry regardless of this ceiling: brigadier reaches for it only after a slice fails its gate. Effort is never pinned per task tier.";
 
 /** Decision #19 and #7, said out loud so the config is not mistaken for a router. */
-export const ROUTER_NOTE =
+const ROUTER_NOTE =
   "This config layers on top of brigadier's router: it records which models are permitted and how high their effort may go. Routing still filters by capability, ranks by competence, then weighs difficulty, effort, and cost. Vendor is never a routing input.";
 
 export interface InitOptions {
@@ -449,7 +449,7 @@ function describe(error: unknown): string {
 /* Command line                                                              */
 /* ------------------------------------------------------------------------ */
 
-export interface CliOptions {
+interface CliOptions {
   /** `process.argv.slice(2)`. */
   readonly argv: readonly string[];
   readonly version: string;
@@ -492,7 +492,7 @@ export interface CliOptions {
  * the shim is left with only the two things it alone can do: write to the real
  * stderr and exit the real process.
  */
-export interface InterruptDecision {
+interface InterruptDecision {
   /** Exactly what to write to stderr, newline-terminated on both ends. */
   readonly message: string;
   /** Null to keep running; a number to exit with that code immediately. */
@@ -573,7 +573,7 @@ export function createInterruptGate(): InterruptGate {
   };
 }
 
-export const USAGE = `Usage: brigadier <command> [options]
+const USAGE = `Usage: brigadier <command> [options]
 
 Commands:
   init                 scan for installed worker CLIs and write a config
@@ -802,7 +802,7 @@ export interface RunHarness {
   readonly sliceRunner?: SliceRunner;
 }
 
-export interface RunOptions {
+interface RunOptions {
   /** `argv` with the `run` command word already removed. */
   readonly argv: readonly string[];
   readonly env: ConfigEnvironment;
@@ -821,7 +821,7 @@ export interface RunOptions {
 }
 
 /** Runs `brigadier run` and resolves the process exit code. */
-export async function runPlan(options: RunOptions): Promise<number> {
+async function runPlan(options: RunOptions): Promise<number> {
   const { stdout, stderr } = options;
 
   const parsed = parseRunArguments(options.argv);
@@ -974,7 +974,7 @@ function interruptedExitCode(signal: AbortSignal | undefined): number | null {
  * against are the ports the CLI actually builds rather than a reimplementation
  * of them.
  */
-export interface RunDependenciesInput {
+interface RunDependenciesInput {
   readonly config: BrigadierConfig;
   readonly env: LaunchEnv;
   readonly log: (line: string) => void;
@@ -1038,7 +1038,7 @@ export function buildRunDependencies(
  * and process handle — so sharing them is safe and keeps a concurrent wave from
  * re-resolving the same path per slice.
  */
-export function createWorkerFactory(
+function createWorkerFactory(
   config: BrigadierConfig,
 ): (vendor: Vendor) => AnyWorker | null {
   const adapters = new Map<Vendor, AnyWorker>();
