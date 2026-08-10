@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-platform:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-latest
+            target: bun-darwin-arm64
+          - platform: darwin-x64
+            runner: macos-latest
+            target: bun-darwin-x64
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            target: bun-linux-arm64
+          - platform: linux-x64
+            runner: ubuntu-latest
+            target: bun-linux-x64
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      DEVELOPER_ID_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          package_version="$(bun -e 'console.log(require("./package.json").version)')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "${package_version}" != "${tag_version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package version ${package_version}" >&2
+            exit 1
+          fi
+      - name: Build native executable
+        run: |
+          mkdir -p release-bin
+          bun build ./src/cli.ts --compile --bytecode --minify --sourcemap \
+            --target=${{ matrix.target }} --outfile ./release-bin/brigadier
+      - name: Ad-hoc sign Darwin executable
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - ./release-bin/brigadier
+          codesign --verify --strict ./release-bin/brigadier
+      - name: Install Developer ID certificate
+        if: >-
+          runner.os == 'macOS' && env.APPLE_ID != '' &&
+          env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' &&
+          env.DEVELOPER_ID_IDENTITY != '' &&
+          env.APPLE_CERTIFICATE_P12 != '' &&
+          env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != ''
+        shell: bash
+        run: |
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/brigadier-signing.keychain-db"
+          printf '%s' "${APPLE_CERTIFICATE_P12}" | base64 --decode > "${certificate_path}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security import "${certificate_path}" -P "${APPLE_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain_path}"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security list-keychain -d user -s "${keychain_path}"
+      - name: Developer ID sign and notarize
+        if: >-
+          runner.os == 'macOS' && env.APPLE_ID != '' &&
+          env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' &&
+          env.DEVELOPER_ID_IDENTITY != '' &&
+          env.APPLE_CERTIFICATE_P12 != '' &&
+          env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != ''
+        env:
+          ARTIFACT_PATH: ${{ github.workspace }}/release-bin/brigadier
+          NOTARIZED_DMG_PATH: ${{ github.workspace }}/release-bin/brigadier-${{ github.ref_name }}-${{ matrix.platform }}.dmg
+        run: ./scripts/notarize.sh
+      - name: Assemble release archive and platform npm package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release-packages
+          tar -czf "release-packages/brigadier-${version}-${{ matrix.platform }}.tar.gz" -C release-bin brigadier
+          if [[ -f "release-bin/brigadier-${GITHUB_REF_NAME}-${{ matrix.platform }}.dmg" ]]; then
+            cp "release-bin/brigadier-${GITHUB_REF_NAME}-${{ matrix.platform }}.dmg" release-packages/
+          fi
+          cd release-packages
+          shasum -a 256 "brigadier-${version}-${{ matrix.platform }}.tar.gz" > "brigadier-${version}-${{ matrix.platform }}.tar.gz.sha256"
+          cd ..
+          bun ./scripts/assemble-platform-package.ts "${{ matrix.platform }}" ./release-bin/brigadier ./release-packages
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-packages/*
+          if-no-files-found: error
+
+  package-root:
+    name: Package root npm module
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4.4.0
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Build MCP output when its source slice is present
+        shell: bash
+        run: |
+          if [[ -f src/mcp/server.ts ]]; then
+            bun run build:mcp
+          else
+            echo "src/mcp/server.ts is not present; packaging the declared MCP shim without its future build output"
+          fi
+      - run: mkdir -p release-packages && npm pack --pack-destination release-packages
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: release-root-npm
+          path: release-packages/*.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm packages
+    needs:
+      - build-platform
+      - package-root
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: release-*
+          path: release-packages
+          merge-multiple: true
+      - uses: actions/setup-node@v6.5.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish platform packages before root package
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for package in release-packages/stephen-golban-brigadier-darwin-*.tgz release-packages/stephen-golban-brigadier-linux-*.tgz; do
+            npm publish "${package}" --access public
+          done
+          npm publish "release-packages/stephen-golban-brigadier-${version}.tgz" --access public
+      - name: Publication disabled
+        if: env.NPM_TOKEN == ''
+        run: echo "NPM_TOKEN is unset; npm publication is disabled"
+
+  publish-github:
+    name: Publish GitHub release
+    needs: build-platform
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_PUBLISH_ENABLED: ${{ secrets.RELEASE_PUBLISH_ENABLED }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: release-*
+          path: release-packages
+          merge-multiple: true
+      - name: Create GitHub release
+        if: env.RELEASE_PUBLISH_ENABLED == 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=(release-packages/*.tar.gz release-packages/*.tar.gz.sha256 release-packages/*.dmg)
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+      - name: Publication disabled
+        if: env.RELEASE_PUBLISH_ENABLED != 'true'
+        run: echo "RELEASE_PUBLISH_ENABLED is not true; GitHub release publication is disabled"

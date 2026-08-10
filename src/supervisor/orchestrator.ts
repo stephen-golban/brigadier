@@ -17,25 +17,24 @@
  *   2. check directive coverage     — a slice with no difficulty cannot route
  *   3. read quota, route every slice— pre-flight, before any side effect exists
  *   4. prepare the session          — the first thing that writes a ref
- *   5. run the waves                — bounded concurrency, dependency-ordered
- *   6. reconcile                    — merge in a stable order, after everything
+ *   5. run and accumulate waves     — reconcile before dependent worktrees exist
+ *   6. finalize                     — materialize integration after all commits
  *   7. remove surviving worktrees   — after reconcile, never before
  *   8. release the session's refs   — after every worktree is gone
  *   9. remove the empty scaffold    — the two directories the worktrees hung
  *                                     under, and only while they are empty
  *
- * Steps 1 through 3 are all "fail before creating anything". Step 6 is after
- * step 5 in its entirety rather than interleaved with it, because
- * `engine.commit()` throws "slice commits are closed after integration begins"
- * the moment the first `merge()` materializes the integration branch — an
- * interleaved run would not merely produce a surprising ref, it would make the
- * last slices in the schedule uncommittable. Step 7 is after step 6 for the
- * mirror-image reason: `engine.merge()` opens with a registry lookup of the
- * worktree it is handed and rejects one that was already removed. Step 8 is
- * after step 7 because `engine.release()` refuses to retire refs while a
- * worktree created from the session is still active. Step 9 is last because
- * `<repo>-brigadier/<slug>` cannot be empty until every worktree beneath it has
- * been removed, and it removes nothing that is not empty.
+ * Steps 1 through 3 are all "fail before creating anything". Step 5 uses
+ * `merge({ finalize: false })` between waves: it advances only the scratch base,
+ * so the next wave starts from its prerequisites without closing slice commits.
+ * Step 6 is the first default merge and therefore the only point that
+ * materializes the integration branch; every slice that can commit has already
+ * done so by then. Step 7 follows because `engine.merge()` rejects a worktree
+ * that was already removed. Step 8 is after step 7 because `engine.release()`
+ * refuses to retire refs while a worktree created from the session is still
+ * active. Step 9 is last because `<repo>-brigadier/<slug>` cannot be empty until
+ * every worktree beneath it has been removed, and it removes nothing that is
+ * not empty.
  *
  * INTERRUPTION DOES NOT GET ITS OWN PATH THROUGH THIS SEQUENCE, and that is the
  * design rather than an omission. An aborted `RunRequest.signal` stops the run
@@ -74,6 +73,7 @@ import type {
   SliceDirective,
   SliceMergeRecord,
   SliceResult,
+  SliceReview,
   SliceRunInput,
   SliceRunner,
   SupervisorPorts,
@@ -490,12 +490,15 @@ async function executeRun(
     session = await ports.engine.prepare({
       repositoryPath: request.repositoryPath,
       slug: request.slug,
-      // `linkedPaths` is empty because nothing in this unit discovers secret
-      // files; a later unit sources the inventory and fills it in. The consent
-      // flag is already meaningful on its own — the engine refuses to link
-      // anything without it — so wiring it now keeps the policy honest even
-      // while the path list is empty.
-      secrets: { linkedPaths: [], consentToLink: config.secretsConsent },
+      // INVENTORY IS NOT LINKING. Even a hand-edited config that carries paths
+      // while consent is false must inventory their values: redaction is
+      // mandatory, while exposing those files to a worker is separately gated
+      // by `consentToLink`. Passing both fields unchanged lets the engine redact
+      // every artifact and still refuse to seed a link without explicit consent.
+      secrets: {
+        linkedPaths: config.linkedSecretPaths,
+        consentToLink: config.secretsConsent,
+      },
     });
   } catch (error) {
     return finish({
@@ -525,7 +528,13 @@ async function executeRun(
   let integrationBranch: string | null = null;
 
   try {
-    for (const wave of validation.waves) {
+    for (
+      let waveIndex = 0;
+      waveIndex < validation.waves.length;
+      waveIndex += 1
+    ) {
+      // biome-ignore lint/style/noNonNullAssertion: bounded by `validation.waves.length`.
+      const wave = validation.waves[waveIndex]!;
       if (interrupted()) {
         // STOP STARTING WAVES. An abort can land during `prepare`, after the
         // pre-prepare check and before this first wave. This guard keeps that
@@ -537,13 +546,16 @@ async function executeRun(
         skipped.push(...wave);
         continue;
       }
-      if (sliceFailed) {
-        // LATER WAVES DEPEND ON EARLIER ONES BY CONSTRUCTION. Running this wave
-        // would spawn workers against prerequisites that were never produced,
-        // burning quota to generate diffs written against a tree that does not
-        // exist. Slices already in flight are left to finish rather than
-        // killed: they are independent of the failure by definition, their work
-        // is already paid for, and a half-killed worker leaves a dirty worktree.
+      if (sliceFailed || mergeFailure !== null) {
+        // Conservatively stop every later wave after a missing prerequisite or
+        // an accumulation conflict. Topological waves do not prove that every
+        // later member depends on the failed slice, but starting only selected
+        // members would make a run's scope depend on transitive-failure analysis
+        // this scheduler does not expose. Stopping all later waves guarantees
+        // that no dependent runs against a base missing promised content.
+        // Slices already in flight are left to finish: they are independent of
+        // the failure by definition, their work is already paid for, and a
+        // half-killed worker leaves a dirty worktree.
         skipped.push(...wave);
         continue;
       }
@@ -615,6 +627,38 @@ async function executeRun(
         }
         ports.log(sliceLogLine(result));
       }
+
+      // Every non-final wave must become the base BEFORE the next wave creates
+      // a worktree. `finalize: false` is load-bearing: a default merge here
+      // materializes the integration branch and closes `engine.commit()`, which
+      // would make every later slice fail before it could carry the dependency.
+      if (waveIndex < validation.waves.length - 1) {
+        const waveSurvivors = waveResults
+          .filter((result): result is SucceededSlice => result.ok)
+          .sort(
+            (a, b) =>
+              sliceNumberOf(byId, a.sliceId) - sliceNumberOf(byId, b.sliceId),
+          );
+        for (const result of waveSurvivors) {
+          try {
+            const accumulated = await ports.engine.merge({
+              worktree: result.worktree,
+              finalize: false,
+            });
+            ports.log(`accumulate ${result.sliceId}: ${accumulated.status}`);
+            if (accumulated.status === "conflicted") {
+              // Finish accumulating independent siblings in this wave because
+              // the engine leaves every ref unchanged on conflict. Do not start
+              // another wave: its dependency set may include this missing slice.
+              mergeFailure ??= `slice ${result.sliceId} conflicts while accumulating wave ${waveIndex + 1}`;
+            }
+          } catch (error) {
+            const message = `accumulate ${result.sliceId}: error ${errorMessage(error)}`;
+            ports.log(message);
+            mergeFailure ??= message;
+          }
+        }
+      }
     }
     if (skipped.length > 0) {
       ports.log(
@@ -622,12 +666,13 @@ async function executeRun(
       );
     }
 
-    /* --------------------------- 6. reconcile ---------------------------- */
+    /* ---------------------------- 6. finalize ----------------------------- */
 
-    // MERGE IN `sliceNumber` ORDER, NEVER COMPLETION ORDER. Completion order is
-    // a function of how long each worker happened to take, so an integration
-    // history keyed to it is not reproducible and two identical runs produce
-    // two different first-parent chains.
+    // MERGE IN `sliceNumber` ORDER, NEVER COMPLETION ORDER. The first default
+    // merge materializes the accumulated scratch head as the integration
+    // branch; earlier-wave slices then report `already-integrated`, while the
+    // final wave is reconciled onto it. This happens only after all workers have
+    // committed, so integration can safely close further slice commits.
     const ordered = [...survivors].sort(
       (a, b) => sliceNumberOf(byId, a.sliceId) - sliceNumberOf(byId, b.sliceId),
     );
@@ -947,6 +992,10 @@ function preflightSliceResult(preflight: Preflight): SliceResult {
         routed: preflight.decision.routed,
         outcome: null,
         commit: null,
+        // Nothing ran, so nothing was reviewed. A dry run reports which model
+        // WOULD do the work; it cannot report what a reviewer would think of
+        // work that does not exist.
+        review: null,
         failure: null,
         durationMs: preflight.durationMs,
       }
@@ -955,6 +1004,7 @@ function preflightSliceResult(preflight: Preflight): SliceResult {
         routed: null,
         outcome: null,
         commit: null,
+        review: null,
         failure: {
           kind: "ROUTING_FAILED",
           message: preflight.decision.message,
@@ -1061,6 +1111,7 @@ function runnerThrewResult(
         routed: null,
         outcome: null,
         commit: null,
+        review: null,
         failure: {
           kind: "WORKER_FAILED",
           message,
@@ -1089,13 +1140,33 @@ function sliceNumberOf(
 
 function sliceLogLine(result: SliceResult): string {
   if (result.ok) {
-    return `slice ${result.sliceId}: ok ${result.branch} ${result.commit}`;
+    // The gate's verdict rides on the success line because "ok" alone can now
+    // mean two different things: reviewed and approved, or committed with no
+    // review at all because the gate could not run. A log that printed them
+    // identically would be the first place that difference disappeared.
+    return `slice ${result.sliceId}: ok ${result.branch} ${result.commit} (review: ${logVerdict(result.attempts.at(-1)?.review ?? null)})`;
   }
   const kind = result.attempts.at(-1)?.failure?.kind ?? "NOT_ATTEMPTED";
   // "failed" is a verdict on the work. A cancelled slice has not earned one.
   return result.cancelled === true
     ? `slice ${result.sliceId}: cancelled`
     : `slice ${result.sliceId}: failed ${kind}`;
+}
+
+/**
+ * The shortest honest form of a verdict.
+ *
+ * `none` rather than an empty string for an absent review: a slice can only be
+ * `ok` by passing through the gate, so a null verdict on a successful slice is
+ * a defect worth being able to see in a log rather than a blank nobody notices.
+ */
+function logVerdict(review: SliceReview | null): string {
+  if (review === null) {
+    return "none";
+  }
+  return review.verdict === "skipped"
+    ? `skipped ${review.reason}`
+    : `${review.verdict} by ${review.reviewer.vendor}/${review.reviewer.model}`;
 }
 
 function errorMessage(error: unknown): string {

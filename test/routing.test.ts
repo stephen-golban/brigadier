@@ -58,6 +58,7 @@ function makeConfig(
   return parseConfig({
     version: CONFIG_VERSION,
     secretsConsent: false,
+    linkedSecretPaths: [],
     allowDegradedRouting,
     vendors: specs.map((spec) => ({
       vendor: spec.vendor,
@@ -387,7 +388,7 @@ describe("competence rank and difficulty floor", () => {
     );
   });
 
-  test("an unranked model is admitted only when no ranked model clears the floor", () => {
+  test("an unranked model cannot establish the difficulty floor without consent", () => {
     const config = makeConfig([
       {
         vendor: "claude",
@@ -397,27 +398,78 @@ describe("competence rank and difficulty floor", () => {
         ],
       },
     ]);
+    const failure = expectFailure(route(request("hard"), input(config)));
+    expect(failure.reason).toBe("NO_CAPABLE_MODEL");
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "competence",
+        reason: "competence score 74 is below the hard floor of 90",
+      },
+      {
+        vendor: "claude",
+        model: "mystery-model-1",
+        stage: "competence",
+        reason:
+          "no competence rule ranks this model, so brigadier cannot establish that it clears the hard floor of 90",
+      },
+    ]);
+  });
+
+  test("degraded-routing consent admits an unranked model and records the waiver", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [["mystery-model-1", "high"]],
+        },
+      ],
+      true,
+    );
     const routed = expectRouted(route(request("hard"), input(config)));
     expect(routed.model).toBe("mystery-model-1");
     expect(routed.effort).toBe("high");
+    expect(routed.waivedDifficultyFloor).toBe(true);
     expect(routed.rationale[3]).toBe(
-      "competence: hard difficulty sets a floor of 90; eligible claude/mystery-model-1=0; picked claude/mystery-model-1 — not in brigadier's competence table; offered because the probe found it, ranked below the tiers brigadier has exercised (no ranked model cleared the floor, so unranked candidates were admitted in config order)",
+      "competence: the hard difficulty floor of 90 was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: claude/mystery-model-1=unranked; picked claude/mystery-model-1 with no competence rank (ranked scores win over unranked models once the floor is waived; unranked ties break on config order)",
     );
   });
 
-  test("unranked candidates are ordered by config position", () => {
-    const config = makeConfig([
-      {
-        vendor: "claude",
-        models: [
-          ["mystery-model-b", "high"],
-          ["mystery-model-a", "high"],
-        ],
-      },
-    ]);
-    expect(expectRouted(route(request("hard"), input(config))).model).toBe(
-      "mystery-model-b",
+  test("consented salvage prefers a ranked model over an unranked model", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["mystery-model-1", "high"],
+            ["claude-sonnet-5", "high"],
+          ],
+        },
+      ],
+      true,
     );
+    const routed = expectRouted(route(request("hard"), input(config)));
+    expect(routed.model).toBe("claude-sonnet-5");
+    expect(routed.waivedDifficultyFloor).toBe(true);
+  });
+
+  test("unranked candidates are ordered by config position", () => {
+    const config = makeConfig(
+      [
+        {
+          vendor: "claude",
+          models: [
+            ["mystery-model-b", "high"],
+            ["mystery-model-a", "high"],
+          ],
+        },
+      ],
+      true,
+    );
+    const routed = expectRouted(route(request("hard"), input(config)));
+    expect(routed.model).toBe("mystery-model-b");
+    expect(routed.waivedDifficultyFloor).toBe(true);
   });
 
   test("nothing clearing the floor and nothing unranked is NO_CAPABLE_MODEL", () => {
@@ -523,35 +575,31 @@ describe("model exclusion", () => {
         vendor: "claude",
         model: "claude-opus-4-6",
         stage: "excluded",
-        reason:
-          "claude/claude-opus-4-6 already ran this slice and failed its gate",
+        reason: "claude/claude-opus-4-6 already ran this slice and failed",
       },
       {
         vendor: "claude",
         model: "claude-sonnet-5",
         stage: "excluded",
-        reason:
-          "claude/claude-sonnet-5 already ran this slice and failed its gate",
+        reason: "claude/claude-sonnet-5 already ran this slice and failed",
       },
       {
         vendor: "claude",
         model: "claude-haiku-5",
         stage: "excluded",
-        reason:
-          "claude/claude-haiku-5 already ran this slice and failed its gate",
+        reason: "claude/claude-haiku-5 already ran this slice and failed",
       },
       {
         vendor: "codex",
         model: "gpt-5.6-sol",
         stage: "excluded",
-        reason: "codex/gpt-5.6-sol already ran this slice and failed its gate",
+        reason: "codex/gpt-5.6-sol already ran this slice and failed",
       },
       {
         vendor: "codex",
         model: "gpt-5.6-terra",
         stage: "excluded",
-        reason:
-          "codex/gpt-5.6-terra already ran this slice and failed its gate",
+        reason: "codex/gpt-5.6-terra already ran this slice and failed",
       },
     ]);
   });
@@ -709,7 +757,7 @@ describe("effort", () => {
     );
     expect(routed.effort).toBe("xhigh");
     expect(routed.rationale[4]).toBe(
-      'effort: base "xhigh" from escalation after a failed gate; no clamp applied; final "xhigh"',
+      'effort: base "xhigh" from escalation after a routed model ran the slice and failed; no clamp applied; final "xhigh"',
     );
   });
 
@@ -727,7 +775,7 @@ describe("effort", () => {
     );
     expect(routed.effort).toBe("high");
     expect(routed.rationale[4]).toBe(
-      'effort: base "xhigh" from escalation after a failed gate; clamped down by the configured effort ceiling "high"; final "high"',
+      'effort: base "xhigh" from escalation after a routed model ran the slice and failed; clamped down by the configured effort ceiling "high"; final "high"',
     );
   });
 

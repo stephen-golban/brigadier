@@ -58,7 +58,7 @@ describe("plan validation success", () => {
     });
   });
 
-  test("rejects every dependent slice in plan order", () => {
+  test("returns dependency waves in prerequisite order", () => {
     const input = plan([
       slice("d", ["src/d.ts"], ["b", "c"]),
       slice("c", ["src/c.ts"], ["a"]),
@@ -68,30 +68,15 @@ describe("plan validation success", () => {
     ]);
 
     expect(validatePlan(input)).toEqual({
-      ok: false,
-      issues: [
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "d" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["d"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "c" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["c"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "b" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["b"],
-          paths: [],
-        },
-      ],
+      ok: true,
+      waves: [["a", "e"], ["b", "c"], ["d"]],
+      normalizedPaths: new Map([
+        ["d", ["src/d.ts"]],
+        ["c", ["src/c.ts"]],
+        ["b", ["src/b.ts"]],
+        ["e", ["src/e.ts"]],
+        ["a", ["src/a.ts"]],
+      ]),
     });
   });
 });
@@ -111,20 +96,16 @@ describe("plan structure", () => {
     });
   });
 
-  test("refuses a valid dependency because prerequisite content is unavailable", () => {
+  test("accepts a valid dependency and schedules its prerequisite first", () => {
     const input = plan([slice("b", ["src/b.ts"], ["a"]), slice("a")]);
 
     expect(validatePlan(input)).toEqual({
-      ok: false,
-      issues: [
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "b" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["b"],
-          paths: [],
-        },
-      ],
+      ok: true,
+      waves: [["a"], ["b"]],
+      normalizedPaths: new Map([
+        ["b", ["src/b.ts"]],
+        ["a", ["src/a.ts"]],
+      ]),
     });
   });
 
@@ -601,20 +582,6 @@ describe("dependency graph", () => {
           sliceIds: ["b"],
           paths: [],
         },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "a" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["a"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "b" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["b"],
-          paths: [],
-        },
       ],
     });
   });
@@ -633,27 +600,6 @@ describe("dependency graph", () => {
           code: "DEPENDENCY_CYCLE",
           message: 'dependency cycle contains slices: "a", "b"',
           sliceIds: ["a", "b"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "downstream" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["downstream"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "b" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["b"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "a" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["a"],
           paths: [],
         },
       ],
@@ -683,34 +629,6 @@ describe("dependency graph", () => {
           sliceIds: ["y", "z"],
           paths: [],
         },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "z" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["z"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "b" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["b"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "y" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["y"],
-          paths: [],
-        },
-        {
-          code: "DEPENDENCIES_UNSUPPORTED",
-          message:
-            'slice "a" declares dependsOn, but a dependent slice would not see its prerequisite\'s output; dependency content is not yet implemented, so split this plan into separate runs',
-          sliceIds: ["a"],
-          paths: [],
-        },
       ],
     });
   });
@@ -728,7 +646,6 @@ describe("issue collection", () => {
       "NO_OWNED_PATHS",
       "INVALID_PATH",
       "UNKNOWN_DEPENDENCY",
-      "DEPENDENCIES_UNSUPPORTED",
     ]);
   });
 
@@ -741,7 +658,6 @@ describe("issue collection", () => {
     expect(issuesOf(validatePlan(input)).map((issue) => issue.code)).toEqual([
       "PATH_CONFLICT",
       "UNKNOWN_DEPENDENCY",
-      "DEPENDENCIES_UNSUPPORTED",
     ]);
   });
 });

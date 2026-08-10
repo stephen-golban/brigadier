@@ -1,0 +1,40 @@
+{
+  "manifest_version": "0.2",
+  "name": "brigadier",
+  "display_name": "brigadier",
+  "version": "0.0.0",
+  "description": "Hand coding work to the brigadier CLI running locally on this machine.",
+  "long_description": "Claude Desktop Skills execute server-side and cannot invoke a binary on your laptop. Desktop MCP servers run locally with full user privileges and can spawn `claude -p`. That is why brigadier reaches Desktop as an MCP server rather than as a skill: it is the only surface that can actually start a run.",
+  "author": {
+    "name": "brigadier"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/brigadier-mcp.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/brigadier-mcp.js"]
+    }
+  },
+  "tools": [
+    {
+      "name": "brigadier_validate_plan",
+      "description": "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing."
+    },
+    {
+      "name": "brigadier_route_plan",
+      "description": "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker."
+    },
+    {
+      "name": "brigadier_run",
+      "description": "Run a brigadier plan on a local repository: route every slice, spawn a worker for each, commit what it produced, and merge the lot."
+    }
+  ],
+  "tools_generated": false,
+  "keywords": ["brigadier", "orchestration", "delegation", "coding"],
+  "compatibility": {
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

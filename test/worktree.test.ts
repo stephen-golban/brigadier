@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   stat,
@@ -11,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { createSecretRedactor, redactText } from "../src/worktree/engine.ts";
 import {
   type CreatedWorktree,
   GitWorktreeEngine,
@@ -23,6 +25,11 @@ const SECRET = "literal-super-secret-value";
 const ROTATED_JSON_SECRET = "rotated-json-secret-value";
 const ROTATED_YAML_SECRET = "rotated-yaml-secret-value";
 const MULTILINE_SECRET = "multiline-secret-first\nmultiline-secret-second";
+const PEM_SECRET = [
+  "-----BEGIN PRIVATE KEY-----",
+  "c2VjcmV0LWJ5dGVz",
+  "-----END PRIVATE KEY-----",
+].join("\n");
 const scratchParent = resolve(import.meta.dir, "../src/worktree");
 
 interface Fixture {
@@ -452,6 +459,185 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
+    "redacts a rotated multiline dotenv secret split across deleted diff lines",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "multiline-diff-redaction",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+
+        // The first slice commit predates the secret inventory. This creates
+        // the real historical shape under review: the later deletion reads the
+        // old bytes from its parent, after the linked file identifies them.
+        await writeFile(join(worktree.path, "pem.txt"), `${PEM_SECRET}\n`);
+        const containingCommit = await fixture.engine.commit({
+          worktree,
+          message: "fixture commit containing the future secret",
+        });
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            `${containingCommit.commit}:pem.txt`,
+          ]),
+        ).toBe(`${PEM_SECRET}\n`);
+
+        const linkedSecretFile = `PEM_PRIVATE_KEY="${PEM_SECRET}"\n`;
+        await writeFile(join(fixture.repository, ".env"), linkedSecretFile);
+        expect(await readFile(join(fixture.repository, ".env"), "utf8")).toBe(
+          linkedSecretFile,
+        );
+        await rm(join(worktree.path, "pem.txt"));
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+        const expectedPatch = [
+          "diff --git a/pem.txt b/pem.txt",
+          "deleted file mode 100644",
+          "--- a/pem.txt",
+          "+++ /dev/null",
+          "@@ -1,3 +0,0 @@",
+          "-[REDACTED]",
+          "",
+        ].join("\n");
+        expect(diff.patch.indexOf(PEM_SECRET)).toBe(-1);
+        expect(diff.patch).toBe(expectedPatch);
+
+        const stdout = fixture.engine.redact(
+          worktree,
+          `stdout=${PEM_SECRET}\n`,
+        );
+        expect(stdout.indexOf(PEM_SECRET)).toBe(-1);
+        expect(stdout).toBe("stdout=[REDACTED]\n");
+
+        const deletion = await fixture.engine.commit({
+          worktree,
+          message: `deleted ${PEM_SECRET}`,
+        });
+        expect(deletion.message).toBe("deleted [REDACTED]");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "-s",
+            "--format=%s",
+            deletion.commit,
+          ]),
+        ).toBe("deleted [REDACTED]\n");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test("bounds multiline redaction work by counted scan operations", () => {
+    let operations = 0;
+    const countOperation = () => {
+      operations += 1;
+      if (operations > 16) {
+        throw new Error("redaction exceeded 16 scan operations");
+      }
+    };
+
+    expect(
+      redactText("unchanged", ["", "\n", "\n\n", "missing"], countOperation),
+    ).toBe("unchanged");
+    expect(operations).toBe(1);
+
+    operations = 0;
+    expect(
+      redactText(
+        ["before", "-unique-line", "+", " -----END", "after"].join("\n"),
+        ["unique-line\n\n-----END"],
+        countOperation,
+      ),
+    ).toBe(["before", "-[REDACTED]", "after"].join("\n"));
+    expect(operations).toBe(5);
+  });
+
+  test(
+    "builds a session-free redactor without creating files or refs",
+    async () => {
+      await withFixture(async ({ repository }) => {
+        await writeFile(
+          join(repository, ".planner.env"),
+          `PLANNER_SECRET="${PEM_SECRET}"\n`,
+        );
+        const filesBefore = (
+          await readdir(repository, { recursive: true })
+        ).sort();
+        const refsBefore = await headRefListing(repository);
+
+        const redact = await createSecretRedactor({
+          repositoryPath: repository,
+          linkedSecretPaths: [".env", ".planner.env"],
+        });
+        const artifact = redact(
+          [
+            `planner received ${SECRET}`,
+            `plain=${PEM_SECRET}`,
+            `diff=${PEM_SECRET.replaceAll("\n", "\n+")}`,
+          ].join("\n"),
+        );
+
+        expect(artifact.indexOf(SECRET)).toBe(-1);
+        expect(artifact.indexOf(PEM_SECRET)).toBe(-1);
+        expect(artifact).toBe(
+          [
+            "planner received [REDACTED]",
+            "plain=[REDACTED]",
+            "diff=[REDACTED]",
+          ].join("\n"),
+        );
+        expect(
+          await gitText(repository, [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/brigadier/",
+          ]),
+        ).toBe("");
+        expect(await headRefListing(repository)).toBe(refsBefore);
+        expect((await readdir(repository, { recursive: true })).sort()).toEqual(
+          filesBefore,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "keeps session-free multiline redaction work countable and bounded",
+    async () => {
+      await withFixture(async ({ repository }) => {
+        const multilineSecret = "unique-line\nsecond-line";
+        await writeFile(
+          join(repository, ".planner.env"),
+          `PLANNER_SECRET="${multilineSecret}"\n`,
+        );
+        let operations = 0;
+        const redact = await createSecretRedactor({
+          repositoryPath: repository,
+          linkedSecretPaths: [".planner.env"],
+          onScan: () => {
+            operations += 1;
+            if (operations > 16) {
+              throw new Error("redaction exceeded 16 scan operations");
+            }
+          },
+        });
+
+        expect(() =>
+          redact("unique-line\n!not-a-prefix\n".repeat(1_000)),
+        ).toThrow("redaction exceeded 16 scan operations");
+        expect(operations).toBe(17);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     "captures an advanced submodule pointer in the scratch base commit",
     async () => {
       await withFixture(async (fixture) => {
@@ -738,6 +924,241 @@ describe("GitWorktreeEngine", () => {
         expect(
           await gitText(fixture.repository, ["branch", "--show-current"]),
         ).toBe("main\n");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "branches a later wave from accumulated earlier-wave content and releases every scratch ref",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = await gitBuffer(fixture.repository, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        expect(
+          await gitBuffer(fixture.repository, ["symbolic-ref", "HEAD"]),
+        ).toEqual(Buffer.from("refs/heads/main\n"));
+        expect(
+          await gitBuffer(fixture.repository, [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]),
+        ).toEqual(
+          Buffer.from(
+            " M tracked.txt\n" +
+              `?? artifact-${SECRET}.txt\n` +
+              "?? base-leak.txt\n" +
+              "?? untracked.txt\n",
+          ),
+        );
+
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "two-waves",
+        );
+        const producer = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(producer.path, "helper.ts"),
+          'export const helper = "wave-one-output";\n',
+        );
+        await fixture.engine.commit({
+          worktree: producer,
+          message: "produce helper",
+        });
+        const accumulated = await fixture.engine.merge({
+          worktree: producer,
+          message: "accumulate wave 1",
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected wave 1 to accumulate cleanly");
+        }
+
+        const consumer = await createWorktree(fixture, session, 2);
+        const helperBytes = await readFile(join(consumer.path, "helper.ts"));
+        expect(helperBytes).toEqual(
+          Buffer.from('export const helper = "wave-one-output";\n'),
+        );
+        expect(await gitBuffer(consumer.path, ["rev-parse", "HEAD"])).toEqual(
+          Buffer.from(`${accumulated.commit}\n`),
+        );
+
+        await fixture.engine.remove(producer);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(producer), 1);
+        await fixture.engine.remove(consumer);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(consumer), 1);
+        await fixture.engine.release(session);
+        expect(
+          await gitText(fixture.repository, [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/brigadier/",
+          ]),
+        ).toBe("");
+        expect(
+          await gitBuffer(fixture.repository, ["branch", "--show-current"]),
+        ).toEqual(Buffer.from("main\n"));
+        expect(
+          await gitBuffer(fixture.repository, ["symbolic-ref", "HEAD"]),
+        ).toEqual(Buffer.from("refs/heads/main\n"));
+        expect(
+          await gitBuffer(fixture.repository, ["rev-parse", "HEAD"]),
+        ).toEqual(originalHead);
+        expect(await readFile(join(fixture.repository, "tracked.txt"))).toEqual(
+          Buffer.from("tracked in progress\n"),
+        );
+        expect(
+          await readFile(join(fixture.repository, "untracked.txt")),
+        ).toEqual(Buffer.from("untracked in progress\n"));
+        expect(
+          await gitBuffer(fixture.repository, [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]),
+        ).toEqual(
+          Buffer.from(
+            " M tracked.txt\n" +
+              `?? artifact-${SECRET}.txt\n` +
+              "?? base-leak.txt\n" +
+              "?? untracked.txt\n",
+          ),
+        );
+
+        console.log(
+          `two-wave proof: wave 2 helper.ts bytes = ${JSON.stringify(helperBytes.toString("utf8"))}`,
+        );
+        console.log(
+          'two-wave proof: user HEAD = "refs/heads/main\\n"; source tracked.txt bytes = "tracked in progress\\n"; refs/heads/brigadier/** after release = ""',
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "materializes the accumulated head before final reconciliation",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "finalize-waves",
+        );
+        const producer = await createWorktree(fixture, session, 1);
+        await writeFile(join(producer.path, "helper.ts"), "wave 1 helper\n");
+        await fixture.engine.commit({
+          worktree: producer,
+          message: "produce wave 1 helper",
+        });
+        const accumulated = await fixture.engine.merge({
+          worktree: producer,
+          message: "accumulate wave 1",
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected wave 1 to accumulate cleanly");
+        }
+
+        const consumer = await createWorktree(fixture, session, 2);
+        await writeFile(
+          join(consumer.path, "consumer.ts"),
+          "wave 2 consumer\n",
+        );
+        const consumerCommit = await fixture.engine.commit({
+          worktree: consumer,
+          message: "consume wave 1 helper",
+        });
+
+        const producerFinal = await fixture.engine.merge({
+          worktree: producer,
+        });
+        expect(producerFinal).toEqual({
+          status: "already-integrated",
+          commit: accumulated.commit,
+          integrationBranch: "brigadier/finalize-waves",
+        });
+        const consumerFinal = await fixture.engine.merge({
+          worktree: consumer,
+        });
+        expect(consumerFinal.status).toBe("merged");
+        if (consumerFinal.status !== "merged") {
+          throw new Error("expected wave 2 to merge cleanly");
+        }
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "brigadier/finalize-waves:helper.ts",
+          ]),
+        ).toBe("wave 1 helper\n");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "brigadier/finalize-waves:consumer.ts",
+          ]),
+        ).toBe("wave 2 consumer\n");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "-s",
+            "--format=%P",
+            consumerFinal.commit,
+          ]),
+        ).toBe(`${accumulated.commit} ${consumerCommit.commit}\n`);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "leaves the accumulated base unchanged after a scratch merge conflict",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "wave-conflict",
+        );
+        const accepted = await createWorktree(fixture, session, 1);
+        const rejected = await createWorktree(fixture, session, 2);
+        await writeFile(join(accepted.path, "tracked.txt"), "accepted wave\n");
+        await writeFile(join(rejected.path, "tracked.txt"), "rejected wave\n");
+        await fixture.engine.commit({
+          worktree: accepted,
+          message: "accepted slice",
+        });
+        await fixture.engine.commit({
+          worktree: rejected,
+          message: "conflicting slice",
+        });
+
+        const accumulated = await fixture.engine.merge({
+          worktree: accepted,
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+        if (accumulated.status !== "merged") {
+          throw new Error("expected the first scratch merge to succeed");
+        }
+        const conflict = await fixture.engine.merge({
+          worktree: rejected,
+          finalize: false,
+        });
+        expect(conflict.status).toBe("conflicted");
+        expect(
+          await gitText(fixture.repository, ["rev-parse", session.baseBranch]),
+        ).toBe(`${accumulated.commit}\n`);
+
+        const laterWave = await createWorktree(fixture, session, 3);
+        expect(
+          await readFile(join(laterWave.path, "tracked.txt"), "utf8"),
+        ).toBe("accepted wave\n");
       });
     },
     TEST_TIMEOUT_MS,
@@ -1143,7 +1564,441 @@ describe("GitWorktreeEngine", () => {
     },
     TEST_TIMEOUT_MS,
   );
+
+  // -------------------------------------------------------------------------
+  // diffUncommitted: the change a reviewer is shown before the commit
+  // -------------------------------------------------------------------------
+
+  test(
+    "renders the uncommitted change as the exact diff the commit will record",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d1");
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, "tracked.txt"),
+          "tracked and reviewed\n",
+        );
+        await mkdir(join(worktree.path, "src"));
+        await writeFile(
+          join(worktree.path, "src/new.ts"),
+          "export const added = 1;\n",
+        );
+        await rm(join(worktree.path, "untracked.txt"));
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        // THE WHOLE PATCH, LITERALLY. Asserting that it "contains" a filename
+        // would pass against a diff computed from the wrong parent, against one
+        // that lost a hunk, and against one whose renames or context width the
+        // operator's own git config had quietly changed.
+        expect(diff.patch).toBe(EXPECTED_PATCH);
+        expect(diff.truncated).toBe(false);
+        expect(diff.totalCharacters).toBe(EXPECTED_PATCH.length);
+
+        // AND IT IS THE SAME CHANGE THE COMMIT RECORDS, proven against the
+        // commit rather than asserted. This is the property the review gate
+        // rests on: a reviewer approves a patch, and what lands must be it.
+        const parent = (
+          await gitText(fixture.repository, [
+            "rev-parse",
+            `refs/heads/${worktree.branch}`,
+          ])
+        ).trim();
+        const committed = await fixture.engine.commit({
+          worktree,
+          message: "diff proof",
+        });
+        const recorded = await gitText(fixture.repository, [
+          ...RAW_DIFF_ARGS,
+          parent,
+          committed.commit,
+          "--",
+        ]);
+        expect(stripIndexLines(recorded)).toBe(EXPECTED_PATCH);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "redacts secret values and secret-bearing paths out of the diff",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d2");
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, `leak-${SECRET}.txt`),
+          `token=${SECRET}\n`,
+        );
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        // A DIFF IS THE ARTIFACT MOST LIKELY TO CARRY A SECRET: it is the one
+        // thing this gate sends to another vendor's servers. Both the value and
+        // the filename are gone, and the assertion is the whole text.
+        expect(diff.patch).toBe(
+          [
+            "diff --git a/leak-[REDACTED].txt b/leak-[REDACTED].txt",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/leak-[REDACTED].txt",
+            "@@ -0,0 +1 @@",
+            "+token=[REDACTED]",
+            "",
+          ].join("\n"),
+        );
+        expect(diff.patch.includes(SECRET)).toBe(false);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "writes none of the diff's objects into the user's repository",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d3");
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, "tracked.txt"),
+          "a rejected slice must leave nothing behind\n",
+        );
+        const before = await objectIds(fixture.repository);
+
+        await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        // THE COST A REJECTED SLICE MUST NOT LEAVE. The gate runs before every
+        // commit, including the ones it refuses, so a diff that promoted its
+        // blobs into the real object database would add unreferenced objects to
+        // the user's repository once per rejection.
+        const after = await objectIds(fixture.repository);
+        expect(after).toEqual(before);
+        console.log(
+          `diff object scan: ${before.length} objects before, ${after.length} after`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "truncates at a line boundary and says so inside the patch",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d4");
+        const worktree = await createWorktree(fixture, session, 1);
+        // Ten identical eight-character lines, so every offset below is
+        // arithmetic rather than a fixture nobody can check.
+        await writeFile(join(worktree.path, "big.txt"), "0123456\n".repeat(10));
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 120,
+        });
+
+        const full = [
+          "diff --git a/big.txt b/big.txt",
+          "new file mode 100644",
+          "--- /dev/null",
+          "+++ b/big.txt",
+          "@@ -0,0 +1,10 @@",
+          ...Array.from({ length: 10 }, () => "+0123456"),
+          "",
+        ].join("\n");
+        expect(diff.truncated).toBe(true);
+        expect(diff.totalCharacters).toBe(full.length);
+        // 30 + 20 + 13 + 13 + 16 header characters, ten 8-character added
+        // lines, and the fifteen newlines that join them.
+        expect(diff.totalCharacters).toBe(187);
+        // The last newline at or before character 120 sits at index 114, which
+        // is the end of the second added line, so 115 characters survive — and
+        // the patch then SAYS SO, in its own text, because a reviewer that is
+        // not told has no way to know it was shown less than the change.
+        expect(diff.patch).toBe(
+          [
+            "diff --git a/big.txt b/big.txt",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/big.txt",
+            "@@ -0,0 +1,10 @@",
+            "+0123456",
+            "+0123456",
+            "[brigadier: this diff was truncated; 115 of 187 characters shown]",
+            "",
+          ].join("\n"),
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "reports an empty patch exactly when the commit would refuse as empty",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d5");
+        const worktree = await createWorktree(fixture, session, 1);
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        expect(diff.patch).toBe("");
+        expect(diff.truncated).toBe(false);
+        expect(diff.totalCharacters).toBe(0);
+        // The same two trees, compared by the same code: "the diff is empty"
+        // and "there is nothing to commit" are one fact, not two opinions.
+        await expect(
+          fixture.engine.commit({ worktree, message: "nothing" }),
+        ).rejects.toThrow("refusing to create an empty slice commit");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses every path that is not a live isolated worktree of this engine",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d6");
+        const worktree = await createWorktree(fixture, session, 1);
+        const inPlace = await fixture.engine.create({
+          session,
+          slice: 2,
+          unsafeInPlace: true,
+        });
+        fixture.worktrees.push(inPlace);
+
+        // A path nothing was ever created at.
+        const stranger = join(fixture.root, "stranger");
+        await expect(
+          fixture.engine.diffUncommitted({
+            worktreePath: stranger,
+            maxCharacters: 1024,
+          }),
+        ).rejects.toThrow(
+          `no isolated worktree created by this engine is registered at ${stranger}`,
+        );
+
+        // THE IN-PLACE CHECKOUT, REFUSED BY DESIGN. Its uncommitted content is
+        // the user's own work plus every concurrent slice's, so a diff of it
+        // would attribute all of that to whichever slice asked.
+        await expect(
+          fixture.engine.diffUncommitted({
+            worktreePath: fixture.repository,
+            maxCharacters: 1024,
+          }),
+        ).rejects.toThrow(
+          "no isolated worktree created by this engine is registered at",
+        );
+
+        // A live one still answers, and stops answering the moment it is gone.
+        await writeFile(join(worktree.path, "tracked.txt"), "changed\n");
+        expect(
+          (
+            await fixture.engine.diffUncommitted({
+              worktreePath: worktree.path,
+              maxCharacters: 1024,
+            })
+          ).patch.startsWith("diff --git a/tracked.txt b/tracked.txt"),
+        ).toBe(true);
+        const removedPath = worktree.path;
+        await fixture.engine.remove(worktree);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(worktree), 1);
+        await expect(
+          fixture.engine.diffUncommitted({
+            worktreePath: removedPath,
+            maxCharacters: 1024,
+          }),
+        ).rejects.toThrow(
+          `no isolated worktree created by this engine is registered at ${removedPath}`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses to diff a worktree that has been moved off its engine branch",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d7");
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(join(worktree.path, "tracked.txt"), "changed\n");
+        await gitText(worktree.path, [
+          "symbolic-ref",
+          "HEAD",
+          `refs/heads/${session.baseBranch}`,
+        ]);
+
+        // The same refusal `commit()` makes, for the same reason: the parent
+        // would no longer be the commit this slice is about to extend.
+        await expect(
+          fixture.engine.diffUncommitted({
+            worktreePath: worktree.path,
+            maxCharacters: 1024,
+          }),
+        ).rejects.toThrow(
+          `refusing to diff outside engine-created branch ${worktree.branch}`,
+        );
+
+        await gitText(worktree.path, [
+          "symbolic-ref",
+          "HEAD",
+          `refs/heads/${worktree.branch}`,
+        ]);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "shows only this slice's own change, not the wave accumulated before it",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d9");
+        const first = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(first.path, "helper.ts"),
+          "export const helper = 1;\n",
+        );
+        await fixture.engine.commit({ worktree: first, message: "wave one" });
+        const accumulated = await fixture.engine.merge({
+          worktree: first,
+          message: "accumulate wave 1",
+          finalize: false,
+        });
+        expect(accumulated.status).toBe("merged");
+
+        const second = await createWorktree(fixture, session, 2);
+        await writeFile(join(second.path, "tracked.txt"), "second wave only\n");
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: second.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        // THE PARENT IS THE SLICE'S BRANCH HEAD, NOT THE RUN'S BASE. A diff
+        // taken against the session's base commit would hand the reviewer wave
+        // one's `helper.ts` as though this slice had written it — the reviewer
+        // would then be judging, and could reject, another slice's work.
+        expect(diff.patch).toBe(
+          [
+            "diff --git a/tracked.txt b/tracked.txt",
+            "--- a/tracked.txt",
+            "+++ b/tracked.txt",
+            "@@ -1 +1 @@",
+            "-tracked in progress",
+            "+second wave only",
+            "",
+          ].join("\n"),
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses a bound that is not a positive whole number",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(fixture.engine, fixture.repository, "d8");
+        const worktree = await createWorktree(fixture, session, 1);
+        for (const maxCharacters of [0, -1, 1.5, Number.NaN]) {
+          await expect(
+            fixture.engine.diffUncommitted({
+              worktreePath: worktree.path,
+              maxCharacters,
+            }),
+          ).rejects.toThrow("maxCharacters must be a positive whole number");
+        }
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
+
+/**
+ * The exact patch the first diff test expects.
+ *
+ * Held as data rather than inlined because two assertions consume it: the
+ * engine's answer, and the answer git itself gives for the commit that follows.
+ */
+const EXPECTED_PATCH = [
+  "diff --git a/src/new.ts b/src/new.ts",
+  "new file mode 100644",
+  "--- /dev/null",
+  "+++ b/src/new.ts",
+  "@@ -0,0 +1 @@",
+  "+export const added = 1;",
+  "diff --git a/tracked.txt b/tracked.txt",
+  "--- a/tracked.txt",
+  "+++ b/tracked.txt",
+  "@@ -1 +1 @@",
+  "-tracked in progress",
+  "+tracked and reviewed",
+  "diff --git a/untracked.txt b/untracked.txt",
+  "deleted file mode 100644",
+  "--- a/untracked.txt",
+  "+++ /dev/null",
+  "@@ -1 +0,0 @@",
+  "-untracked in progress",
+  "",
+].join("\n");
+
+/**
+ * The engine's own diff flags, restated here so the cross-check against the
+ * real commit compares like with like rather than against this machine's git
+ * defaults.
+ */
+const RAW_DIFF_ARGS = [
+  "diff",
+  "--no-color",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--no-renames",
+  "--indent-heuristic",
+  "--diff-algorithm=myers",
+  "--unified=3",
+  "--src-prefix=a/",
+  "--dst-prefix=b/",
+  "--ignore-submodules=none",
+  "--submodule=short",
+] as const;
+
+function stripIndexLines(patch: string): string {
+  return patch
+    .split("\n")
+    .filter(
+      (line) => !/^index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$/.test(line),
+    )
+    .join("\n");
+}
+
+/** Every object id in the repository's database, sorted. */
+async function objectIds(repository: string): Promise<readonly string[]> {
+  return (
+    await gitText(repository, [
+      "cat-file",
+      "--batch-all-objects",
+      "--batch-check=%(objectname)",
+    ])
+  )
+    .split("\n")
+    .filter(Boolean)
+    .sort();
+}
 
 async function withFixture(
   run: (fixture: Fixture) => Promise<void>,

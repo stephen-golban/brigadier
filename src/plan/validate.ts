@@ -28,7 +28,6 @@ export function validatePlan(plan: Plan): PlanValidation {
   const unknownDependencyIssues: PlanIssue[] = [];
   const selfDependencyIssues: PlanIssue[] = [];
   const cycleIssues: PlanIssue[] = [];
-  const unsupportedDependencyIssues: PlanIssue[] = [];
 
   if (plan.slices.length === 0) {
     emptyIssues.push({
@@ -163,14 +162,6 @@ export function validatePlan(plan: Plan): PlanValidation {
   const seenUnknownDependencies = new Set<string>();
   const seenSelfDependencies = new Set<string>();
   for (const slice of plan.slices) {
-    if (slice.dependsOn.length > 0) {
-      unsupportedDependencyIssues.push({
-        code: "DEPENDENCIES_UNSUPPORTED",
-        message: `slice ${JSON.stringify(slice.id)} declares dependsOn, but a dependent slice would not see its prerequisite's output; dependency content is not yet implemented, so split this plan into separate runs`,
-        sliceIds: [slice.id],
-        paths: [],
-      });
-    }
     let dependencies = dependenciesById.get(slice.id);
     if (dependencies === undefined) {
       dependencies = new Set<string>();
@@ -238,7 +229,6 @@ export function validatePlan(plan: Plan): PlanValidation {
     ...unknownDependencyIssues,
     ...selfDependencyIssues,
     ...cycleIssues,
-    ...unsupportedDependencyIssues,
   ];
   if (issues.length > 0) {
     return { ok: false, issues };

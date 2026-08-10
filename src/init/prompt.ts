@@ -103,6 +103,24 @@ export async function confirmPrompt(
 }
 
 /**
+ * A single-line free-text prompt. Empty input and end of input take the exact
+ * default without trimming or otherwise rewriting user input.
+ */
+export async function textPrompt(
+  io: PromptIo,
+  question: string,
+  defaultValue: string,
+): Promise<string> {
+  io.output.write(`\n${question} [${defaultValue}] `);
+  const line = await io.reader.readLine();
+  if (line === null) {
+    io.output.write(`${defaultValue}\n`);
+    return defaultValue;
+  }
+  return line.length === 0 ? defaultValue : line;
+}
+
+/**
  * A numbered single-choice prompt. Only the listed choices are reachable, which
  * is how "offer only what the probe found" is enforced at the keyboard.
  *

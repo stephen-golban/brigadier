@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "brigadier": "./bin/brigadier.js"
+    "brigadier": "./bin/brigadier.js",
+    "brigadier-mcp": "./bin/brigadier-mcp.js"
   },
   "exports": {
     ".": {
@@ -27,7 +28,12 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/contracts.ts ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && tsc --project ./tsconfig.build.json && bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier && codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
+    "build": "bun run build:dist && bun run build:mcp && bun run build:binary && bun run build:codesign",
+    "build:binary": "bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier",
+    "build:codesign": "codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
+    "build:dist": "bun build ./src/index.ts ./src/contracts.ts ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && tsc --project ./tsconfig.build.json",
+    "build:mcp": "bun build ./src/mcp/server.ts --target=node --minify --sourcemap --outdir ./dist/mcp",
+    "build:unsigned": "bun run build:dist && bun run build:binary",
     "check": "biome check .",
     "format": "biome format --write .",
     "prepack": "bun run build",

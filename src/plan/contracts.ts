@@ -13,8 +13,7 @@ export type PlanIssueCode =
   | "PATH_CONFLICT"
   | "UNKNOWN_DEPENDENCY"
   | "SELF_DEPENDENCY"
-  | "DEPENDENCY_CYCLE"
-  | "DEPENDENCIES_UNSUPPORTED";
+  | "DEPENDENCY_CYCLE";
 
 /** One independently actionable reason a proposed plan cannot be scheduled. */
 export interface PlanIssue {

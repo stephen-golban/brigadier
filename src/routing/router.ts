@@ -17,10 +17,11 @@
  * - Difficulty sets a *floor*, and the winner is the **lowest** scorer above
  *   it. Ranking without that inversion would route every slice to the best
  *   model on the machine and make the "cost" stage decorative.
- * - `xhigh` is unreachable unless the slice already failed a gate (decisions
- *   #9/#20). Effort is clamped downward only, from a base that can be `xhigh`
- *   solely on an escalated request, and `assertEffortEarned` re-checks the
- *   result rather than trusting the arithmetic.
+ * - `xhigh` is unreachable unless a routed model already ran this slice and
+ *   failed (decisions #9/#20). Effort is clamped downward only, from a base
+ *   that can be `xhigh` solely on an escalated request, and
+ *   `assertEffortEarned` re-checks the result rather than trusting the
+ *   arithmetic. A routing failure, where no model ran, does not escalate.
  * - Quota is resolved **per model, not per vendor** (WO-010B). A CLI account
  *   meters some limits account-wide and others per model tier — a drained
  *   `seven_day_opus` bucket says nothing about Sonnet — so each pooled model
@@ -130,19 +131,17 @@ interface Selection {
   readonly floor: number;
   /** Candidates that cleared competence, best-value first. */
   readonly eligible: readonly ScoredModel[];
-  /** True when only unranked models were left to choose from. */
-  readonly usedUnranked: boolean;
   readonly clamps: readonly string[];
 }
 
 /**
  * One model admitted to the waived-floor salvage pool, proven able to run the
  * slice at some effort: it passed the capability filter, resolved to a runnable
- * rung, was not removed by quota, and was eliminated only by the difficulty
- * floor.
+ * rung, was not removed by quota, and either scored below the difficulty floor
+ * or had no rank with which brigadier could establish that it cleared it.
  */
 interface SalvageCandidate {
-  readonly entry: PooledModel;
+  readonly entry: ScoredModel;
   readonly effort: Effort;
   readonly score: number;
   readonly clamps: readonly string[];
@@ -153,11 +152,11 @@ interface SelectionOutcome {
   /** Null when nothing survived all three stages. */
   readonly selection: Selection | null;
   /**
-   * Models that passed capability and were eliminated *only* for scoring below
-   * the difficulty floor, each with the effort it would run at. This is the
-   * whole salvage pool, and it is carried out of the pipeline rather than
-   * recomputed because the pipeline is the only place that knows which models
-   * failed for which reason.
+   * Models that passed capability and whose competence did not establish the
+   * difficulty floor, each with the effort it would run at. This is the whole
+   * salvage pool, and it is carried out of the pipeline rather than recomputed
+   * because the pipeline is the only place that knows which models failed for
+   * which reason.
    */
   readonly salvageable: readonly SalvageCandidate[];
 }
@@ -432,7 +431,7 @@ function excludeModels(
       vendor: entry.vendor,
       model: entry.model,
       stage: "excluded",
-      reason: `${describe(entry)} already ran this slice and failed its gate`,
+      reason: `${describe(entry)} already ran this slice and failed`,
     });
   }
   return survivors;
@@ -634,8 +633,9 @@ function describeQuotaStatuses(
 /**
  * Picks the winner of the waived-floor salvage pool.
  *
- * The highest competence score wins. This is the one place in the engine where
- * the *highest* score wins rather than the lowest, and it is deliberate. A
+ * The highest known competence score wins, and every ranked candidate precedes
+ * every unranked one. This is the one place in the engine where the *highest*
+ * score wins rather than the lowest, and it is deliberate. A
  * review read it as "the last-resort path reverses the cost rule" and asked for
  * the lowest scorer instead; that reading is wrong, and rejected on the record
  * (2026-08-07). The cost stage takes the *cheapest adequate* model, and
@@ -655,11 +655,14 @@ function describeQuotaStatuses(
 function chooseSalvage(
   candidates: readonly SalvageCandidate[],
 ): SalvageCandidate | null {
-  const ordered = [...candidates].sort((left, right) =>
-    left.score === right.score
+  const ordered = [...candidates].sort((left, right) => {
+    if (left.entry.ranked !== right.entry.ranked) {
+      return left.entry.ranked ? -1 : 1;
+    }
+    return left.score === right.score
       ? left.entry.order - right.entry.order
-      : right.score - left.score,
-  );
+      : right.score - left.score;
+  });
   return ordered[0] ?? null;
 }
 
@@ -728,26 +731,27 @@ function selectWorker(
       reason: `competence score ${below.score} is below the ${request.difficulty} floor of ${floor}`,
     });
   }
-  const salvageable = collectSalvageable(belowFloor, request, capabilities);
-
-  let eligible: readonly ScoredModel[] = clearing;
-  let usedUnranked = false;
-  if (clearing.length === 0) {
-    // An unranked model is a model brigadier has never exercised. It is a last
-    // resort, not a cheap option: promoting it whenever it is the lowest score
-    // would send every routine slice to whatever the vendor shipped this week.
-    eligible = [...unranked].sort((left, right) => left.order - right.order);
-    usedUnranked = eligible.length > 0;
-  } else {
-    for (const held of unranked) {
-      rejections.push({
-        vendor: held.vendor,
-        model: held.model,
-        stage: "competence",
-        reason: `no competence rule ranks this model, and ${clearing.length} ranked model(s) clear the ${request.difficulty} floor of ${floor}`,
-      });
-    }
+  // RULING FOR DECISION #26: an unranked model is not proven weaker than the
+  // floor, but neither is it proven to clear the floor. It therefore cannot be
+  // an ordinary eligible candidate. It enters the same consented salvage pool
+  // as a ranked model below the floor; `waivedDifficultyFloor: true` then means
+  // precisely that brigadier did not establish the requested floor, rather than
+  // claiming the unknown model has an objectively sub-floor score.
+  for (const held of unranked) {
+    rejections.push({
+      vendor: held.vendor,
+      model: held.model,
+      stage: "competence",
+      reason: `no competence rule ranks this model, so brigadier cannot establish that it clears the ${request.difficulty} floor of ${floor}`,
+    });
   }
+  const salvageable = collectSalvageable(
+    [...belowFloor, ...unranked],
+    request,
+    capabilities,
+  );
+
+  const eligible: readonly ScoredModel[] = clearing;
   if (eligible.length === 0) {
     return { selection: null, salvageable };
   }
@@ -777,7 +781,6 @@ function selectWorker(
         effort: resolved.effort,
         floor,
         eligible,
-        usedUnranked,
         clamps: resolved.clamps,
       },
       salvageable: [],
@@ -787,8 +790,8 @@ function selectWorker(
 }
 
 /**
- * The salvage pool: models that passed the capability filter, were eliminated
- * only by the difficulty floor, and can still resolve to a runnable effort.
+ * The salvage pool: models that passed the capability filter, did not establish
+ * the difficulty floor, and can still resolve to a runnable effort.
  *
  * Every model here already survived the quota stage, because `selectWorker`
  * only ever runs over models quota left standing. That is what makes the pool
@@ -799,12 +802,12 @@ function selectWorker(
  * rather than carried into the pool and skipped later.
  */
 function collectSalvageable(
-  belowFloor: readonly ScoredModel[],
+  notClearing: readonly ScoredModel[],
   request: RoutingRequest,
   capabilities: ReadonlyMap<string, Capability>,
 ): readonly SalvageCandidate[] {
   const candidates: SalvageCandidate[] = [];
-  for (const entry of belowFloor) {
+  for (const entry of notClearing) {
     const capability = capabilities.get(keyOf(entry.vendor, entry.model));
     const resolved = resolveEffort(
       baseEffort(request),
@@ -983,8 +986,9 @@ function validateRequirements(requires: SliceRequirements | undefined): void {
 
 /**
  * Decisions #9/#20 in one function. `xhigh` is reachable only through
- * `escalated`, which the supervisor sets after a slice has failed its gate —
- * never from difficulty, however hard the planner judged the work.
+ * `escalated`, which the supervisor sets after a routed model runs the slice
+ * and fails — never after a routing failure and never from difficulty, however
+ * hard the planner judged the work.
  */
 function baseEffort(request: RoutingRequest): Effort {
   if (request.escalated === true) {
@@ -1044,7 +1048,7 @@ function resolveEffort(
 function assertEffortEarned(effort: Effort, request: RoutingRequest): void {
   if (effort === "xhigh" && request.escalated !== true) {
     throw new Error(
-      `routing invariant violated: xhigh was selected for slice ${JSON.stringify(request.slice.id)}, which has not failed a gate`,
+      `routing invariant violated: xhigh was selected for slice ${JSON.stringify(request.slice.id)} without evidence that a routed model already ran it and failed`,
     );
   }
 }
@@ -1075,10 +1079,7 @@ function describeCompetenceLine(
   const scores = selection.eligible
     .map((entry) => `${describe(entry)}=${entry.score}`)
     .join(", ");
-  const basis = selection.usedUnranked
-    ? "no ranked model cleared the floor, so unranked candidates were admitted in config order"
-    : "lowest score clearing the floor wins, so the slice costs no more than it has to";
-  return `competence: ${request.difficulty} difficulty sets a floor of ${selection.floor}; eligible ${scores}; picked ${describe(selection.candidate)} — ${selection.candidate.competence} (${basis})`;
+  return `competence: ${request.difficulty} difficulty sets a floor of ${selection.floor}; eligible ${scores}; picked ${describe(selection.candidate)} — ${selection.candidate.competence} (lowest score clearing the floor wins, so the slice costs no more than it has to)`;
 }
 
 /**
@@ -1104,9 +1105,16 @@ function describeWaivedCompetenceLine(
   const floor = DIFFICULTY_FLOORS[request.difficulty];
   const considered = [...salvage]
     .sort((left, right) => left.entry.order - right.entry.order)
-    .map((candidate) => `${describe(candidate.entry)}=${candidate.score}`)
+    .map((candidate) =>
+      candidate.entry.ranked
+        ? `${describe(candidate.entry)}=${candidate.score}`
+        : `${describe(candidate.entry)}=unranked`,
+    )
     .join(", ");
-  return `competence: the ${request.difficulty} difficulty floor of ${floor} was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: ${considered}; picked ${describe(chosen.entry)} at an actual competence score of ${chosen.score} (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)`;
+  const choice = chosen.entry.ranked
+    ? `picked ${describe(chosen.entry)} at an actual competence score of ${chosen.score} (highest score wins once the floor is waived, since "cheapest adequate" has no adequate set left to range over; ties break on config order)`
+    : `picked ${describe(chosen.entry)} with no competence rank (ranked scores win over unranked models once the floor is waived; unranked ties break on config order)`;
+  return `competence: the ${request.difficulty} difficulty floor of ${floor} was WAIVED because allowDegradedRouting is enabled — no model could take this slice under the ordinary rules, so the salvage pool was consulted: ${considered}; ${choice}`;
 }
 
 function describeEffortLine(
@@ -1117,7 +1125,7 @@ function describeEffortLine(
   const base = baseEffort(request);
   const origin =
     request.escalated === true
-      ? "escalation after a failed gate"
+      ? "escalation after a routed model ran the slice and failed"
       : `${request.difficulty} difficulty`;
   const clamped =
     clamps.length === 0

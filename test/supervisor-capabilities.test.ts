@@ -8,9 +8,10 @@ import {
 
 function config(vendors: BrigadierConfig["vendors"]): BrigadierConfig {
   return {
-    version: 2,
+    version: 3,
     vendors,
     secretsConsent: false,
+    linkedSecretPaths: [],
     allowDegradedRouting: false,
   };
 }

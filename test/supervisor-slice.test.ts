@@ -43,10 +43,14 @@ import type {
 import type { DetachedProcess } from "../src/shared/process.js";
 import type {
   AttemptSlot,
+  ReviewFinding,
   RunInterruption,
   SliceAttempt,
   SliceDirective,
   SliceResult,
+  SliceReview,
+  SliceReviewer,
+  SliceReviewRequest,
   SliceRunInput,
   SupervisorPorts,
 } from "../src/supervisor/contracts.js";
@@ -66,7 +70,10 @@ import type {
   WorktreeSession,
   WorktreeSpec,
 } from "../src/worktree/contracts.js";
-import { NoChangesToCommitError } from "../src/worktree/engine.js";
+import {
+  GitWorktreeEngine,
+  NoChangesToCommitError,
+} from "../src/worktree/engine.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -113,6 +120,7 @@ const CONFIG: BrigadierConfig = {
     },
   ],
   secretsConsent: true,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 
@@ -281,6 +289,30 @@ async function makeWorld(): Promise<World> {
       { sliceNumber: 8, worktreePath: join(root, "wt", "slice-8") },
     ],
   };
+}
+
+async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+  const process = Bun.spawn({
+    cmd: ["git", ...args],
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    process.kill(9);
+  }, 10_000);
+  const [exitCode, stdout, stderr] = await Promise.all([
+    process.exited,
+    new Response(process.stdout).text(),
+    new Response(process.stderr).text(),
+  ]);
+  clearTimeout(timer);
+  expect(timedOut).toBe(false);
+  expect(exitCode).toBe(0);
+  expect(stderr).toBe("");
+  return stdout.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +673,103 @@ const CODEX_ORACLE: CodexQuotaOracle = {
     Promise.resolve({ ...quotaSnapshot("codex"), vendor: "codex" }),
   dispose: () => Promise.resolve(),
 };
+
+// ---------------------------------------------------------------------------
+// Review gate fakes. None of them spawns anything, none reads a clock, and none
+// waits on wall time: a gate that could hang would wedge the whole suite rather
+// than fail one test.
+// ---------------------------------------------------------------------------
+
+interface FakeReviewer extends SliceReviewer {
+  /** Every request the runner handed the gate, in call order. */
+  requests(): readonly SliceReviewRequest[];
+}
+
+/**
+ * A gate that returns canned verdicts, one per call.
+ *
+ * `durationMs: 0` throughout, and deliberately so: these fakes never read
+ * `ports.now`, which is what lets a test assert an ATTEMPT's duration against
+ * an absolute number without that number encoding how many times the gate
+ * happened to look at the clock.
+ */
+function fakeReviewer(verdicts: readonly SliceReview[]): FakeReviewer {
+  const seen: SliceReviewRequest[] = [];
+  return {
+    requests: () => seen,
+    review: (request: SliceReviewRequest): Promise<SliceReview> => {
+      seen.push(request);
+      const verdict = verdicts[seen.length - 1];
+      if (verdict === undefined) {
+        throw new Error(
+          `the fake reviewer has no verdict for review ${seen.length}; it was given ${verdicts.length}`,
+        );
+      }
+      return Promise.resolve(verdict);
+    },
+  };
+}
+
+const REVIEWER: ReviewerIdentityFixture = {
+  vendor: "codex",
+  model: "gpt-5.6-sol",
+  effort: "high",
+};
+
+type ReviewerIdentityFixture = Extract<
+  SliceReview,
+  { readonly verdict: "approved" }
+>["reviewer"];
+
+const BLOCKING_FINDING: ReviewFinding = {
+  severity: "blocking",
+  path: "src/added.ts",
+  line: 12,
+  summary: "the loop runs one past the end of the array",
+};
+
+const CONCERN_FINDING: ReviewFinding = {
+  severity: "concern",
+  path: "src/added.ts",
+  line: 30,
+  summary: "this branch looks unreachable",
+};
+
+const APPROVED: SliceReview = {
+  verdict: "approved",
+  reviewer: REVIEWER,
+  findings: [],
+  durationMs: 0,
+};
+
+const REJECTED: SliceReview = {
+  verdict: "rejected",
+  reviewer: REVIEWER,
+  findings: [BLOCKING_FINDING],
+  durationMs: 0,
+};
+
+const SKIPPED: SliceReview = {
+  verdict: "skipped",
+  reviewer: null,
+  reason: "NO_OTHER_VENDOR",
+  message: "no other vendor is configured",
+  durationMs: 0,
+};
+
+const CANCELLED_REVIEW: SliceReview = {
+  verdict: "skipped",
+  reviewer: REVIEWER,
+  reason: "CANCELLED",
+  message:
+    "slice slice-auth was not reviewed: the codex/gpt-5.6-sol reviewer failed with CANCELLED: brigadier received SIGINT",
+  durationMs: 0,
+};
+
+/** A gate that always skips, for tests whose subject is not the gate. */
+function skippingReviewer(): SliceReviewer {
+  return { review: (): Promise<SliceReview> => Promise.resolve(SKIPPED) };
+}
 
 interface Harness {
   readonly ports: SupervisorPorts;
@@ -1210,10 +1339,11 @@ describe("DefaultSliceRunner retry policy", () => {
     expect(result.ok).toBe(true);
     expect(result.attempts.length).toBe(2);
     expect(harness.routeRequests.length).toBe(2);
-    // The whole point: attempt 2 is escalated but excludes nothing, because
-    // claude-opus-5 was never actually tried.
+    // The whole point: claude-opus-5 was never actually tried, so attempt 2
+    // neither excludes it nor earns the higher effort reserved for a model
+    // whose work failed.
     expect(harness.routeRequests[1]?.excluded).toBeUndefined();
-    expect(harness.routeRequests[1]?.escalated).toBe(true);
+    expect(harness.routeRequests[1]?.escalated).toBeUndefined();
     expect(attemptAt(result, 1).routed?.model).toBe("claude-opus-5");
   });
 
@@ -1253,6 +1383,7 @@ describe("DefaultSliceRunner retry policy", () => {
     expect(harness.routeRequests[1]?.excluded).toEqual([
       { vendor: "claude", model: "claude-opus-5" },
     ]);
+    expect(harness.routeRequests[1]?.escalated).toBe(true);
   });
 
   /**
@@ -2847,6 +2978,9 @@ describe("DefaultSliceRunner worktree ownership", () => {
       ports: harness.ports,
       env: ENV,
       route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      // The gate is injected as one that never touches the clock, so the number
+      // below measures the attempt rather than the gate's bookkeeping.
+      review: skippingReviewer(),
     });
 
     const result = await withBound(
@@ -2862,8 +2996,517 @@ describe("DefaultSliceRunner worktree ownership", () => {
       "run",
     );
 
-    // The injected clock advances 5 ms per read and the attempt reads it twice.
-    expect(attemptAt(result, 0).durationMs).toBe(5);
+    // The injected clock advances 5 ms per read. The attempt reads it at its
+    // start and its end, and `#reviewQuietly` reads it once more so a reviewer
+    // that throws can still be given a duration.
+    expect(attemptAt(result, 0).durationMs).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The cross-vendor review gate
+//
+// Every test here drives the gate through the injected `review` seam rather
+// than through two real vendors, so each verdict — including the ones a healthy
+// machine almost never produces — is reachable from a literal. The gate's own
+// logic (which vendor reviews, what the prompt says, how a reply is parsed and
+// adjudicated) is tested against the real implementation in
+// `test/supervisor-review.test.ts`.
+// ---------------------------------------------------------------------------
+
+describe("DefaultSliceRunner review gate", () => {
+  test("the constructor default runs the real cross-vendor reviewer", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const codex = codexAdapter([
+      { outcome: { ...OK_OUTCOME, output: '{"findings":[]}' } },
+    ]);
+    const harness = makeHarness({
+      workers: { claude: claude.worker, codex: codex.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "production-default review",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(claude.specs.length).toBe(1);
+    expect(
+      codex.specs.map((spec) => ({
+        id: spec.id,
+        vendor: spec.vendor,
+        model: spec.model,
+        effort: spec.effort,
+        cwd: spec.cwd,
+        editablePaths: spec.sandbox.filesystem.editablePaths,
+      })),
+    ).toEqual([
+      {
+        id: "slice-auth-review-1",
+        vendor: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        cwd: join(world.root, "wt", "slice-7"),
+        editablePaths: [],
+      },
+    ]);
+    expect(attemptAt(result, 0).review?.verdict).toBe("approved");
+    expect(attemptAt(result, 0).review?.reviewer).toEqual(REVIEWER);
+    expect(harness.engine.commits.length).toBe(1);
+  });
+
+  test("a rejected review fails the slice as REVIEW_REJECTED and never commits", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: fakeReviewer([REJECTED]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.commit).toBe(null);
+    // THE LOAD-BEARING ASSERTION. A gate that rejected after committing would
+    // leave a ref on a branch the orchestrator may still merge, and no method
+    // on the engine can take it back. `commit` must never have been called.
+    expect(harness.engine.commits).toEqual([]);
+    const failure = attemptAt(result, 0).failure;
+    expect(failure?.kind).toBe("REVIEW_REJECTED");
+    expect(failure?.message).toBe(
+      "slice slice-auth attempt 1: codex/gpt-5.6-sol found 1 blocking issue(s) in claude/claude-opus-5's work: src/added.ts:12: the loop runs one past the end of the array",
+    );
+  });
+
+  test("the review runs before the commit, with the worktree still uncommitted", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    // Records what the engine had done by the time the gate was asked. A gate
+    // that ran after the commit would see one commit here instead of none.
+    const commitsAtReview: number[] = [];
+    const seen: SliceReviewRequest[] = [];
+    const spy: SliceReviewer = {
+      review: (request: SliceReviewRequest): Promise<SliceReview> => {
+        seen.push(request);
+        commitsAtReview.push(harness.engine.commits.length);
+        return Promise.resolve(APPROVED);
+      },
+    };
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: spy,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(commitsAtReview).toEqual([0]);
+    expect(harness.engine.commits.length).toBe(1);
+    // The gate is handed the live worktree the builder just wrote into, the
+    // builder's identity, and the attempt number — everything a reviewer needs
+    // and nothing it does not.
+    expect(seen.length).toBe(1);
+    expect(seen[0]?.worktreePath).toBe(join(world.root, "wt", "slice-7"));
+    expect(seen[0]?.attempt).toBe(1);
+    expect(seen[0]?.builder.vendor).toBe("claude");
+    expect(seen[0]?.builder.model).toBe("claude-opus-5");
+    expect(seen[0]?.slice.id).toBe("slice-auth");
+  });
+
+  test("a rejection excludes the builder's exact pair and escalates attempt 2", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([
+      { outcome: OK_OUTCOME },
+      { outcome: OK_OUTCOME },
+    ]);
+    const harness = makeHarness({ workers: { claude: claude.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+      review: fakeReviewer([REJECTED, APPROVED]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    // DECISION #24, REACHED FOR THE FIRST TIME. Every previous route to a
+    // second attempt came from a worker that did not finish. This one comes
+    // from work that finished and was judged wrong, which is the case the
+    // escalation was designed for and which nothing could produce until the
+    // gate existed.
+    expect(result.ok).toBe(true);
+    expect(result.attempts.length).toBe(2);
+    expect(harness.routeRequests.length).toBe(2);
+    expect(harness.routeRequests[1]?.excluded).toEqual([
+      { vendor: "claude", model: "claude-opus-5" },
+    ]);
+    expect(harness.routeRequests[1]?.escalated).toBe(true);
+    expect(attemptAt(result, 0).failure?.kind).toBe("REVIEW_REJECTED");
+    expect(attemptAt(result, 1).failure).toBe(null);
+    expect(attemptAt(result, 1).review?.verdict).toBe("approved");
+  });
+
+  test("two rejections end the slice with both verdicts on the record", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([
+      { outcome: OK_OUTCOME },
+      { outcome: OK_OUTCOME },
+    ]);
+    const harness = makeHarness({ workers: { claude: claude.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+      review: fakeReviewer([REJECTED, REJECTED]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.attempts.length).toBe(2);
+    expect(harness.engine.commits).toEqual([]);
+    expect(attemptAt(result, 0).failure?.kind).toBe("REVIEW_REJECTED");
+    expect(attemptAt(result, 1).failure?.kind).toBe("REVIEW_REJECTED");
+    // Both worktrees were torn down: a rejected attempt takes the ordinary
+    // failure path, which is the entire reason the gate sits where it does.
+    expect(harness.engine.removes.length).toBe(2);
+  });
+
+  test("an approved review commits and rides on the attempt record", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const approvedWithConcern: SliceReview = {
+      verdict: "approved",
+      reviewer: REVIEWER,
+      findings: [CONCERN_FINDING],
+      durationMs: 0,
+    };
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: fakeReviewer([approvedWithConcern]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(true);
+    const review = attemptAt(result, 0).review;
+    expect(review?.verdict).toBe("approved");
+    // The concern survives the approval. It did not stop the commit and it is
+    // still the most useful thing the reviewer said.
+    expect(review?.verdict === "approved" ? review.findings : []).toEqual([
+      CONCERN_FINDING,
+    ]);
+    expect(harness.logs).toContain(
+      "slice slice-auth attempt 1: review approved by codex/gpt-5.6-sol (0 blocking, 1 concern(s)) in 0ms",
+    );
+  });
+
+  test("a skipped review still commits and is never recorded as an approval", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: fakeReviewer([SKIPPED]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    // FAIL-OPEN, AND VISIBLY SO. The slice commits, because a gate that could
+    // not run says nothing about the code — but the record says `skipped` with
+    // its reason, so nothing downstream can report this as a reviewed slice.
+    expect(result.ok).toBe(true);
+    const review = attemptAt(result, 0).review;
+    expect(review?.verdict).toBe("skipped");
+    expect(review?.verdict === "skipped" ? review.reason : null).toBe(
+      "NO_OTHER_VENDOR",
+    );
+  });
+
+  test("an interrupted review leaves the slice ref at its prepared base", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-review-cancel-ref-"));
+    temporaries.push(root);
+    const repository = join(root, "repo");
+    await mkdir(repository, { recursive: true });
+    await runGit(repository, ["init", "-b", "main"]);
+    await runGit(repository, ["config", "user.name", "Brigadier Test"]);
+    await runGit(repository, ["config", "user.email", "test@example.invalid"]);
+    await writeFile(join(repository, "README.md"), "base\n");
+    await runGit(repository, ["add", "README.md"]);
+    await runGit(repository, ["commit", "-m", "base"]);
+
+    const engine = new GitWorktreeEngine({ commandTimeoutMs: 10_000 });
+    const session = await engine.prepare({
+      repositoryPath: repository,
+      slug: "review-cancel",
+      secrets: { linkedPaths: [] },
+    });
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        outcome: OK_OUTCOME,
+        onSpawn: async (spec) => {
+          await mkdir(join(spec.cwd, "src"), { recursive: true });
+          await writeFile(join(spec.cwd, "src/added.ts"), "export {};\n");
+        },
+      },
+    ]);
+    const routeRequests: RoutingRequest[] = [];
+    const runner = new DefaultSliceRunner({
+      ports: {
+        engine,
+        workerFor: (vendor) => (vendor === "claude" ? adapter.worker : null),
+        oracles: [],
+        now: makeClock(),
+        log: () => {},
+      },
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], routeRequests),
+      review: {
+        review: () => {
+          controller.abort(SIGINT_REASON);
+          return Promise.resolve(CANCELLED_REVIEW);
+        },
+      },
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session,
+        attemptSlots: [{ sliceNumber: 7, worktreePath: join(root, "slice-7") }],
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      10_000,
+      "cancelled review ref run",
+    );
+
+    expect(
+      await runGit(repository, [
+        "rev-list",
+        "--count",
+        "refs/heads/brigadier/review-cancel/slice-7",
+      ]),
+    ).toBe("2");
+    expect(result.cancelled).toBe(true);
+    await engine.release(session);
+  }, 30_000);
+
+  test("the gate is not consulted when the worker itself failed", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: AUTH_FAILED_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const reviewer = fakeReviewer([]);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: reviewer,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(attemptAt(result, 0).failure?.kind).toBe("WORKER_FAILED");
+    // There is no work to judge, so the gate is never asked. The fake would
+    // throw if it were, since it was given no verdicts at all.
+    expect(reviewer.requests()).toEqual([]);
+    expect(attemptAt(result, 0).review).toBe(null);
+  });
+
+  test("a reviewer that throws is contained, and the slice still commits", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const exploding: SliceReviewer = {
+      review: (): Promise<SliceReview> => {
+        throw new Error("the gate itself is broken");
+      },
+    };
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: exploding,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    // A broken gate must not be reported as a broken builder. Without the
+    // containment in `#reviewQuietly` this throw reaches `#runAttempt`'s outer
+    // catch and the slice fails as WORKER_FAILED — blaming a worker that
+    // succeeded and discarding a diff that may well have been correct.
+    expect(result.ok).toBe(true);
+    const review = attemptAt(result, 0).review;
+    expect(review?.verdict).toBe("skipped");
+    expect(review?.verdict === "skipped" ? review.reason : null).toBe(
+      "REVIEWER_FAILED",
+    );
+    expect(review?.verdict === "skipped" ? review.message : "").toBe(
+      "slice slice-auth attempt 1 was not reviewed: the reviewer threw instead of reporting: the gate itself is broken",
+    );
+  });
+
+  test("a cleanup note appended to a rejection keeps its findings", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const engine = new FakeEngine();
+    engine.removeError = new Error("directory is busy");
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: fakeReviewer([REJECTED]),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    // `appendNote` rebuilds the failure member by member. A REVIEW_REJECTED arm
+    // that forgot to copy `review` would leave a user with a rejection whose
+    // diagnosis had been thrown away because tidying up also went wrong.
+    const failure = attemptAt(result, 0).failure;
+    expect(failure?.kind).toBe("REVIEW_REJECTED");
+    expect(
+      failure?.kind === "REVIEW_REJECTED" ? failure.review.findings : [],
+    ).toEqual([BLOCKING_FINDING]);
+    expect(failure?.message).toContain("cleanup of worktree");
   });
 });
 

@@ -29,6 +29,8 @@ import type {
   CreatedWorktree,
   MergeResult,
   MergeSpec,
+  UncommittedDiff,
+  UncommittedDiffSpec,
   WorktreeEngine,
   WorktreeEngineOptions,
   WorktreeSession,
@@ -39,6 +41,72 @@ import type {
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
 const REDACTION_MARKER = "[REDACTED]";
+const ARTIFACT_LINE_PREFIXES = ["-", "+", " "] as const;
+
+/**
+ * The diff invocation, pinned against the reader's own git configuration.
+ *
+ * EVERY FLAG HERE EXISTS BECAUSE A USER'S `~/.gitconfig` CAN CHANGE THE ANSWER.
+ * This patch is about to be shown to a model that will decide whether a slice
+ * commits, and it is asserted byte-for-byte by this repository's tests; a
+ * `diff.algorithm = histogram` or a `diff.external` in the operator's config
+ * would silently change both. Command-line flags outrank every config file, so
+ * each behaviour that has a config knob is stated here rather than inherited:
+ * colour, external drivers, textconv, rename detection, the hunk algorithm, the
+ * indent heuristic, the context width, the path prefixes, and submodules.
+ *
+ * `--binary` IS DELIBERATELY ABSENT. Without it a changed binary file renders
+ * as one `Binary files a/x and b/x differ` line; with it, the whole file
+ * arrives base64-encoded. A reviewer can do nothing with the second, and it is
+ * the fastest way to spend the caller's entire character budget on one asset.
+ */
+const DIFF_ARGS = [
+  "diff",
+  "--no-color",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--no-renames",
+  "--indent-heuristic",
+  "--diff-algorithm=myers",
+  "--unified=3",
+  "--src-prefix=a/",
+  "--dst-prefix=b/",
+  "--ignore-submodules=none",
+  "--submodule=short",
+] as const;
+
+/**
+ * `core.quotePath=false`, forced the one way a config file cannot outrank.
+ *
+ * Git reads `GIT_CONFIG_COUNT`-style variables after every config file, so this
+ * wins over both the operator's global config and the repository's own. Left at
+ * the default, a path with any non-ASCII byte reaches the reviewer as octal
+ * escapes, which is both unreadable and — since the default is a config knob —
+ * not the same text on two machines.
+ */
+const DIFF_CONFIG_ENV: Readonly<Record<string, string>> = {
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "core.quotePath",
+  GIT_CONFIG_VALUE_0: "false",
+};
+
+/**
+ * A unified diff's `index <old>..<new> <mode>` header line.
+ *
+ * THESE LINES ARE REMOVED FROM THE PATCH, and the reason is that they are the
+ * only part of it that is neither reproducible nor useful here. The abbreviated
+ * object ids they carry depend on how many objects the repository holds, so the
+ * same change produces different text in a scratch repository and in a large
+ * one — which would make an exact assertion impossible and tell a reviewer
+ * nothing it can act on. The mode they repeat is already stated by the
+ * `new file mode` / `deleted file mode` / `old mode` / `new mode` lines beside
+ * them, which are kept.
+ *
+ * IT CANNOT MATCH FILE CONTENT. Every content line in a unified diff carries a
+ * one-character prefix (` `, `+`, `-`), so a line beginning at column zero is a
+ * header by construction, and this pattern is anchored at both ends.
+ */
+const DIFF_INDEX_LINE = /^index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$/;
 const LFS_UNSUPPORTED_MESSAGE =
   "Git LFS is unsupported: remove filter=lfs attributes and unset filter.lfs.clean before using Brigadier";
 
@@ -65,12 +133,60 @@ interface SessionState {
   redactionValues: readonly string[];
   readonly sliceHeads: Map<string, string>;
   readonly activeWorktrees: Set<CreatedWorktree>;
+  accumulatedHead: string;
   integrationMaterialized: boolean;
   refsReleased: boolean;
 }
 
 interface WorktreeState {
   readonly sessionState: SessionState;
+  /**
+   * The canonical path this worktree is registered under in `#isolatedByPath`,
+   * or null when it is not registered at all (an `unsafeInPlace` worktree).
+   *
+   * Remembered rather than recomputed, because `remove()` resolves it AFTER the
+   * directory is gone: a second `realpath` would fail there and quietly leave a
+   * dead entry in the index, holding a removed worktree alive and answering a
+   * later lookup with a handle the engine has already rejected.
+   */
+  readonly indexKey: string | null;
+}
+
+/** Read-only inputs for building a redactor before a worktree session exists. */
+export interface SecretRedactorSpec {
+  readonly repositoryPath: string;
+  readonly linkedSecretPaths: readonly string[];
+  readonly redactionValues?: readonly string[];
+  /** Test seam for proving that every search advances and work stays counted. */
+  readonly onScan?: () => void;
+}
+
+/** Redacts inventoried exact values from one artifact. */
+export type SecretRedactor = (artifact: string) => string;
+
+/**
+ * Builds the inventory-backed redactor without preparing a session.
+ *
+ * This performs reads only: it runs no Git command and creates no ref, commit,
+ * worktree, or directory. It deliberately covers verbatim values only. A value
+ * transformed, summarized, truncated, derived, or re-encoded by a model is not
+ * the same byte sequence and remains outside this guarantee.
+ */
+export async function createSecretRedactor(
+  spec: SecretRedactorSpec,
+): Promise<SecretRedactor> {
+  const repositoryPath = await realpath(resolve(spec.repositoryPath));
+  const linkedSecretPaths = normalizeUniquePaths(
+    spec.linkedSecretPaths,
+    "linked secret",
+  );
+  const redactionValues = await collectRedactionValues(
+    repositoryPath,
+    linkedSecretPaths,
+    spec.redactionValues ?? [],
+  );
+  return (artifact: string): string =>
+    redactText(artifact, redactionValues, spec.onScan);
 }
 
 export class LinkedSecretCommitError extends Error {
@@ -109,6 +225,23 @@ export class GitWorktreeEngine implements WorktreeEngine {
   readonly #commandTimeoutMs: number;
   readonly #sessions = new WeakMap<WorktreeSession, SessionState>();
   readonly #worktrees = new WeakMap<CreatedWorktree, WorktreeState>();
+  /**
+   * Canonical worktree path to the handle created there, for the isolated
+   * worktrees only.
+   *
+   * IT IS A STRONG MAP BESIDE A WEAK ONE, AND BOTH ARE NEEDED. `#worktrees` is
+   * weak so a handle a caller has dropped can be collected; this index is what
+   * lets `diffUncommitted` find a handle from the only identifier its caller
+   * has, and holding the handle strongly is what keeps the weak entry alive
+   * until `remove()` retires both. Entries are added by `create()` and deleted
+   * by `remove()`, so its size is the number of live isolated worktrees.
+   *
+   * `unsafeInPlace` WORKTREES ARE DELIBERATELY ABSENT. They all share one path
+   * — the user's checkout — so a path lookup could not say which slice was
+   * being asked about, and the uncommitted content there belongs to the user
+   * and to every concurrent slice as much as to the one asking.
+   */
+  readonly #isolatedByPath = new Map<string, CreatedWorktree>();
 
   constructor(options: WorktreeEngineOptions = {}) {
     const timeout = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
@@ -232,6 +365,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       redactionValues,
       sliceHeads: new Map(),
       activeWorktrees: new Set(),
+      accumulatedHead: baseCommit,
       integrationMaterialized: false,
       refsReleased: false,
     });
@@ -265,14 +399,12 @@ export class GitWorktreeEngine implements WorktreeEngine {
       branch,
       sessionState.redactionValues,
     );
-    const zeroObjectId = "0".repeat(spec.session.baseCommit.length);
-    await this.#git(
-      ["update-ref", branchRef, spec.session.baseCommit, zeroObjectId],
-      {
-        cwd: spec.session.repositoryPath,
-        redactionValues: sessionState.redactionValues,
-      },
-    );
+    const sliceBase = sessionState.accumulatedHead;
+    const zeroObjectId = "0".repeat(sliceBase.length);
+    await this.#git(["update-ref", branchRef, sliceBase, zeroObjectId], {
+      cwd: spec.session.repositoryPath,
+      redactionValues: sessionState.redactionValues,
+    });
 
     try {
       if (!unsafeInPlace) {
@@ -308,10 +440,88 @@ export class GitWorktreeEngine implements WorktreeEngine {
       isolated: !unsafeInPlace,
       session: spec.session,
     }) satisfies CreatedWorktree;
-    this.#worktrees.set(worktree, { sessionState });
-    sessionState.sliceHeads.set(branch, spec.session.baseCommit);
+    // Resolved now, while the directory certainly exists, and resolved on both
+    // sides of the later lookup: on macOS a worktree under `/tmp` is really
+    // under `/private/tmp`, so comparing an unresolved key against a resolved
+    // query would miss every worktree this engine creates in the ordinary case.
+    const indexKey = unsafeInPlace ? null : await canonicalPath(worktreePath);
+    this.#worktrees.set(worktree, { sessionState, indexKey });
+    if (indexKey !== null) {
+      this.#isolatedByPath.set(indexKey, worktree);
+    }
+    sessionState.sliceHeads.set(branch, sliceBase);
     sessionState.activeWorktrees.add(worktree);
     return worktree;
+  }
+
+  async diffUncommitted(spec: UncommittedDiffSpec): Promise<UncommittedDiff> {
+    if (!Number.isSafeInteger(spec.maxCharacters) || spec.maxCharacters <= 0) {
+      throw new RangeError("maxCharacters must be a positive whole number");
+    }
+    const key = await canonicalPath(spec.worktreePath);
+    const worktree = this.#isolatedByPath.get(key);
+    if (worktree === undefined) {
+      // Deliberately one message for "never created", "already removed" and
+      // "created in place": all three mean this engine will not claim to know
+      // what changed there, and distinguishing them would tell a caller more
+      // about other slices' worktrees than it asked about its own.
+      throw new Error(
+        `no isolated worktree created by this engine is registered at ${key}`,
+      );
+    }
+    const state = this.#worktreeState(worktree);
+    await this.#refreshRedactionValues(state.sessionState);
+    const { redactionValues, linkedSecretPaths } = state.sessionState;
+
+    // The same refusal `commit()` makes, made here for the same reason: a
+    // worktree that has been moved onto another branch would diff against a
+    // parent that is not the one the eventual commit will use, so the reviewer
+    // would be shown a change nobody is proposing.
+    const branchRef = `refs/heads/${worktree.branch}`;
+    const checkedOutRef = await this.#git(["symbolic-ref", "--quiet", "HEAD"], {
+      cwd: worktree.path,
+      redactionValues,
+      allowedExitCodes: [0, 1],
+    });
+    if (
+      checkedOutRef.exitCode !== 0 ||
+      checkedOutRef.stdout.toString("utf8").trim() !== branchRef
+    ) {
+      throw new Error(
+        `refusing to diff outside engine-created branch ${worktree.branch}`,
+      );
+    }
+    const parent = await this.#revParse(
+      worktree.repositoryPath,
+      branchRef,
+      redactionValues,
+    );
+
+    const patch = await this.#withSanitizedTree(
+      worktree.path,
+      parent,
+      redactionValues,
+      linkedSecretPaths,
+      "scratch",
+      async (tree, env) => {
+        const result = await this.#git([...DIFF_ARGS, parent, tree, "--"], {
+          cwd: worktree.path,
+          env: { ...env, ...DIFF_CONFIG_ENV },
+          redactionValues,
+        });
+        return result.stdout.toString("utf8");
+      },
+    );
+    // Redacted a second time, over the assembled text, even though every blob
+    // and every path in the tree above was already redacted byte-for-byte. The
+    // two passes catch different things: the tree pass covers file content,
+    // this one covers anything git itself put in the patch, and it covers a
+    // secret that entered the inventory only after the parent commit was
+    // written — whose old value is still sitting in the patch's `-` lines.
+    return boundPatch(
+      redactText(stripIndexLines(patch), redactionValues),
+      spec.maxCharacters,
+    );
   }
 
   async commit(spec: CommitSpec): Promise<CommitResult> {
@@ -399,28 +609,31 @@ export class GitWorktreeEngine implements WorktreeEngine {
     await this.#refreshRedactionValues(state.sessionState);
     const { session, redactionValues } = state.sessionState;
     const repositoryPath = session.repositoryPath;
-    const integrationRef = `refs/heads/${session.integrationBranch}`;
-    const integrationHead = await this.#materializeIntegrationBranch(
-      state.sessionState,
-    );
+    const finalize = spec.finalize !== false;
+    const prospectiveRef = finalize
+      ? `refs/heads/${session.integrationBranch}`
+      : `refs/heads/${session.baseBranch}`;
+    const prospectiveHead = finalize
+      ? await this.#materializeIntegrationBranch(state.sessionState)
+      : await this.#verifiedAccumulatedHead(state.sessionState);
     const sliceHead = state.sessionState.sliceHeads.get(spec.worktree.branch);
     if (sliceHead === undefined) {
       throw new Error(`missing recorded head for ${spec.worktree.branch}`);
     }
     const ancestor = await this.#git(
-      ["merge-base", "--is-ancestor", sliceHead, integrationHead],
+      ["merge-base", "--is-ancestor", sliceHead, prospectiveHead],
       { cwd: repositoryPath, redactionValues, allowedExitCodes: [0, 1] },
     );
     if (ancestor.exitCode === 0) {
       return {
         status: "already-integrated",
-        commit: integrationHead,
+        commit: prospectiveHead,
         integrationBranch: session.integrationBranch,
       };
     }
 
     const merge = await this.#git(
-      ["merge-tree", "--write-tree", integrationHead, sliceHead],
+      ["merge-tree", "--write-tree", prospectiveHead, sliceHead],
       { cwd: repositoryPath, redactionValues, allowedExitCodes: [0, 1] },
     );
     if (merge.exitCode === 1) {
@@ -447,14 +660,17 @@ export class GitWorktreeEngine implements WorktreeEngine {
     const commit = await this.#commitTree(
       repositoryPath,
       tree,
-      [integrationHead, sliceHead],
+      [prospectiveHead, sliceHead],
       message,
       redactionValues,
     );
-    await this.#git(["update-ref", integrationRef, commit, integrationHead], {
+    await this.#git(["update-ref", prospectiveRef, commit, prospectiveHead], {
       cwd: repositoryPath,
       redactionValues,
     });
+    if (!finalize) {
+      state.sessionState.accumulatedHead = commit;
+    }
     return {
       status: "merged",
       commit,
@@ -492,6 +708,13 @@ export class GitWorktreeEngine implements WorktreeEngine {
       }
     }
     this.#worktrees.delete(worktree);
+    // Deleted with the handle rather than lazily: a stale entry would let
+    // `diffUncommitted` resolve a path whose directory no longer exists, and
+    // the failure would arrive from git as an unrecognisable cwd error instead
+    // of this engine's own "not registered" refusal.
+    if (state.indexKey !== null) {
+      this.#isolatedByPath.delete(state.indexKey);
+    }
     state.sessionState.activeWorktrees.delete(worktree);
   }
 
@@ -508,7 +731,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
     await this.#refreshRedactionValues(state);
     const expectedRefs = new Map<string, string>([
-      [`refs/heads/${session.baseBranch}`, session.baseCommit],
+      [`refs/heads/${session.baseBranch}`, state.accumulatedHead],
       ...[...state.sliceHeads].map(
         ([branch, head]) => [`refs/heads/${branch}`, head] as const,
       ),
@@ -602,16 +825,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
     }
 
     const baseRef = `refs/heads/${session.baseBranch}`;
-    const baseHead = await this.#revParse(
-      session.repositoryPath,
-      baseRef,
-      redactionValues,
-    );
-    if (baseHead !== session.baseCommit) {
-      throw new Error(
-        `scratch base branch ${session.baseBranch} moved unexpectedly`,
-      );
-    }
+    const baseHead = await this.#verifiedAccumulatedHead(state);
     for (const worktree of state.activeWorktrees) {
       if (!worktree.isolated) {
         continue;
@@ -625,7 +839,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
       }
     }
 
-    const transaction = ["start", `delete ${baseRef} ${session.baseCommit}`];
+    const transaction = ["start", `delete ${baseRef} ${baseHead}`];
     for (const [branch, head] of state.sliceHeads) {
       transaction.push(`delete refs/heads/${branch} ${head}`);
     }
@@ -635,14 +849,14 @@ export class GitWorktreeEngine implements WorktreeEngine {
       input: transaction.join("\n"),
       redactionValues,
     });
-    const zeroObjectId = "0".repeat(session.baseCommit.length);
+    const zeroObjectId = "0".repeat(baseHead.length);
     try {
-      await this.#git(
-        ["update-ref", integrationRef, session.baseCommit, zeroObjectId],
-        { cwd: session.repositoryPath, redactionValues },
-      );
+      await this.#git(["update-ref", integrationRef, baseHead, zeroObjectId], {
+        cwd: session.repositoryPath,
+        redactionValues,
+      });
     } catch (error) {
-      const restore = ["start", `create ${baseRef} ${session.baseCommit}`];
+      const restore = ["start", `create ${baseRef} ${baseHead}`];
       for (const [branch, head] of state.sliceHeads) {
         restore.push(`create refs/heads/${branch} ${head}`);
       }
@@ -655,7 +869,22 @@ export class GitWorktreeEngine implements WorktreeEngine {
       throw error;
     }
     state.integrationMaterialized = true;
-    return session.baseCommit;
+    return baseHead;
+  }
+
+  async #verifiedAccumulatedHead(state: SessionState): Promise<string> {
+    const { session, redactionValues } = state;
+    const head = await this.#revParse(
+      session.repositoryPath,
+      `refs/heads/${session.baseBranch}`,
+      redactionValues,
+    );
+    if (head !== state.accumulatedHead) {
+      throw new Error(
+        `scratch base branch ${session.baseBranch} moved unexpectedly`,
+      );
+    }
+    return head;
   }
 
   async #changedPaths(
@@ -699,11 +928,50 @@ export class GitWorktreeEngine implements WorktreeEngine {
     redactionValues: readonly string[],
     linkedSecretPaths: readonly string[],
   ): Promise<string> {
+    return await this.#withSanitizedTree(
+      cwd,
+      parent,
+      redactionValues,
+      linkedSecretPaths,
+      "repository",
+      async (tree) => tree,
+    );
+  }
+
+  /**
+   * Stage the working tree into a sanitized tree object and hand it to `use`.
+   *
+   * ONE PIPELINE, TWO DESTINATIONS, AND THAT IS THE WHOLE POINT OF THE
+   * PARAMETER. `commit()` needs the tree and its blobs to survive in the
+   * repository's object database, because a commit is about to point at them.
+   * `diffUncommitted()` needs the identical tree and must leave nothing behind,
+   * because the slice it describes may be rejected seconds later. Git object
+   * ids are content hashes, so the two destinations produce the SAME ids from
+   * the same working tree — which is what lets the diff promise it shows the
+   * change `commit()` will record, rather than a second opinion about it.
+   *
+   * Writing the diff's objects into the real store instead would be simpler by
+   * one parameter and would leave a rejected slice's blobs unreferenced in the
+   * user's repository, once per rejection, forever.
+   */
+  async #withSanitizedTree<T>(
+    cwd: string,
+    parent: string,
+    redactionValues: readonly string[],
+    linkedSecretPaths: readonly string[],
+    // Named `store` rather than `destination` because a local of that name
+    // already exists in the loop below — it is the REDACTED PATH an entry is
+    // staged at — and two different `destination`s in one function is exactly
+    // how a reader (or a mutation test) ends up comparing a path to a store.
+    store: "repository" | "scratch",
+    use: (tree: string, env: Readonly<Record<string, string>>) => Promise<T>,
+  ): Promise<T> {
     await this.#assertLfsIsNotEnabled(cwd, redactionValues);
     return await this.#withTemporaryStagingStore(
       cwd,
       redactionValues,
       async ({ scratchEnv, realEnv }) => {
+        const targetEnv = store === "repository" ? realEnv : scratchEnv;
         // Git owns worktree conversion, modes, and gitlinks. Git objects are
         // quarantined here; side-storage filters such as Git LFS are refused.
         await this.#git(["read-tree", parent], {
@@ -755,7 +1023,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
                   entry.objectId,
                   cwd,
                   scratchEnv,
-                  realEnv,
+                  targetEnv,
                   redactionValues,
                   this.#commandTimeoutMs,
                 );
@@ -781,14 +1049,14 @@ export class GitWorktreeEngine implements WorktreeEngine {
           }
         }
 
-        // Every blob now exists in the real ODB and every path is sanitized,
-        // so tree creation can safely target the real store.
+        // Every blob now exists in the destination store and every path is
+        // sanitized, so tree creation can safely target it too.
         const result = await this.#git(["write-tree"], {
           cwd,
-          env: realEnv,
+          env: targetEnv,
           redactionValues,
         });
-        return result.stdout.toString("utf8").trim();
+        return await use(result.stdout.toString("utf8").trim(), targetEnv);
       },
     );
   }
@@ -1591,7 +1859,10 @@ function normalizeRedactionValues(
 ): readonly string[] {
   return Object.freeze(
     [...new Set(values)]
-      .filter((value) => value.length > 0)
+      // A value made only of line breaks is indistinguishable from the
+      // structure of a line-oriented artifact. Treating it as a secret would
+      // replace unrelated separators (and, in a diff, unrelated blank lines).
+      .filter((value) => /[^\r\n]/.test(value))
       .sort((left, right) => right.length - left.length),
   );
 }
@@ -1731,14 +2002,211 @@ function stripMatchingQuotes(value: string): string {
   return value;
 }
 
-function redactText(value: string, redactionValues: readonly string[]): string {
+/**
+ * A path with every symbolic link resolved, or its lexically resolved form when
+ * nothing is there to resolve.
+ *
+ * The fallback is narrow on purpose: only a genuinely absent path takes it, and
+ * it exists so that `diffUncommitted("/nowhere")` fails this engine's own
+ * "not registered" refusal instead of surfacing a raw ENOENT from `realpath`.
+ * Any other filesystem error — a component that is a file, a symlink loop —
+ * still propagates, because a path that exists and cannot be resolved is not a
+ * path this engine may quietly guess about.
+ */
+async function canonicalPath(path: string): Promise<string> {
+  const resolved = resolve(path);
+  try {
+    return await realpath(resolved);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return resolved;
+    }
+    throw error;
+  }
+}
+
+/** Drop the `index <old>..<new>` header lines. See `DIFF_INDEX_LINE`. */
+function stripIndexLines(patch: string): string {
+  if (patch === "") {
+    return "";
+  }
+  return patch
+    .split("\n")
+    .filter((line) => !DIFF_INDEX_LINE.test(line))
+    .join("\n");
+}
+
+/**
+ * Cut a patch to the caller's bound and say so inside the text.
+ *
+ * IT CUTS AT A LINE BOUNDARY WHEN IT CAN. A patch severed mid-line reads as a
+ * change that was never proposed — half a condition, an unterminated string —
+ * and a reader has no way to tell that from the real thing. When the window
+ * holds no newline at all (one enormous minified line), it cuts at the limit
+ * and steps back off a lone surrogate, because splitting a surrogate pair
+ * produces a replacement character rather than a shorter string.
+ */
+function boundPatch(patch: string, maxCharacters: number): UncommittedDiff {
+  const totalCharacters = patch.length;
+  if (totalCharacters <= maxCharacters) {
+    return { patch, truncated: false, totalCharacters };
+  }
+  const lastNewline = patch.lastIndexOf("\n", maxCharacters - 1);
+  let cut = maxCharacters;
+  if (lastNewline > 0) {
+    cut = lastNewline + 1;
+  } else if (isHighSurrogate(patch.charCodeAt(cut - 1))) {
+    cut -= 1;
+  }
+  const kept = patch.slice(0, cut);
+  const separator = kept.endsWith("\n") ? "" : "\n";
+  return {
+    patch: `${kept}${separator}[brigadier: this diff was truncated; ${cut} of ${totalCharacters} characters shown]\n`,
+    truncated: true,
+    totalCharacters,
+  };
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+/**
+ * Replace verbatim secrets, including the exact line-oriented form Git emits.
+ *
+ * A multiline value in a deleted diff line is no longer contiguous: Git puts
+ * `-` after every internal newline (`first\n-second`). Added and context lines
+ * have the same shape with `+` and space. The matcher below still requires the
+ * complete value in order; no component line is ever redacted on its own.
+ *
+ * `onScan` is deliberately injectable so the termination test can count
+ * searches and throw at a fixed operation budget instead of relying on time.
+ */
+export function redactText(
+  value: string,
+  redactionValues: readonly string[],
+  onScan?: () => void,
+): string {
   let redacted = value;
   for (const secret of redactionValues) {
-    if (secret.length > 0) {
-      redacted = redacted.split(secret).join(REDACTION_MARKER);
+    // Empty and line-break-only values cannot be secrets in a line-oriented
+    // artifact without also being its structure. This guard also makes every
+    // search below non-empty, so its cursor must advance after every match.
+    if (!/[^\r\n]/.test(secret)) {
+      continue;
     }
+    redacted = replaceLiteral(redacted, secret, REDACTION_MARKER, onScan);
+    if (!secret.includes("\n")) {
+      continue;
+    }
+    redacted = replaceArtifactSplitLiteral(
+      redacted,
+      secret,
+      REDACTION_MARKER,
+      onScan,
+    );
   }
   return redacted;
+}
+
+function replaceArtifactSplitLiteral(
+  source: string,
+  secret: string,
+  replacement: string,
+  onScan?: () => void,
+): string {
+  const lines = secret.split("\n");
+  const insertedPrefixCount = lines.length - 1 - (lines.at(-1) === "" ? 1 : 0);
+  if (insertedPrefixCount <= 0) {
+    return source;
+  }
+
+  // The first line may be empty, but the anchor never is. A non-empty anchor
+  // is the progress invariant that rules out indexOf("") pinning at `length`.
+  const firstLine = lines[0] ?? "";
+  const anchor = firstLine === "" ? "\n" : firstLine;
+  const chunks: string[] = [];
+  let outputCursor = 0;
+  let searchCursor = 0;
+  while (searchCursor <= source.length) {
+    onScan?.();
+    const candidate = source.indexOf(anchor, searchCursor);
+    if (candidate === -1) {
+      break;
+    }
+    const end = artifactSplitMatchEnd(source, candidate, lines, onScan);
+    if (end === null) {
+      searchCursor = candidate + 1;
+      continue;
+    }
+    chunks.push(source.slice(outputCursor, candidate), replacement);
+    outputCursor = end;
+    searchCursor = end;
+  }
+  if (chunks.length === 0) {
+    return source;
+  }
+  chunks.push(source.slice(outputCursor));
+  return chunks.join("");
+}
+
+function artifactSplitMatchEnd(
+  source: string,
+  start: number,
+  lines: readonly string[],
+  onScan?: () => void,
+): number | null {
+  const firstLine = lines[0] ?? "";
+  let cursor = start + firstLine.length;
+  for (let index = 1; index < lines.length; index += 1) {
+    onScan?.();
+    if (source[cursor] !== "\n") {
+      return null;
+    }
+    cursor += 1;
+    const line = lines[index] ?? "";
+    const isTerminalNewline = index === lines.length - 1 && line === "";
+    if (isTerminalNewline) {
+      return cursor;
+    }
+    if (
+      !(ARTIFACT_LINE_PREFIXES as readonly string[]).includes(
+        source[cursor] ?? "",
+      )
+    ) {
+      return null;
+    }
+    cursor += 1;
+    if (!source.startsWith(line, cursor)) {
+      return null;
+    }
+    cursor += line.length;
+  }
+  return cursor;
+}
+
+function replaceLiteral(
+  source: string,
+  search: string,
+  replacement: string,
+  onScan?: () => void,
+): string {
+  if (search.length === 0) {
+    return source;
+  }
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor <= source.length) {
+    onScan?.();
+    const match = source.indexOf(search, cursor);
+    if (match === -1) {
+      chunks.push(source.slice(cursor));
+      break;
+    }
+    chunks.push(source.slice(cursor, match), replacement);
+    cursor = match + search.length;
+  }
+  return chunks.join("");
 }
 
 function replaceBytes(
