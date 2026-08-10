@@ -198,9 +198,9 @@ Full detail, including the honest limits of each host, is in
 [docs/HOSTS.md](docs/HOSTS.md). The headline is that **the handoff hook is not
 uniform**: it works on Claude Code; on opencode it binds to event names verified
 against a running opencode 1.18.16; on Codex brigadier registers it but Codex
-trust-gates it — a click, required again after every edit because the definition
-is hashed, and a silent no-op until you give it — and it is **impossible on
-Claude Desktop**, which exposes no hook surface at all.
+trust-gates it — a click, and a silent no-op until you give it, with the
+approval bound to the registration rather than to the script's contents — and it
+is **impossible on Claude Desktop**, which exposes no hook surface at all.
 
 ### `brigadier mcp`
 

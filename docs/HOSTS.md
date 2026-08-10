@@ -103,10 +103,13 @@ is how a second install finds its own entry to replace instead of appending a
 duplicate.
 
 **Registration is not approval.** Codex will not run a hook you have not
-trusted, and the trust is bound to a hash of the hook definition, so the click
-is required again after any edit to `handoff.mjs`. Until you approve it, the
-hook is a silent no-op: Codex exits 0, with no warning and no hook output. The
-README installed beside `handoff.mjs` explains the approval step.
+trusted. Until you approve it, the hook is a silent no-op: Codex exits 0, with
+no warning and no hook output. That approval is bound to the registration — the
+event, matcher, and command — and not to the contents of `handoff.mjs`, so the
+script at an approved path can later change without Codex asking again;
+re-reviewing an edited script means deliberately changing the registration and
+approving it again. The README installed beside `handoff.mjs` explains the
+approval step.
 
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
 including brigadier's own workers, and no flag suppresses it. Keep it doctrine.
@@ -166,7 +169,7 @@ tempted to keep grinding rather than delegate. **It does not exist uniformly.**
 | --- | --- |
 | Claude Code | **Works.** `PreCompact` receives the transcript path and the hook can write a message back into the session |
 | opencode | **Event names verified.** The plugin subscribes to the session event bus against event names verified on a running opencode 1.18.16 |
-| Codex | **Registered, then trust-gated.** `brigadier install codex` writes the `PreCompact` registration, but hooks run only after you click to trust the hook definition, and the definition is hashed — so the click is required again after every edit to the script. Until then it is a silent no-op. This is not seamless and is not presented as such |
+| Codex | **Registered, then trust-gated.** `brigadier install codex` writes the `PreCompact` registration, but hooks run only after you click to trust it, and until then it is a silent no-op. Approval binds to the registration, not to the script's contents, so an approved script can change later without another click. This is not seamless and is not presented as such |
 | Claude Desktop | **Impossible.** Desktop exposes no hook surface at all, and an MCP server is called by the model, never by the transcript. There is no workaround |
 
 ## Using brigadier over MCP directly
@@ -181,12 +184,18 @@ bundle involved. It takes no runtime options; `-h`/`--help` prints usage.
 | `brigadier_run` | The real thing: worktrees, workers, commits, one integration branch |
 
 `brigadier_run` takes a `repositoryPath` plus the same `slug`, `maxWorkers`,
-`dryRun` and `unsafeInPlace` options the CLI does. The path **must be absolute**,
-in the advertised schema and in the implementation alike: a relative path is
-refused rather than resolved, and so is a leading `~`, which nothing in the
-server expands. An MCP client gives nobody control over the server process's
-working directory, so a relative path would resolve against a directory the
-caller cannot see and could silently target the wrong repository.
+`dryRun` and `unsafeInPlace` options the CLI does. The path **must name exactly
+one location by itself**, in the advertised schema and in the implementation
+alike, and the rule is platform-aware: on POSIX, a path beginning with `/`,
+exactly as before; on Windows, a path that also names its volume, either
+drive-qualified like `C:\repo` or `C:/repo` or UNC like `\\server\share`. A
+relative path is refused rather than resolved, and so is a leading `~`, which
+nothing in the server expands. An MCP client gives nobody control over the
+server process's working directory, so anything the server would have to resolve
+against state of its own could silently target the wrong repository. That is also why the Windows
+check does not use `node:path`'s `isAbsolute`: it answers **true** for `/repo`,
+which — like `\repo` and `C:repo` — is drive-relative and resolves against a
+current drive the caller cannot see, so all three are refused.
 
 `brigadier_route_plan` routes against an empty quota snapshot, which the routing
 pipeline reads as "unknown" and therefore as available — so a drained model is
