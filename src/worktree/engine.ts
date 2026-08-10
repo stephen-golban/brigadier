@@ -107,8 +107,7 @@ const DIFF_CONFIG_ENV: Readonly<Record<string, string>> = {
  * header by construction, and this pattern is anchored at both ends.
  */
 const DIFF_INDEX_LINE = /^index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?$/;
-const LFS_UNSUPPORTED_MESSAGE =
-  "Git LFS is unsupported: remove filter=lfs attributes and unset filter.lfs.clean before using Brigadier";
+const LFS_FILTER_ATTRIBUTE = "lfs";
 
 interface GitResult {
   readonly exitCode: number;
@@ -966,7 +965,6 @@ export class GitWorktreeEngine implements WorktreeEngine {
     store: "repository" | "scratch",
     use: (tree: string, env: Readonly<Record<string, string>>) => Promise<T>,
   ): Promise<T> {
-    await this.#assertLfsIsNotEnabled(cwd, redactionValues);
     return await this.#withTemporaryStagingStore(
       cwd,
       redactionValues,
@@ -979,6 +977,7 @@ export class GitWorktreeEngine implements WorktreeEngine {
           env: scratchEnv,
           redactionValues,
         });
+        await this.#assertNoLfsFilteredPaths(cwd, scratchEnv, redactionValues);
         await this.#git(["add", "-A", "--", "."], {
           cwd,
           env: scratchEnv,
@@ -1123,47 +1122,83 @@ export class GitWorktreeEngine implements WorktreeEngine {
     ]);
   }
 
-  async #assertLfsIsNotEnabled(
+  async #assertNoLfsFilteredPaths(
     cwd: string,
+    env: Readonly<Record<string, string>>,
     redactionValues: readonly string[],
   ): Promise<void> {
-    const configuredCleanFilter = await this.#git(
-      ["config", "--get-all", "filter.lfs.clean"],
-      { cwd, redactionValues, allowedExitCodes: [0, 1] },
+    // Git applies configuration from every scope when it runs a clean/process
+    // filter, so this lookup deliberately does too. Configuration alone is
+    // harmless: it becomes relevant only when an actual staging candidate is
+    // routed through the driver by Git's effective attributes.
+    const configuredDrivers = await Promise.all(
+      ["filter.lfs.clean", "filter.lfs.process"].map(
+        async (key) =>
+          await this.#git(["config", "--get", key], {
+            cwd,
+            env,
+            redactionValues,
+            allowedExitCodes: [0, 1],
+          }),
+      ),
     );
-    if (configuredCleanFilter.exitCode === 0) {
-      throw new Error(LFS_UNSUPPORTED_MESSAGE);
+    if (
+      configuredDrivers.every(
+        (result) =>
+          result.exitCode === 1 ||
+          result.stdout.toString("utf8").trim().length === 0,
+      )
+    ) {
+      return;
     }
 
-    const attributeFiles = splitNul(
+    const listedPaths = splitNul(
       (
         await this.#git(
-          [
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".gitattributes",
-            ":(glob)**/.gitattributes",
-          ],
-          { cwd, redactionValues },
+          ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+          { cwd, env, redactionValues },
         )
       ).stdout,
     );
-    for (const path of attributeFiles) {
-      let contents: string;
+    const stagePaths: string[] = [];
+    for (const path of listedPaths) {
       try {
-        contents = await readFile(resolve(cwd, path), "utf8");
-      } catch (error) {
-        if (isMissingFileError(error)) {
-          continue;
+        if ((await lstat(resolve(cwd, path))).isFile()) {
+          stagePaths.push(path);
         }
-        throw error;
+      } catch (error) {
+        if (!isMissingFileError(error)) {
+          throw error;
+        }
       }
-      if (declaresLfsFilter(contents)) {
-        throw new Error(LFS_UNSUPPORTED_MESSAGE);
+    }
+    if (stagePaths.length === 0) {
+      return;
+    }
+
+    const attributes = splitNul(
+      (
+        await this.#git(["check-attr", "-z", "--stdin", "filter"], {
+          cwd,
+          env,
+          input: Buffer.from(`${stagePaths.join("\0")}\0`),
+          redactionValues,
+        })
+      ).stdout,
+    );
+    for (let index = 0; index < attributes.length; index += 3) {
+      const path = attributes[index];
+      const attribute = attributes[index + 1];
+      const value = attributes[index + 2];
+      if (
+        path !== undefined &&
+        attribute === "filter" &&
+        value === LFS_FILTER_ATTRIBUTE
+      ) {
+        const displayPath = redactText(path, redactionValues);
+        throw new Error(
+          `Git LFS is unsupported for path ${JSON.stringify(displayPath)}: remove its filter=lfs attribute before using Brigadier`,
+        );
       }
     }
   }
@@ -1589,19 +1624,6 @@ function normalizeUniquePaths(
     throw new Error(`${label} paths must be unique`);
   }
   return Object.freeze(normalized);
-}
-
-function declaresLfsFilter(contents: string): boolean {
-  return contents.split(/\r?\n/).some((line) => {
-    const trimmed = line.trimStart();
-    if (trimmed.length === 0 || trimmed.startsWith("#")) {
-      return false;
-    }
-    return trimmed
-      .split(/[\t ]+/)
-      .slice(1)
-      .some((attribute) => attribute === "filter=lfs");
-  });
 }
 
 function normalizeRepositoryPath(path: string, label: string): string {

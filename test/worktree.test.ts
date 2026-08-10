@@ -100,24 +100,67 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
-    "refuses a repository that declares a Git LFS clean filter",
+    "allows an installed Git LFS clean filter when no path has LFS attributes",
+    async () => {
+      await withFixture(async (fixture) => {
+        await gitText(fixture.repository, [
+          "config",
+          "filter.lfs.clean",
+          "git-lfs clean -- %f",
+        ]);
+
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "lfs-installed",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, "worker-output.txt"),
+          "exact bytes written by the worker\n",
+        );
+        const committed = await fixture.engine.commit({
+          worktree,
+          message: "record worker output",
+        });
+
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            `${committed.commit}:worker-output.txt`,
+          ]),
+        ).toBe("exact bytes written by the worker\n");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses a staged path routed through Git LFS by .gitattributes",
     async () => {
       await withFixture(async ({ repository, engine }) => {
+        await gitText(repository, ["config", "filter.lfs.clean", "false"]);
         await writeFile(
           join(repository, ".gitattributes"),
           "*.bin filter=lfs diff=lfs merge=lfs -text\n",
         );
         await writeFile(join(repository, "payload.bin"), SECRET);
         const message =
-          "Git LFS is unsupported: remove filter=lfs attributes and unset filter.lfs.clean before using Brigadier";
+          'Git LFS is unsupported for path "payload.bin": remove its filter=lfs attribute before using Brigadier';
 
-        await expect(
-          engine.prepare({
+        let refusal = "";
+        try {
+          await engine.prepare({
             repositoryPath: repository,
             slug: "lfs-refusal",
             secrets: { linkedPaths: [".env"] },
-          }),
-        ).rejects.toThrow(message);
+          });
+        } catch (error) {
+          refusal = error instanceof Error ? error.message : String(error);
+        }
+        expect(refusal).toBe(
+          'Git LFS is unsupported for path "payload.bin": remove its filter=lfs attribute before using Brigadier',
+        );
         console.log(`LFS refusal: ${message}`);
       });
     },
@@ -125,23 +168,28 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
-    "refuses a configured Git LFS clean filter",
+    "refuses a staged path routed through Git LFS by info attributes",
     async () => {
       await withFixture(async ({ repository, engine }) => {
-        await gitText(repository, [
-          "config",
-          "filter.lfs.clean",
-          "git-lfs clean -- %f",
-        ]);
+        await gitText(repository, ["config", "filter.lfs.clean", "false"]);
+        await writeFile(
+          join(repository, ".git/info/attributes"),
+          "info.bin filter=lfs\n",
+        );
+        await writeFile(join(repository, "info.bin"), "info attribute bytes\n");
 
-        await expect(
-          engine.prepare({
+        let refusal = "";
+        try {
+          await engine.prepare({
             repositoryPath: repository,
-            slug: "lfs-config-refusal",
+            slug: "lfs-info-refusal",
             secrets: { linkedPaths: [".env"] },
-          }),
-        ).rejects.toThrow(
-          "Git LFS is unsupported: remove filter=lfs attributes and unset filter.lfs.clean before using Brigadier",
+          });
+        } catch (error) {
+          refusal = error instanceof Error ? error.message : String(error);
+        }
+        expect(refusal).toBe(
+          'Git LFS is unsupported for path "info.bin": remove its filter=lfs attribute before using Brigadier',
         );
       });
     },
