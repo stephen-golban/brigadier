@@ -293,8 +293,12 @@ commit you intend to tag.
 ### Step 2 — tag it
 
 ```sh
-git tag -s "v${VERSION}" -m "v${VERSION}"
+git tag -a "v${VERSION}" -m "v${VERSION}"
 ```
+
+Signing is optional and requires a configured signing key; use `-s` if that is
+already set up. Without a signing key, `git tag -s` fails instead of creating the
+tag.
 
 A local tag is still private and still deletable (`git tag -d`).
 

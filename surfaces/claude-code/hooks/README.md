@@ -34,9 +34,10 @@ payload shape needs one line changed, not a rewrite.
   than 2 seconds for stdin to end. Both degrade to the shorter message rather
   than to a stall.
 
-## Where this hook does not exist
+## How other hosts differ
 
-- **Codex** — trust-gated. See `surfaces/codex/hooks/README.md`.
+- **Codex** — `brigadier install codex` registers the hook, then Codex requires
+  the user to approve it. See `surfaces/codex/hooks/README.md`.
 - **Claude Desktop** — impossible. Desktop exposes no hook surface at all.
 - **opencode** — provided instead by `surfaces/opencode/plugin/brigadier.js`,
   because opencode's seam is the plugin event bus rather than a hook process.

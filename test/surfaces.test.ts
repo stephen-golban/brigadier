@@ -59,8 +59,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3993,
   },
   "claude-code/hooks/README.md": {
-    sha256: "db99e47da941e8e4a6f33e7f85222b83703be4929cb199c1ac3417184e923b25",
-    bytes: 1848,
+    sha256: "a8dc71a0a1efdcb504fa5448793695f45f6f7a0b8b85a9d8e827be8230773090",
+    bytes: 1919,
   },
   "claude-code/hooks/handoff.mjs": {
     sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
@@ -71,8 +71,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 236,
   },
   "claude-desktop/README.md": {
-    sha256: "d58ff809ee708670a93b7a7e7eea694d66801878ecab2556aca494e0acf61d54",
-    bytes: 2852,
+    sha256: "ff7304ce5432a64a9ea0b4fd4112209341c9b2ea162d1d088304ea7913f77ba3",
+    bytes: 2968,
   },
   "claude-desktop/manifest.json": {
     sha256: "3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f",
@@ -426,10 +426,13 @@ describe("the surface templates", () => {
     );
   });
 
-  test("the installed opencode status matches the verified evidence", () => {
+  test("the surface index matches the verified opencode and Codex hook states", () => {
     const index = readFileSync(join(surfacesRoot, "README.md"), "utf8");
     expect(textBetween(index, "- **opencode", "\n- **Codex")).toBe(
-      "- **opencode — event binding unverified.** The plugin subscribes to the\n  session event bus, but its two event names have not been verified against a\n  running opencode build. See `opencode/plugin/brigadier.js`.",
+      "- **opencode — event binding verified, with limits.** The plugin's event names\n  were verified against opencode 1.18.16, but no live compaction was triggered,\n  only that version was tested, and its event vocabulary is version-dependent.\n  See `opencode/plugin/brigadier.js` and `opencode/README.md`.",
+    );
+    expect(textBetween(index, "- **Codex", "\n- **Claude Desktop")).toBe(
+      "- **Codex — registered, then trust-gated.** `brigadier install codex` merges a\n  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only\n  after you approve the hook definition. The definition is hashed, so approval\n  is required again after every edit to `handoff.mjs`. See `codex/hooks/`.",
     );
 
     const opencode = SURFACE_TEMPLATES["opencode/README.md"] ?? "";
@@ -438,10 +441,10 @@ describe("the surface templates", () => {
     );
   });
 
-  test("Desktop doctrine keeps the unverified hook and staged-build limits explicit", () => {
+  test("Desktop doctrine keeps verified hook and staged-build limits explicit", () => {
     const desktop = SURFACE_TEMPLATES["claude-desktop/README.md"] ?? "";
-    expect(paragraphContaining(desktop, "unverified event names")).toBe(
-      "Design decision #10's transcript-watching handoff works on Claude Code, has\nunverified event names on opencode, and is trust-gated on Codex. On Desktop it is\n**impossible**, not merely unimplemented: Desktop exposes no hook surface of any\nkind, and an MCP server is invoked by the model when the model chooses to invoke\nit — never by the transcript, and never at the moment the context fills. There is\nno workaround and none is offered.",
+    expect(paragraphContaining(desktop, "Design decision #10's")).toBe(
+      "Design decision #10's transcript-watching handoff works on Claude Code. On\nopencode, its event names were verified only on 1.18.16, without triggering live\ncompaction, and remain version-dependent. On Codex, brigadier registers it but\nCodex trust-gates it. On Desktop it is **impossible**, not merely unimplemented:\nDesktop exposes no hook surface of any kind, and an MCP server is invoked by the\nmodel when the model chooses to invoke it — never by the transcript, and never at\nthe moment the context fills. There is no workaround and none is offered.",
     );
     expect(
       textBetween(

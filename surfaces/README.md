@@ -19,7 +19,7 @@ two ever diverge — in either direction, for any installable file.
 | Host | What is installed | Where |
 | --- | --- | --- |
 | Claude Code | a skill, auto-loading as a plugin | `~/.claude/skills/brigadier/` |
-| Codex | a skill plus global `AGENTS.md` doctrine | `~/.agents/skills/brigadier/`, `$CODEX_HOME/AGENTS.md` |
+| Codex | a skill, global `AGENTS.md` doctrine, and a handoff hook registration | `~/.agents/skills/brigadier/`, `$CODEX_HOME/AGENTS.md`, `$CODEX_HOME/hooks.json` |
 | opencode | a plugin | `~/.config/opencode/plugin/brigadier.js` |
 | Claude Desktop | an MCP server bundle, staged for manual install | `~/.brigadier/surfaces/claude-desktop/` |
 
@@ -44,13 +44,14 @@ tempted to keep grinding rather than delegate. It does not exist uniformly:
 
 - **Claude Code — works.** `PreCompact` receives the transcript path and the hook
   can write a message back into the session. See `claude-code/hooks/`.
-- **opencode — event binding unverified.** The plugin subscribes to the
-  session event bus, but its two event names have not been verified against a
-  running opencode build. See `opencode/plugin/brigadier.js`.
-- **Codex — trust-gated.** Hooks run only after you click to trust the hook
-  definition, and the definition is hashed, so the click is required again after
-  every edit to the script. This is not seamless and is not presented as such.
-  See `codex/hooks/`.
+- **opencode — event binding verified, with limits.** The plugin's event names
+  were verified against opencode 1.18.16, but no live compaction was triggered,
+  only that version was tested, and its event vocabulary is version-dependent.
+  See `opencode/plugin/brigadier.js` and `opencode/README.md`.
+- **Codex — registered, then trust-gated.** `brigadier install codex` merges a
+  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only
+  after you approve the hook definition. The definition is hashed, so approval
+  is required again after every edit to `handoff.mjs`. See `codex/hooks/`.
 - **Claude Desktop — impossible.** Desktop exposes no hook surface at all. The
   MCP server is the only local seam it has, and an MCP server is called by the
   model, never by the transcript. There is nothing to install and no workaround.
