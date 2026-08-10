@@ -6,12 +6,13 @@ hand the work to `brigadier run`*. It is not a proxy, it does not wrap the model
 and it depends on no plugin runtime: brigadier spawns `claude` and `codex` as
 plain subprocesses.
 
-Every file under this directory is a template. `brigadier install <host>` copies
-it into the host's configuration directory. `src/surfaces/templates.ts` carries a
-byte-for-byte copy of each file so the compiled single-file binary can write them
-without this directory being present on the user's machine, and
-`test/surfaces.test.ts` fails the build if the two ever diverge — in either
-direction, for any file.
+This README is review-only and is never installed. Every other file under
+this directory is an installable template. `brigadier install <host>` copies
+those files into the host's configuration directory.
+`src/surfaces/templates.ts` carries a byte-for-byte copy of each installable file
+so the compiled single-file binary can write them without this directory being
+present on the user's machine, and `test/surfaces.test.ts` fails the build if the
+two ever diverge — in either direction, for any installable file.
 
 ## The four hosts
 
@@ -43,8 +44,9 @@ tempted to keep grinding rather than delegate. It does not exist uniformly:
 
 - **Claude Code — works.** `PreCompact` receives the transcript path and the hook
   can write a message back into the session. See `claude-code/hooks/`.
-- **opencode — works.** The plugin subscribes to the session event bus. See
-  `opencode/plugin/brigadier.js`.
+- **opencode — event binding unverified.** The plugin subscribes to the
+  session event bus, but its two event names have not been verified against a
+  running opencode build. See `opencode/plugin/brigadier.js`.
 - **Codex — trust-gated.** Hooks run only after you click to trust the hook
   definition, and the definition is hashed, so the click is required again after
   every edit to the script. This is not seamless and is not presented as such.

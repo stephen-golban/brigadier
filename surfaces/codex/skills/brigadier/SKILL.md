@@ -35,10 +35,12 @@ session is disposable and starts clean.
    `id`, `title`, `prompt`, `ownedPaths` and `difficulty` are required on every
    slice. `difficulty` is one of `routine`, `standard`, `hard`, and it has no
    default: a plan that does not say how hard a slice is has not been planned.
-   `dependsOn` is parsed but **not usable yet**: a dependent slice would not see
-   its prerequisite's output, so `brigadier run` refuses any plan that declares
-   one. Split dependent work into separate runs. `requires` is optional and takes
-   `imageInput`, `webSearch`, `structuredOutput`, and `minContextWindowTokens`.
+   `dependsOn` is optional and names prerequisite slice ids. brigadier runs
+   dependency waves in order and reconciles each non-final wave before creating
+   the next wave's worktrees, so dependent slices start from their prerequisites'
+   committed output. Unknown ids, self-dependencies, and cycles are refused.
+   `requires` is optional and takes `imageInput`, `webSearch`,
+   `structuredOutput`, and `minContextWindowTokens`.
 3. **Dry-run it first.** `brigadier run --plan plan.json --dry-run` routes every
    slice and prints which vendor, model and effort would take it, without
    creating a worktree or spawning anything. A slice that cannot route is worth
@@ -55,10 +57,11 @@ session is disposable and starts clean.
 - Do not do the work yourself because it "looks quick". A one-file change is a
   one-slice plan, and writing the plan costs less than the context you spend
   doing it here.
-- Do not invent commands. brigadier has exactly two: `init` and `run`.
-  `brigadier run "fix the parser"` is **not implemented** — a bare task
-  description is refused, and `--plan <file>` (or `--plan -` for stdin) is
-  required.
+- Do not invent commands. brigadier has exactly four: `init`, `run`,
+  `install`, and `mcp`. `brigadier run "<task description>"` asks a model to
+  decompose the task, then sends the result through the same validator used for
+  `--plan`. On genuine ambiguity it exits 4 with `status: "needs_human"` and
+  structured questions; no worktree is created and no slice worker is spawned.
 
 ## Before the first run on a machine
 
@@ -69,5 +72,6 @@ it `brigadier run` exits 1 and tells you to run `init`.
 ## Exit codes worth branching on
 
 `0` succeeded · `1` never started (no config, bad plan file, missing HOME/PATH/USER)
-· `2` usage error · `3` the run started and did not succeed · `130`/`143`
-interrupted.
+· `2` usage error · `3` the run started and did not succeed · `4` needs human input
+(the task was too ambiguous to plan; questions were printed and no run started) ·
+`130`/`143` interrupted.

@@ -38,24 +38,29 @@ last four stages more tightly together. Its actual procedure is:
    for none of those things
    ([`src/routing/contracts.ts:43`](../src/routing/contracts.ts#L43) and
    [`src/routing/router.ts:893`](../src/routing/router.ts#L893)).
-5. Match each survivor's model ID against the competence table, split ranked
-   from unranked models, and apply the difficulty floor to ranked models
-   ([`src/routing/router.ts:707`](../src/routing/router.ts#L707)).
+5. Match each survivor's model ID against the competence table and split ranked
+   from unranked models. Ranked models at or above the difficulty floor can enter
+   ordinary eligibility. Ranked models below it and every unranked model are held
+   for consented salvage
+   ([`src/routing/router.ts:709`](../src/routing/router.ts#L709) and
+   [`src/routing/router.ts:733`](../src/routing/router.ts#L733)).
 6. Sort ranked models that clear the floor by ascending competence score, with
    configuration order breaking ties. That ascending sort is the entire cost
-   policy ([`src/routing/router.ts:712`](../src/routing/router.ts#L712)). It
+   policy ([`src/routing/router.ts:717`](../src/routing/router.ts#L717)). It
    reads no price, token rate, or latency estimate; it assumes the lower-scored
    adequate tier is the cheaper choice.
 7. In that order, resolve the first candidate to the highest supported effort
    no higher than the request's base effort or the configured ceiling
-   ([`src/routing/router.ts:755`](../src/routing/router.ts#L755) and
-   [`src/routing/router.ts:1004`](../src/routing/router.ts#L1004)). If a
+   ([`src/routing/router.ts:758`](../src/routing/router.ts#L758) and
+   [`src/routing/router.ts:1012`](../src/routing/router.ts#L1012)). If a
    candidate has no runnable effort, continue to the next candidate.
-8. If ordinary selection fails and degraded routing is allowed, consider only
-   ranked, below-floor models that survived quota, exclusion, capability, and
-   effort. Pick the highest score, with configuration order again breaking ties
-   ([`src/routing/router.ts:332`](../src/routing/router.ts#L332) and
-   [`src/routing/router.ts:634`](../src/routing/router.ts#L634)).
+8. If ordinary selection fails and degraded routing is allowed, consider ranked
+   below-floor and unranked models that survived quota, exclusion, capability,
+   and effort. Ranked candidates precede unranked candidates; within the ranked
+   set the highest score wins, and configuration order breaks ties and orders
+   unranked candidates
+   ([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and
+   [`src/routing/router.ts:657`](../src/routing/router.ts#L657)).
 
 This differs from the five-stage summary in two checkable ways. Quota and retry
 exclusion run before capability. In the code, cost ordering is computed before
@@ -109,17 +114,12 @@ discovery list contains `claude-fable-5`, but the competence table has no
 `fable` rule ([`src/discovery/table.ts:40`](../src/discovery/table.ts#L40)). It is
 therefore unranked even though discovery can offer it.
 
-That reveals a significant exception to the advertised floor rule. If at least
-one ranked model clears the floor, unranked models are held back. If no ranked
-model clears it, unranked models are admitted in configuration order on the
-ordinary, non-degraded path
-([`src/routing/router.ts:733`](../src/routing/router.ts#L733)). Their numeric
-score of `0` is not compared with the floor in that path, and the returned
-`waivedDifficultyFloor` flag is `false`. Consequently an unranked model can take
-a `hard` slice without `allowDegradedRouting`. This conflicts with an absolute
-reading of “without consent, a slice that no model can take at its difficulty
-fails.” The code treats “unknown competence” as a special last resort rather
-than as known below-floor competence.
+An unranked model is not proven weaker than a difficulty floor, but it is
+not proven to clear it either. It is therefore excluded from ordinary eligibility
+and enters the same consented salvage pool as a ranked model below the floor
+([`src/routing/router.ts:733`](../src/routing/router.ts#L733) and
+[`src/routing/router.ts:747`](../src/routing/router.ts#L747)). Without
+`allowDegradedRouting`, an unranked model cannot take the slice.
 
 ## Difficulty floors and cost inversion
 
@@ -197,27 +197,37 @@ but not enforced end to end.
 
 `allowDegradedRouting` defaults to `false`
 ([`src/config/contracts.ts:92`](../src/config/contracts.ts#L92) and
-[`src/config/contracts.ts:230`](../src/config/contracts.ts#L230)). For **ranked**
-models, ordinary routing fails rather than waive a difficulty floor without
-that consent. With consent, the salvage pool contains only ranked models that:
+[`src/config/contracts.ts:230`](../src/config/contracts.ts#L230)). Ordinary
+routing admits only ranked models that establish the requested difficulty floor.
 
-- survived quota and retry exclusion;
-- passed the slice's capability requirements;
-- scored below the requested floor; and
-- have a runnable effort under both the configured ceiling and reported support.
+With consent, the salvage pool contains both kinds of model that brigadier
+could not prove meet the requested floor:
 
-The salvage winner is the **highest** score, not the lowest. This does not
+- ranked models scored below the requested floor; and
+- unranked models with no competence score to compare with the floor.
+
+Every salvage candidate must also have survived quota and retry exclusion,
+passed the slice's capability requirements, and have a runnable effort under
+both the configured ceiling and reported support.
+
+The ranked salvage winner is the **highest** score, not the lowest. This does not
 contradict cheapest-adequate selection. Ordinary routing has an adequate set
 and minimizes within it. Salvage exists because that set is empty, so minimizing
-would select the weakest known-inadequate model. The salvage rule instead picks
-the best known option and marks `waivedDifficultyFloor: true`; the rationale
-names the waived floor, setting, candidates, scores, and winner
-([`src/routing/router.ts:1099`](../src/routing/router.ts#L1099)).
+would select the weakest known-inadequate model. The rationale names the waived
+floor, setting, candidates, scores, and winner
+([`src/routing/router.ts:1098`](../src/routing/router.ts#L1098)).
+
+Every successful salvage route records `waivedDifficultyFloor: true`. For a
+ranked winner this records a known below-floor score. For an unranked winner it
+does not claim an unranked model has a sub-floor score; it records that brigadier
+did not establish the requested floor. Ranked candidates precede all unranked
+candidates, ranked candidates are ordered by descending score, and ties or
+unranked-only choices preserve configuration order
+([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and
+[`src/routing/router.ts:657`](../src/routing/router.ts#L657)).
 
 Consent waives only the floor. It cannot revive a quota-exhausted or excluded
-model, manufacture a missing capability, or create a supported effort. The
-unranked-model exception described above remains outside this consent mechanism
-and should be considered when auditing the default-failure claim.
+model, manufacture a missing capability, or create a supported effort.
 
 ## Quota and its limitations
 
