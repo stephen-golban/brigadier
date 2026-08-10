@@ -9,9 +9,10 @@ and judgement; a worker session is disposable and starts clean.
    owned by both.
 2. **Write a plan document** (JSON). Every slice needs `id`, `title`, `prompt`,
    `ownedPaths`, and `difficulty` (`routine`, `standard`, or `hard` — there is no
-   default). `requires` is optional. `dependsOn` is parsed but **not usable
-   yet** — a dependent slice would not see its prerequisite's output, so a plan
-   declaring one is refused; split dependent work into separate runs.
+   default). `requires` is optional. `dependsOn` names prerequisite slice ids.
+   brigadier reconciles each non-final dependency wave before creating the next
+   wave's worktrees, so dependent slices start from their prerequisites' committed
+   output. Unknown ids, self-dependencies, and cycles are refused.
 
    ```json
    {
@@ -41,9 +42,11 @@ and judgement; a worker session is disposable and starts clean.
 - Edit a file while a slice that owns it is running.
 - Do the work here because it "looks quick" — a one-file change is a one-slice
   plan.
-- Invent commands. brigadier has exactly two: `init` and `run`. A bare
-  `brigadier run "fix the parser"` is refused; `--plan <file>` (or `--plan -`) is
-  required.
+- Invent commands. brigadier has exactly four: `init`, `run`, `install`, and
+  `mcp`. `brigadier run "<task description>"` asks a model to decompose the task
+  and sends the result through the same validator used for `--plan`. On genuine
+  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no
+  worktree is created and no slice worker is spawned.
 
 `brigadier init` must have been run once on this machine; it writes
 `$BRIGADIER_HOME/config.json`, defaulting to `~/.brigadier/config.json`.

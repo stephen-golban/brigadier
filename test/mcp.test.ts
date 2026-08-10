@@ -270,7 +270,7 @@ describe("the MCP server over stdio", () => {
     }
   }, 40_000);
 
-  test("tools/list advertises exactly three tools, on one line of 4614 bytes", async () => {
+  test("tools/list advertises the exact meaning of all three tool schemas", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
     const entry = join(home, "entry.ts");
     await writeFile(entry, FAKE_ENTRY, "utf8");
@@ -284,14 +284,9 @@ describe("the MCP server over stdio", () => {
       expect(lines.length).toBe(1);
       const line = lines[0] ?? "";
 
-      // The whole frame, pinned by length: any change to a description or a
-      // schema moves this number and has to be looked at on purpose.
-      expect(line.length).toBe(4614);
-      expect(
-        line.startsWith('{"jsonrpc":"2.0","id":3,"result":{"tools":['),
-      ).toBe(true);
-
       const parsed = JSON.parse(line) as {
+        jsonrpc: string;
+        id: number;
         result: {
           tools: readonly {
             name: string;
@@ -300,6 +295,8 @@ describe("the MCP server over stdio", () => {
           }[];
         };
       };
+      expect(parsed.jsonrpc).toBe("2.0");
+      expect(parsed.id).toBe(3);
       const tools = parsed.result.tools;
       expect(tools.map((tool) => tool.name)).toEqual([
         "brigadier_validate_plan",
@@ -316,25 +313,198 @@ describe("the MCP server over stdio", () => {
         "Run a brigadier plan on a local repository: route every slice, spawn a worker for each, commit what it produced, and merge the lot.",
       );
 
-      // THERE IS NO PLANNING TOOL, and that is the point rather than an
-      // omission: `brigadier run "<task>"` is refused by the CLI because the
-      // planner does not exist, and a tool that invented one would be the most
-      // misleading thing this surface could advertise.
+      // This MCP contract accepts plan documents. Task-to-plan is available on
+      // the CLI, but is not a fourth MCP tool.
       expect(tools.some((tool) => tool.name.includes("plan_task"))).toBe(false);
 
-      const runSchema = tools[2]?.inputSchema as {
-        required: readonly string[];
-        properties: Record<string, unknown>;
-      };
-      expect(runSchema.required).toEqual(["plan", "repositoryPath"]);
-      expect(Object.keys(runSchema.properties)).toEqual([
-        "plan",
-        "repositoryPath",
-        "slug",
-        "maxWorkers",
-        "dryRun",
-        "unsafeInPlace",
-      ]);
+      expect(tools[0]?.inputSchema).toEqual({
+        type: "object",
+        properties: {
+          plan: {
+            type: "object",
+            description:
+              "A brigadier plan document. Every slice requires id, title, prompt, ownedPaths, and difficulty (routine | standard | hard, with no default). requires is optional. dependsOn is optional and names prerequisite slice ids. Dependency waves are reconciled before later worktrees are created, so a dependent slice sees its prerequisites' committed output. Unknown ids, self-dependencies, and cycles are refused.",
+            properties: {
+              id: { type: "string" },
+              goal: { type: "string" },
+              slices: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    title: { type: "string" },
+                    prompt: { type: "string" },
+                    ownedPaths: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    dependsOn: {
+                      type: "array",
+                      items: { type: "string" },
+                      description:
+                        "Prerequisite slice ids. Each prerequisite wave is reconciled before this slice's worktree is created.",
+                    },
+                    difficulty: {
+                      enum: ["routine", "standard", "hard"],
+                    },
+                    requires: {
+                      type: "object",
+                      properties: {
+                        imageInput: { type: "boolean" },
+                        webSearch: { type: "boolean" },
+                        structuredOutput: { type: "boolean" },
+                        minContextWindowTokens: { type: "integer" },
+                      },
+                    },
+                  },
+                  required: [
+                    "id",
+                    "title",
+                    "prompt",
+                    "ownedPaths",
+                    "difficulty",
+                  ],
+                },
+              },
+            },
+            required: ["id", "goal", "slices"],
+          },
+        },
+        required: ["plan"],
+      });
+      expect(tools[1]?.inputSchema).toEqual({
+        type: "object",
+        properties: {
+          plan: {
+            type: "object",
+            description:
+              "A brigadier plan document. Every slice requires id, title, prompt, ownedPaths, and difficulty (routine | standard | hard, with no default). requires is optional. dependsOn is optional and names prerequisite slice ids. Dependency waves are reconciled before later worktrees are created, so a dependent slice sees its prerequisites' committed output. Unknown ids, self-dependencies, and cycles are refused.",
+            properties: {
+              id: { type: "string" },
+              goal: { type: "string" },
+              slices: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    title: { type: "string" },
+                    prompt: { type: "string" },
+                    ownedPaths: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    dependsOn: {
+                      type: "array",
+                      items: { type: "string" },
+                      description:
+                        "Prerequisite slice ids. Each prerequisite wave is reconciled before this slice's worktree is created.",
+                    },
+                    difficulty: {
+                      enum: ["routine", "standard", "hard"],
+                    },
+                    requires: {
+                      type: "object",
+                      properties: {
+                        imageInput: { type: "boolean" },
+                        webSearch: { type: "boolean" },
+                        structuredOutput: { type: "boolean" },
+                        minContextWindowTokens: { type: "integer" },
+                      },
+                    },
+                  },
+                  required: [
+                    "id",
+                    "title",
+                    "prompt",
+                    "ownedPaths",
+                    "difficulty",
+                  ],
+                },
+              },
+            },
+            required: ["id", "goal", "slices"],
+          },
+        },
+        required: ["plan"],
+      });
+      expect(tools[2]?.inputSchema).toEqual({
+        type: "object",
+        properties: {
+          plan: {
+            type: "object",
+            description:
+              "A brigadier plan document. Every slice requires id, title, prompt, ownedPaths, and difficulty (routine | standard | hard, with no default). requires is optional. dependsOn is optional and names prerequisite slice ids. Dependency waves are reconciled before later worktrees are created, so a dependent slice sees its prerequisites' committed output. Unknown ids, self-dependencies, and cycles are refused.",
+            properties: {
+              id: { type: "string" },
+              goal: { type: "string" },
+              slices: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    title: { type: "string" },
+                    prompt: { type: "string" },
+                    ownedPaths: {
+                      type: "array",
+                      items: { type: "string" },
+                    },
+                    dependsOn: {
+                      type: "array",
+                      items: { type: "string" },
+                      description:
+                        "Prerequisite slice ids. Each prerequisite wave is reconciled before this slice's worktree is created.",
+                    },
+                    difficulty: {
+                      enum: ["routine", "standard", "hard"],
+                    },
+                    requires: {
+                      type: "object",
+                      properties: {
+                        imageInput: { type: "boolean" },
+                        webSearch: { type: "boolean" },
+                        structuredOutput: { type: "boolean" },
+                        minContextWindowTokens: { type: "integer" },
+                      },
+                    },
+                  },
+                  required: [
+                    "id",
+                    "title",
+                    "prompt",
+                    "ownedPaths",
+                    "difficulty",
+                  ],
+                },
+              },
+            },
+            required: ["id", "goal", "slices"],
+          },
+          repositoryPath: {
+            type: "string",
+            description: "Absolute path to the git repository to run in.",
+          },
+          slug: {
+            type: "string",
+            description:
+              "Names every ref this run creates. Defaults to the plan id, made branch-safe.",
+          },
+          maxWorkers: { type: "integer", minimum: 1 },
+          dryRun: {
+            type: "boolean",
+            description:
+              "Route every slice and report it; create no worktree, spawn no worker, write no commit.",
+          },
+          unsafeInPlace: {
+            type: "boolean",
+            description:
+              "Run workers in the checkout itself instead of isolated worktrees. Every file there becomes visible to every worker.",
+          },
+        },
+        required: ["plan", "repositoryPath"],
+      });
     } finally {
       await rm(home, { recursive: true, force: true });
     }

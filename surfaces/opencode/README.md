@@ -1,6 +1,6 @@
 # The opencode surface
 
-**Status: works, with no click and no trust prompt.**
+**Status: plugin installs; handoff event names are unverified.**
 
 opencode reads `~/.claude/skills/` natively — the same directory Claude Code
 reads — and also reads `~/.agents/skills/`. So the doctrine is already installed

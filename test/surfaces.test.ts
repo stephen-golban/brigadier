@@ -44,8 +44,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "5541fbdb5808cae13538dde3cad505968bcf12b5945aaf45c1b65ec9ff3b155d",
-    bytes: 3285,
+    sha256: "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
+    bytes: 3648,
   },
   "claude-code/hooks/README.md": {
     sha256: "db99e47da941e8e4a6f33e7f85222b83703be4929cb199c1ac3417184e923b25",
@@ -68,8 +68,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1597,
   },
   "codex/AGENTS.md": {
-    sha256: "84567769b20a31e26c3c0731b47518aa088b6c4948ffc83b1e0e276ecf52dc0f",
-    bytes: 2580,
+    sha256: "feeb444d4a86eb128c6826caa228b996b59913e2459e3cc90a38fa5fc9ddbe85",
+    bytes: 2869,
   },
   "codex/hooks/README.md": {
     sha256: "64cdc2af24479711b36664d89e6646e8a2b95e0d192672164ebf95d84d33a88d",
@@ -80,12 +80,12 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 4570,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "5541fbdb5808cae13538dde3cad505968bcf12b5945aaf45c1b65ec9ff3b155d",
-    bytes: 3285,
+    sha256: "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
+    bytes: 3648,
   },
   "opencode/README.md": {
-    sha256: "9172d9a7fcbac09935aef759bb215bb3ab110bf774d7388d66098e3d1e5437a4",
-    bytes: 1720,
+    sha256: "b86a7ca88693a91bf255cc392d2399a29422313636f3197bf7b11a3d6a42e9ae",
+    bytes: 1731,
   },
   "opencode/plugin/brigadier.js": {
     sha256: "782555e1df289d86ed570988c1f7e63e7210f85ad4c1c10a02c057b1508d68e6",
@@ -110,6 +110,20 @@ function walkSurfaces(directory: string, prefix: string): string[] {
 
 function hashOf(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** One prose paragraph, including wrapped lines, selected by an exact fragment. */
+function paragraphContaining(text: string, fragment: string): string {
+  return (
+    text.split("\n\n").find((paragraph) => paragraph.includes(fragment)) ?? ""
+  );
+}
+
+/** Exact text from one named line up to, but not including, another. */
+function textBetween(text: string, start: string, end: string): string {
+  const startIndex = text.indexOf(start);
+  const endIndex = text.indexOf(end, startIndex + start.length);
+  return startIndex < 0 || endIndex < 0 ? "" : text.slice(startIndex, endIndex);
 }
 
 /**
@@ -256,6 +270,85 @@ describe("the surface templates", () => {
     );
   });
 
+  test("every installed doctrine states the current dependency and command contracts", () => {
+    const claude = SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "";
+    const codexSkill =
+      SURFACE_TEMPLATES["codex/skills/brigadier/SKILL.md"] ?? "";
+    const codexAgents = SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "";
+
+    for (const doctrine of [claude, codexSkill]) {
+      expect(
+        textBetween(
+          doctrine,
+          "   `id`, `title`, `prompt`, `ownedPaths`",
+          "\n3. **Dry-run",
+        ),
+      ).toBe(
+        "   `id`, `title`, `prompt`, `ownedPaths` and `difficulty` are required on every\n   slice. `difficulty` is one of `routine`, `standard`, `hard`, and it has no\n   default: a plan that does not say how hard a slice is has not been planned.\n   `dependsOn` is optional and names prerequisite slice ids. brigadier runs\n   dependency waves in order and reconciles each non-final wave before creating\n   the next wave's worktrees, so dependent slices start from their prerequisites'\n   committed output. Unknown ids, self-dependencies, and cycles are refused.\n   `requires` is optional and takes `imageInput`, `webSearch`,\n   `structuredOutput`, and `minContextWindowTokens`.",
+      );
+      expect(
+        textBetween(doctrine, "- Do not invent commands.", "\n\n## Before"),
+      ).toBe(
+        '- Do not invent commands. brigadier has exactly four: `init`, `run`,\n  `install`, and `mcp`. `brigadier run "<task description>"` asks a model to\n  decompose the task, then sends the result through the same validator used for\n  `--plan`. On genuine ambiguity it exits 4 with `status: "needs_human"` and\n  structured questions; no worktree is created and no slice worker is spawned.',
+      );
+      expect(paragraphContaining(doctrine, "`4` needs human input")).toBe(
+        "`0` succeeded · `1` never started (no config, bad plan file, missing HOME/PATH/USER)\n· `2` usage error · `3` the run started and did not succeed · `4` needs human input\n(the task was too ambiguous to plan; questions were printed and no run started) ·\n`130`/`143` interrupted.\n",
+      );
+    }
+
+    expect(
+      textBetween(
+        codexAgents,
+        "2. **Write a plan document**",
+        "\n\n   ```json",
+      ),
+    ).toBe(
+      "2. **Write a plan document** (JSON). Every slice needs `id`, `title`, `prompt`,\n   `ownedPaths`, and `difficulty` (`routine`, `standard`, or `hard` — there is no\n   default). `requires` is optional. `dependsOn` names prerequisite slice ids.\n   brigadier reconciles each non-final dependency wave before creating the next\n   wave's worktrees, so dependent slices start from their prerequisites' committed\n   output. Unknown ids, self-dependencies, and cycles are refused.",
+    );
+    expect(
+      textBetween(codexAgents, "- Invent commands.", "\n\n`brigadier init`"),
+    ).toBe(
+      '- Invent commands. brigadier has exactly four: `init`, `run`, `install`, and\n  `mcp`. `brigadier run "<task description>"` asks a model to decompose the task\n  and sends the result through the same validator used for `--plan`. On genuine\n  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no\n  worktree is created and no slice worker is spawned.',
+    );
+  });
+
+  test("the published methodology states the consented unranked-model policy", () => {
+    const methodology = readFileSync(
+      join(repositoryRoot, "docs/METHODOLOGY.md"),
+      "utf8",
+    );
+    expect(paragraphContaining(methodology, "not proven to clear it")).toBe(
+      "An unranked model is not proven weaker than a difficulty floor, but it is\nnot proven to clear it either. It is therefore excluded from ordinary eligibility\nand enters the same consented salvage pool as a ranked model below the floor\n([`src/routing/router.ts:733`](../src/routing/router.ts#L733) and\n[`src/routing/router.ts:747`](../src/routing/router.ts#L747)). Without\n`allowDegradedRouting`, an unranked model cannot take the slice.",
+    );
+    expect(paragraphContaining(methodology, "contains both kinds")).toBe(
+      "With consent, the salvage pool contains both kinds of model that brigadier\ncould not prove meet the requested floor:",
+    );
+    expect(
+      paragraphContaining(methodology, "does not claim an unranked model"),
+    ).toBe(
+      "Every successful salvage route records `waivedDifficultyFloor: true`. For a\nranked winner this records a known below-floor score. For an unranked winner it\ndoes not claim an unranked model has a sub-floor score; it records that brigadier\ndid not establish the requested floor. Ranked candidates precede all unranked\ncandidates, ranked candidates are ordered by descending score, and ties or\nunranked-only choices preserve configuration order\n([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and\n[`src/routing/router.ts:657`](../src/routing/router.ts#L657)).",
+    );
+  });
+
+  test("the surface index distinguishes its review-only README from installed bytes", () => {
+    const index = readFileSync(join(surfacesRoot, "README.md"), "utf8");
+    expect(paragraphContaining(index, "review-only")).toBe(
+      "This README is review-only and is never installed. Every other file under\nthis directory is an installable template. `brigadier install <host>` copies\nthose files into the host's configuration directory.\n`src/surfaces/templates.ts` carries a byte-for-byte copy of each installable file\nso the compiled single-file binary can write them without this directory being\npresent on the user's machine, and `test/surfaces.test.ts` fails the build if the\ntwo ever diverge — in either direction, for any installable file.",
+    );
+  });
+
+  test("opencode handoff status does not outrun its verification", () => {
+    const index = readFileSync(join(surfacesRoot, "README.md"), "utf8");
+    expect(textBetween(index, "- **opencode", "\n- **Codex")).toBe(
+      "- **opencode — event binding unverified.** The plugin subscribes to the\n  session event bus, but its two event names have not been verified against a\n  running opencode build. See `opencode/plugin/brigadier.js`.",
+    );
+
+    const opencode = SURFACE_TEMPLATES["opencode/README.md"] ?? "";
+    expect(paragraphContaining(opencode, "**Status:")).toBe(
+      "**Status: plugin installs; handoff event names are unverified.**",
+    );
+  });
+
   test("no surface file carries a control byte, and the sweep can fail", () => {
     // THE CANARY. A control byte makes `grep` silently return nothing for every
     // pattern in a file, so a sweep that cannot be shown to fail is worthless.
@@ -399,7 +492,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "5541fbdb5808cae13538dde3cad505968bcf12b5945aaf45c1b65ec9ff3b155d",
+        "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -426,7 +519,7 @@ describe("brigadier install", () => {
         `${skill}/hooks/hooks.json`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "5541fbdb5808cae13538dde3cad505968bcf12b5945aaf45c1b65ec9ff3b155d",
+        "04338d25b51bfc7b89625156956ca1f779596681360c73312a3939f3127592d3",
       );
     } finally {
       await rm(home, { recursive: true, force: true });

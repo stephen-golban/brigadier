@@ -8,10 +8,9 @@
  *   `brigadier_route_plan`     one config read. Who would take each slice.
  *   `brigadier_run`            the real thing: worktrees, workers, commits.
  *
- * There is deliberately no `brigadier_plan` tool that turns a task description
- * into a plan. `brigadier run "<task>"` is refused by the CLI for the same
- * reason — the planner does not exist — and an MCP tool that quietly invented
- * one would be the single most misleading thing this file could export.
+ * There is no `brigadier_plan` tool in this protocol surface. The CLI can turn a
+ * task description into a plan, but MCP clients submit plan documents to these
+ * three tools; task-to-plan is not part of this MCP contract.
  *
  * The two impure tools reach the outside world through injected functions, so
  * every assertion in `test/mcp.test.ts` about framing, dispatch, and the two
@@ -69,7 +68,7 @@ const DEFAULT_MAX_WORKERS = 1;
 const PLAN_SCHEMA = {
   type: "object",
   description:
-    "A brigadier plan document. Every slice requires id, title, prompt, ownedPaths, and difficulty (routine | standard | hard, with no default). requires is optional. dependsOn is parsed but not usable yet: a plan declaring one is refused, because a dependent slice would not see its prerequisite's output.",
+    "A brigadier plan document. Every slice requires id, title, prompt, ownedPaths, and difficulty (routine | standard | hard, with no default). requires is optional. dependsOn is optional and names prerequisite slice ids. Dependency waves are reconciled before later worktrees are created, so a dependent slice sees its prerequisites' committed output. Unknown ids, self-dependencies, and cycles are refused.",
   properties: {
     id: { type: "string" },
     goal: { type: "string" },
@@ -86,7 +85,7 @@ const PLAN_SCHEMA = {
             type: "array",
             items: { type: "string" },
             description:
-              "Not usable yet. A plan declaring one is refused by validation.",
+              "Prerequisite slice ids. Each prerequisite wave is reconciled before this slice's worktree is created.",
           },
           difficulty: { enum: ["routine", "standard", "hard"] },
           requires: {
