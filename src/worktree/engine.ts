@@ -41,6 +41,7 @@ import type {
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
 const REDACTION_MARKER = "[REDACTED]";
+const ARTIFACT_LINE_PREFIXES = ["-", "+", " "] as const;
 
 /**
  * The diff invocation, pinned against the reader's own git configuration.
@@ -1821,7 +1822,10 @@ function normalizeRedactionValues(
 ): readonly string[] {
   return Object.freeze(
     [...new Set(values)]
-      .filter((value) => value.length > 0)
+      // A value made only of line breaks is indistinguishable from the
+      // structure of a line-oriented artifact. Treating it as a secret would
+      // replace unrelated separators (and, in a diff, unrelated blank lines).
+      .filter((value) => /[^\r\n]/.test(value))
       .sort((left, right) => right.length - left.length),
   );
 }
@@ -2030,14 +2034,142 @@ function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
 }
 
-function redactText(value: string, redactionValues: readonly string[]): string {
+/**
+ * Replace verbatim secrets, including the exact line-oriented form Git emits.
+ *
+ * A multiline value in a deleted diff line is no longer contiguous: Git puts
+ * `-` after every internal newline (`first\n-second`). Added and context lines
+ * have the same shape with `+` and space. The matcher below still requires the
+ * complete value in order; no component line is ever redacted on its own.
+ *
+ * `onScan` is deliberately injectable so the termination test can count
+ * searches and throw at a fixed operation budget instead of relying on time.
+ */
+export function redactText(
+  value: string,
+  redactionValues: readonly string[],
+  onScan?: () => void,
+): string {
   let redacted = value;
   for (const secret of redactionValues) {
-    if (secret.length > 0) {
-      redacted = redacted.split(secret).join(REDACTION_MARKER);
+    // Empty and line-break-only values cannot be secrets in a line-oriented
+    // artifact without also being its structure. This guard also makes every
+    // search below non-empty, so its cursor must advance after every match.
+    if (!/[^\r\n]/.test(secret)) {
+      continue;
     }
+    redacted = replaceLiteral(redacted, secret, REDACTION_MARKER, onScan);
+    if (!secret.includes("\n")) {
+      continue;
+    }
+    redacted = replaceArtifactSplitLiteral(
+      redacted,
+      secret,
+      REDACTION_MARKER,
+      onScan,
+    );
   }
   return redacted;
+}
+
+function replaceArtifactSplitLiteral(
+  source: string,
+  secret: string,
+  replacement: string,
+  onScan?: () => void,
+): string {
+  const lines = secret.split("\n");
+  const insertedPrefixCount = lines.length - 1 - (lines.at(-1) === "" ? 1 : 0);
+  if (insertedPrefixCount <= 0) {
+    return source;
+  }
+
+  // The first line may be empty, but the anchor never is. A non-empty anchor
+  // is the progress invariant that rules out indexOf("") pinning at `length`.
+  const firstLine = lines[0] ?? "";
+  const anchor = firstLine === "" ? "\n" : firstLine;
+  const chunks: string[] = [];
+  let outputCursor = 0;
+  let searchCursor = 0;
+  while (searchCursor <= source.length) {
+    onScan?.();
+    const candidate = source.indexOf(anchor, searchCursor);
+    if (candidate === -1) {
+      break;
+    }
+    const end = artifactSplitMatchEnd(source, candidate, lines, onScan);
+    if (end === null) {
+      searchCursor = candidate + 1;
+      continue;
+    }
+    chunks.push(source.slice(outputCursor, candidate), replacement);
+    outputCursor = end;
+    searchCursor = end;
+  }
+  if (chunks.length === 0) {
+    return source;
+  }
+  chunks.push(source.slice(outputCursor));
+  return chunks.join("");
+}
+
+function artifactSplitMatchEnd(
+  source: string,
+  start: number,
+  lines: readonly string[],
+  onScan?: () => void,
+): number | null {
+  const firstLine = lines[0] ?? "";
+  let cursor = start + firstLine.length;
+  for (let index = 1; index < lines.length; index += 1) {
+    onScan?.();
+    if (source[cursor] !== "\n") {
+      return null;
+    }
+    cursor += 1;
+    const line = lines[index] ?? "";
+    const isTerminalNewline = index === lines.length - 1 && line === "";
+    if (isTerminalNewline) {
+      return cursor;
+    }
+    if (
+      !(ARTIFACT_LINE_PREFIXES as readonly string[]).includes(
+        source[cursor] ?? "",
+      )
+    ) {
+      return null;
+    }
+    cursor += 1;
+    if (!source.startsWith(line, cursor)) {
+      return null;
+    }
+    cursor += line.length;
+  }
+  return cursor;
+}
+
+function replaceLiteral(
+  source: string,
+  search: string,
+  replacement: string,
+  onScan?: () => void,
+): string {
+  if (search.length === 0) {
+    return source;
+  }
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor <= source.length) {
+    onScan?.();
+    const match = source.indexOf(search, cursor);
+    if (match === -1) {
+      chunks.push(source.slice(cursor));
+      break;
+    }
+    chunks.push(source.slice(cursor, match), replacement);
+    cursor = match + search.length;
+  }
+  return chunks.join("");
 }
 
 function replaceBytes(
