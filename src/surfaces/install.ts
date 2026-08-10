@@ -31,8 +31,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readlink, realpath } from "node:fs/promises";
+import { basename, dirname, relative, sep } from "node:path";
 import type { ConfigEnvironment } from "../config/store.js";
 import { resolveConfigHome } from "../config/store.js";
 import type { OutputStream } from "../init/prompt.js";
@@ -62,28 +63,97 @@ const MANIFEST_FILE_NAME = "surfaces.json";
  * Deliberately NOT `ConfigIo`: that port's `writeFile` opens with `wx` and fails
  * when the target exists, which is exactly right for an atomic config write and
  * exactly wrong here, where replacing a file brigadier itself wrote is the
- * normal upgrade path. The decision about whether a replacement is allowed is
- * made above this port, by the manifest, and never by an open flag.
+ * normal upgrade path. This port instead opens with O_NOFOLLOW and checks the
+ * inspected file's identity on the same descriptor it later mutates.
  */
 export interface SurfaceIo {
   mkdir(path: string): Promise<void>;
   /** Rejects with an ENOENT-coded error when the file does not exist. */
-  readFile(path: string): Promise<string>;
-  writeFile(path: string, contents: string, mode: number): Promise<void>;
+  readFile(path: string): Promise<SurfaceSnapshot>;
+  writeFile(
+    path: string,
+    contents: string,
+    mode: number,
+    expected: SurfaceSnapshot | null,
+  ): Promise<void>;
+  realpath(path: string): Promise<string>;
+  lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
+  readlink(path: string): Promise<string>;
+}
+
+export interface SurfaceSnapshot {
+  readonly contents: string;
+  /** Opaque identity used only to prove the writer opened the inspected file. */
+  readonly identity: string;
 }
 
 export const nodeSurfaceIo: SurfaceIo = {
   async mkdir(path) {
     await mkdir(path, { recursive: true, mode: DIRECTORY_MODE });
   },
-  readFile(path) {
-    return readFile(path, "utf8");
+  async readFile(path) {
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const entry = await handle.stat();
+      return {
+        contents: await handle.readFile("utf8"),
+        identity: fileIdentity(entry.dev, entry.ino),
+      };
+    } finally {
+      await handle.close();
+    }
   },
-  async writeFile(path, contents, mode) {
-    await writeFile(path, contents, { encoding: "utf8", mode });
-    // `writeFile`'s mode applies only when it creates the file, so an existing
-    // hook that lost its executable bit would silently stay unexecutable.
-    await chmod(path, mode);
+  async writeFile(path, contents, mode, expected) {
+    const flags =
+      expected === null
+        ? constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW
+        : constants.O_RDWR | constants.O_NOFOLLOW;
+    const handle = await open(path, flags, mode);
+    try {
+      if (expected !== null) {
+        const entry = await handle.stat();
+        const identity = fileIdentity(entry.dev, entry.ino);
+        const current = await handle.readFile("utf8");
+        if (identity !== expected.identity || current !== expected.contents) {
+          throw new Error(
+            `refusing to replace ${path}: it changed after brigadier inspected it`,
+          );
+        }
+      }
+
+      const bytes = Buffer.from(contents, "utf8");
+      await handle.truncate(0);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const { bytesWritten } = await handle.write(
+          bytes,
+          offset,
+          bytes.byteLength - offset,
+          offset,
+        );
+        if (bytesWritten === 0) {
+          throw new Error(`could not finish writing ${path}`);
+        }
+        offset += bytesWritten;
+      }
+      await handle.truncate(bytes.byteLength);
+      // Descriptor chmod cannot be redirected if the pathname is swapped.
+      await handle.chmod(mode);
+    } finally {
+      await handle.close();
+    }
+  },
+  realpath(path) {
+    return realpath(path);
+  },
+  lstat(path) {
+    return lstat(path);
+  },
+  readlink(path) {
+    return readlink(path);
   },
 };
 
@@ -120,6 +190,8 @@ interface Roots {
 interface Placement {
   /** A key into `SURFACE_TEMPLATES`, which is a repo-relative surfaces path. */
   readonly template: string;
+  /** The directory outside which this placement must never write. */
+  readonly root: (roots: Roots) => string;
   readonly destination: (roots: Roots) => string;
   readonly executable?: true;
 }
@@ -132,11 +204,11 @@ interface HostPlan {
 }
 
 const CLAUDE_SKILL = (roots: Roots): string =>
-  join(roots.claudeConfig, "skills", "brigadier");
+  appendPath(roots.claudeConfig, "skills", "brigadier");
 const AGENTS_SKILL = (roots: Roots): string =>
-  join(roots.agentsSkills, "brigadier");
+  appendPath(roots.agentsSkills, "brigadier");
 const DESKTOP_BUNDLE = (roots: Roots): string =>
-  join(roots.brigadierHome, "surfaces", "claude-desktop");
+  appendPath(roots.brigadierHome, "surfaces", "claude-desktop");
 
 const HOST_PLANS: readonly HostPlan[] = [
   {
@@ -144,32 +216,38 @@ const HOST_PLANS: readonly HostPlan[] = [
     placements: [
       {
         template: "claude-code/SKILL.md",
-        destination: (roots) => join(CLAUDE_SKILL(roots), "SKILL.md"),
+        root: (roots) => roots.claudeConfig,
+        destination: (roots) => appendPath(CLAUDE_SKILL(roots), "SKILL.md"),
       },
       {
         template: "claude-code/.claude-plugin/plugin.json",
+        root: (roots) => roots.claudeConfig,
         destination: (roots) =>
-          join(CLAUDE_SKILL(roots), ".claude-plugin", "plugin.json"),
+          appendPath(CLAUDE_SKILL(roots), ".claude-plugin", "plugin.json"),
       },
       {
         template: "claude-code/hooks/hooks.json",
+        root: (roots) => roots.claudeConfig,
         destination: (roots) =>
-          join(CLAUDE_SKILL(roots), "hooks", "hooks.json"),
+          appendPath(CLAUDE_SKILL(roots), "hooks", "hooks.json"),
       },
       {
         template: "claude-code/hooks/handoff.mjs",
+        root: (roots) => roots.claudeConfig,
         destination: (roots) =>
-          join(CLAUDE_SKILL(roots), "hooks", "handoff.mjs"),
+          appendPath(CLAUDE_SKILL(roots), "hooks", "handoff.mjs"),
         executable: true,
       },
       {
         template: "claude-code/hooks/README.md",
-        destination: (roots) => join(CLAUDE_SKILL(roots), "hooks", "README.md"),
+        root: (roots) => roots.claudeConfig,
+        destination: (roots) =>
+          appendPath(CLAUDE_SKILL(roots), "hooks", "README.md"),
       },
     ],
     notes: (roots) => [
       `The skill auto-loads as the plugin \`brigadier@skills-dir\` in your next Claude Code session, because of the .claude-plugin/plugin.json beside it. No marketplace, and no consent dialog.`,
-      `The handoff hook is registered against PreCompact in ${join(CLAUDE_SKILL(roots), "hooks", "hooks.json")} and needs no approval on this host.`,
+      `The handoff hook is registered against PreCompact in ${appendPath(CLAUDE_SKILL(roots), "hooks", "hooks.json")} and needs no approval on this host.`,
     ],
   },
   {
@@ -177,27 +255,32 @@ const HOST_PLANS: readonly HostPlan[] = [
     placements: [
       {
         template: "codex/skills/brigadier/SKILL.md",
-        destination: (roots) => join(AGENTS_SKILL(roots), "SKILL.md"),
+        root: (roots) => roots.agentsSkills,
+        destination: (roots) => appendPath(AGENTS_SKILL(roots), "SKILL.md"),
       },
       {
         template: "codex/hooks/handoff.mjs",
+        root: (roots) => roots.agentsSkills,
         destination: (roots) =>
-          join(AGENTS_SKILL(roots), "hooks", "handoff.mjs"),
+          appendPath(AGENTS_SKILL(roots), "hooks", "handoff.mjs"),
         executable: true,
       },
       {
         template: "codex/hooks/README.md",
-        destination: (roots) => join(AGENTS_SKILL(roots), "hooks", "README.md"),
+        root: (roots) => roots.agentsSkills,
+        destination: (roots) =>
+          appendPath(AGENTS_SKILL(roots), "hooks", "README.md"),
       },
       {
         template: "codex/AGENTS.md",
-        destination: (roots) => join(roots.codexHome, "AGENTS.md"),
+        root: (roots) => roots.codexHome,
+        destination: (roots) => appendPath(roots.codexHome, "AGENTS.md"),
       },
     ],
     notes: (roots) => [
       `~/.agents/skills is read by both Codex and opencode, so this one skill serves both.`,
-      `THE HANDOFF HOOK IS TRUST-GATED ON CODEX. Running it is a click, and the click is required again after every edit, because Codex hashes the hook definition. brigadier does NOT write a Codex hook registration: the configuration key differs across Codex releases and a guessed one is a silent no-op. Register it yourself against ${join(AGENTS_SKILL(roots), "hooks", "handoff.mjs")} — see the README next to it.`,
-      `${join(roots.codexHome, "AGENTS.md")} is loaded by Codex 0.145.0 into every session including brigadier's own workers, and no flag suppresses it. Keep it doctrine.`,
+      `THE HANDOFF HOOK IS TRUST-GATED ON CODEX. Running it is a click, and the click is required again after every edit, because Codex hashes the hook definition. brigadier does NOT write a Codex hook registration: the configuration key differs across Codex releases and a guessed one is a silent no-op. Register it yourself against ${appendPath(AGENTS_SKILL(roots), "hooks", "handoff.mjs")} — see the README next to it.`,
+      `${appendPath(roots.codexHome, "AGENTS.md")} is loaded by Codex 0.145.0 into every session including brigadier's own workers, and no flag suppresses it. Keep it doctrine.`,
     ],
   },
   {
@@ -205,13 +288,15 @@ const HOST_PLANS: readonly HostPlan[] = [
     placements: [
       {
         template: "opencode/plugin/brigadier.js",
+        root: (roots) => roots.opencodeConfig,
         destination: (roots) =>
-          join(roots.opencodeConfig, "plugin", "brigadier.js"),
+          appendPath(roots.opencodeConfig, "plugin", "brigadier.js"),
       },
       {
         template: "opencode/README.md",
+        root: (roots) => roots.opencodeConfig,
         destination: (roots) =>
-          join(roots.opencodeConfig, "brigadier.README.md"),
+          appendPath(roots.opencodeConfig, "brigadier.README.md"),
       },
     ],
     notes: () => [
@@ -224,11 +309,14 @@ const HOST_PLANS: readonly HostPlan[] = [
     placements: [
       {
         template: "claude-desktop/manifest.json",
-        destination: (roots) => join(DESKTOP_BUNDLE(roots), "manifest.json"),
+        root: (roots) => roots.brigadierHome,
+        destination: (roots) =>
+          appendPath(DESKTOP_BUNDLE(roots), "manifest.json"),
       },
       {
         template: "claude-desktop/README.md",
-        destination: (roots) => join(DESKTOP_BUNDLE(roots), "README.md"),
+        root: (roots) => roots.brigadierHome,
+        destination: (roots) => appendPath(DESKTOP_BUNDLE(roots), "README.md"),
       },
     ],
     notes: (roots) => [
@@ -304,8 +392,30 @@ export async function runInstall(
   }
 
   const fs = io.fs ?? nodeSurfaceIo;
-  const manifestPath = join(roots.brigadierHome, MANIFEST_FILE_NAME);
-  const recorded = await readManifest(fs, manifestPath);
+  const manifestPath = appendPath(roots.brigadierHome, MANIFEST_FILE_NAME);
+  let manifest: ManifestRead;
+  try {
+    const proof = await proveWriteContained(
+      fs,
+      roots.brigadierHome,
+      manifestPath,
+    );
+    if (!proof.ok) {
+      throw new Error(proof.message);
+    }
+    manifest = await readManifest(fs, manifestPath);
+  } catch (error) {
+    const proof = await proveWriteContained(
+      fs,
+      roots.brigadierHome,
+      manifestPath,
+    );
+    io.stderr.write(
+      `brigadier install: could not safely read ${manifestPath}: ${proof.ok ? describe(error) : proof.message}\n`,
+    );
+    return 1;
+  }
+  const recorded = manifest.files;
   const written = new Map(recorded);
 
   let refused = 0;
@@ -346,7 +456,13 @@ export async function runInstall(
 
   if (!parsed.dryRun) {
     try {
-      await writeManifest(fs, manifestPath, written);
+      await writeManifest(
+        fs,
+        roots.brigadierHome,
+        manifestPath,
+        written,
+        manifest.snapshot,
+      );
     } catch (error) {
       io.stderr.write(
         `brigadier install: could not record what was written to ${manifestPath}: ${describe(error)}. The files are in place, but the next install will refuse to replace them.\n`,
@@ -373,6 +489,7 @@ interface ApplyInput {
 
 async function applyPlacement(input: ApplyInput): Promise<FileOutcome> {
   const destination = input.placement.destination(input.roots);
+  const installRoot = input.placement.root(input.roots);
   const contents = SURFACE_TEMPLATES[input.placement.template];
   if (contents === undefined) {
     // Unreachable while `test/surfaces.test.ts` passes: it proves every
@@ -387,7 +504,29 @@ async function applyPlacement(input: ApplyInput): Promise<FileOutcome> {
     input.placement.executable === true ? EXECUTABLE_MODE : FILE_MODE;
   const desiredHash = sha256(contents);
 
-  const existing = await readIfPresent(input.fs, destination);
+  const initialProof = await proveWriteContained(
+    input.fs,
+    installRoot,
+    destination,
+  );
+  if (!initialProof.ok) {
+    return {
+      verdict: "refused",
+      path: destination,
+      detail: initialProof.message,
+    };
+  }
+
+  let snapshot: SurfaceSnapshot | null;
+  try {
+    snapshot = await readIfPresent(input.fs, destination);
+  } catch (error) {
+    const proof = await proveWriteContained(input.fs, installRoot, destination);
+    return proof.ok
+      ? { verdict: "failed", path: destination, detail: describe(error) }
+      : { verdict: "refused", path: destination, detail: proof.message };
+  }
+  const existing = snapshot?.contents ?? null;
   if (existing !== null && existing === contents) {
     input.written.set(destination, desiredHash);
     return { verdict: "unchanged", path: destination, detail: null };
@@ -412,9 +551,27 @@ async function applyPlacement(input: ApplyInput): Promise<FileOutcome> {
   }
   try {
     await input.fs.mkdir(parentOf(destination));
-    await input.fs.writeFile(destination, contents, mode);
+    // This narrows the ancestor-swap window to the call boundary below. Node
+    // exposes no portable openat-style API that could bind every component;
+    // O_NOFOLLOW and the descriptor identity check do bind the final file.
+    const finalProof = await proveWriteContained(
+      input.fs,
+      installRoot,
+      destination,
+    );
+    if (!finalProof.ok) {
+      return {
+        verdict: "refused",
+        path: destination,
+        detail: finalProof.message,
+      };
+    }
+    await input.fs.writeFile(destination, contents, mode, snapshot);
   } catch (error) {
-    return { verdict: "failed", path: destination, detail: describe(error) };
+    const proof = await proveWriteContained(input.fs, installRoot, destination);
+    return proof.ok
+      ? { verdict: "failed", path: destination, detail: describe(error) }
+      : { verdict: "refused", path: destination, detail: proof.message };
   }
   input.written.set(destination, desiredHash);
   return { verdict, path: destination, detail: null };
@@ -436,30 +593,35 @@ function writeOutcome(stdout: OutputStream, outcome: FileOutcome): void {
  * the safe direction: with no record, every pre-existing file is refused rather
  * than replaced.
  */
+interface ManifestRead {
+  readonly files: ReadonlyMap<string, string>;
+  readonly snapshot: SurfaceSnapshot | null;
+}
+
 async function readManifest(
   fs: SurfaceIo,
   path: string,
-): Promise<ReadonlyMap<string, string>> {
-  const contents = await readIfPresent(fs, path);
-  if (contents === null) {
-    return new Map();
+): Promise<ManifestRead> {
+  const snapshot = await readIfPresent(fs, path);
+  if (snapshot === null) {
+    return { files: new Map(), snapshot: null };
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(contents);
+    parsed = JSON.parse(snapshot.contents);
   } catch {
-    return new Map();
+    return { files: new Map(), snapshot };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return new Map();
+    return { files: new Map(), snapshot };
   }
   const record = parsed as Record<string, unknown>;
   if (record.version !== MANIFEST_VERSION) {
-    return new Map();
+    return { files: new Map(), snapshot };
   }
   const files = record.files;
   if (typeof files !== "object" || files === null || Array.isArray(files)) {
-    return new Map();
+    return { files: new Map(), snapshot };
   }
   const entries = new Map<string, string>();
   for (const [key, value] of Object.entries(files as Record<string, unknown>)) {
@@ -467,14 +629,16 @@ async function readManifest(
       entries.set(key, value);
     }
   }
-  return entries;
+  return { files: entries, snapshot };
 }
 
 /** Sorted keys, so two installs of the same set produce identical bytes. */
 async function writeManifest(
   fs: SurfaceIo,
+  root: string,
   path: string,
   written: ReadonlyMap<string, string>,
+  expected: SurfaceSnapshot | null,
 ): Promise<void> {
   const files: Record<string, string> = {};
   for (const key of [...written.keys()].sort()) {
@@ -483,12 +647,29 @@ async function writeManifest(
       files[key] = value;
     }
   }
+  const initialProof = await proveWriteContained(fs, root, path);
+  if (!initialProof.ok) {
+    throw new Error(initialProof.message);
+  }
   await fs.mkdir(parentOf(path));
-  await fs.writeFile(
-    path,
-    `${JSON.stringify({ version: MANIFEST_VERSION, files }, null, 2)}\n`,
-    0o600,
-  );
+  const finalProof = await proveWriteContained(fs, root, path);
+  if (!finalProof.ok) {
+    throw new Error(finalProof.message);
+  }
+  try {
+    await fs.writeFile(
+      path,
+      `${JSON.stringify({ version: MANIFEST_VERSION, files }, null, 2)}\n`,
+      0o600,
+      expected,
+    );
+  } catch (error) {
+    const proof = await proveWriteContained(fs, root, path);
+    if (!proof.ok) {
+      throw new Error(proof.message);
+    }
+    throw error;
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -567,11 +748,20 @@ function isHost(value: string): value is SurfaceHost {
  * home directory is how an installer writes into `/`.
  */
 export function resolveRoots(env: ConfigEnvironment): Roots {
-  const brigadierHome = resolveConfigHome(env);
-  const home = env.HOME?.trim() ?? "";
-  const claudeConfig = trimmed(env.CLAUDE_CONFIG_DIR);
-  const codexHome = trimmed(env.CODEX_HOME);
-  const xdgConfig = trimmed(env.XDG_CONFIG_HOME);
+  // Keep resolveConfigHome as the authority for its validation and error text,
+  // but do not use its lexically-normalized path: realpath must see `..` on
+  // disk when a preceding component is a symbolic link.
+  resolveConfigHome(env);
+  const rawHome = env.HOME?.trim() ?? "";
+  const home = rawHome.length === 0 ? "" : absoluteWithoutCollapsing(rawHome);
+  const explicitBrigadierHome = trimmed(env.BRIGADIER_HOME);
+  const brigadierHome =
+    explicitBrigadierHome === null
+      ? appendPath(home, ".brigadier")
+      : absoluteWithoutCollapsing(explicitBrigadierHome);
+  const claudeConfig = absoluteIfPresent(trimmed(env.CLAUDE_CONFIG_DIR));
+  const codexHome = absoluteIfPresent(trimmed(env.CODEX_HOME));
+  const xdgConfig = absoluteIfPresent(trimmed(env.XDG_CONFIG_HOME));
 
   const needsHome =
     claudeConfig === null || codexHome === null || xdgConfig === null;
@@ -582,13 +772,13 @@ export function resolveRoots(env: ConfigEnvironment): Roots {
   }
 
   return {
-    claudeConfig: claudeConfig ?? join(home, ".claude"),
-    agentsSkills: join(home, ".agents", "skills"),
+    claudeConfig: claudeConfig ?? appendPath(home, ".claude"),
+    agentsSkills: appendPath(home, ".agents", "skills"),
     opencodeConfig:
       xdgConfig === null
-        ? join(home, ".config", "opencode")
-        : join(xdgConfig, "opencode"),
-    codexHome: codexHome ?? join(home, ".codex"),
+        ? appendPath(home, ".config", "opencode")
+        : appendPath(xdgConfig, "opencode"),
+    codexHome: codexHome ?? appendPath(home, ".codex"),
     brigadierHome,
   };
 }
@@ -605,7 +795,7 @@ function trimmed(value: string | undefined): string | null {
 async function readIfPresent(
   fs: SurfaceIo,
   path: string,
-): Promise<string | null> {
+): Promise<SurfaceSnapshot | null> {
   try {
     return await fs.readFile(path);
   } catch (error) {
@@ -623,12 +813,188 @@ export function sha256(contents: string): string {
 /**
  * The parent directory, by string surgery rather than `path.dirname`, for
  * uniformity with the rest of this file's absolute-path handling. Every path it
- * sees was built by `join` from a resolved root, so it always contains a
- * separator.
+ * sees was built by appendPath from an absolute root, so it always contains a
+ * separator and still carries any `..` evidence into the safety check.
  */
 function parentOf(path: string): string {
   const index = path.lastIndexOf("/");
   return index <= 0 ? "/" : path.slice(0, index);
+}
+
+function appendPath(root: string, ...segments: readonly string[]): string {
+  const separator = root.endsWith("/") ? "" : "/";
+  return `${root}${separator}${segments.join("/")}`;
+}
+
+function absoluteIfPresent(path: string | null): string | null {
+  return path === null ? null : absoluteWithoutCollapsing(path);
+}
+
+/** Make a path absolute without erasing a symlink-sensitive `..` segment. */
+function absoluteWithoutCollapsing(path: string): string {
+  return path.startsWith("/") ? path : appendPath(process.cwd(), path);
+}
+
+function fileIdentity(device: number | bigint, inode: number | bigint): string {
+  return `${String(device)}:${String(inode)}`;
+}
+
+type ContainmentProof =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly message: string };
+
+/**
+ * Prove where a write would land using the filesystem, never string cleanup.
+ *
+ * The root and destination are both resolved through their deepest existing
+ * ancestor. A missing suffix is safe to re-append only after `lstat` proves it
+ * is genuinely absent rather than a dangling symlink. Final symlinks are
+ * refused even when they point inward: the descriptor writer deliberately uses
+ * O_NOFOLLOW so the ownership check and mutation concern one regular file.
+ */
+async function proveWriteContained(
+  fs: SurfaceIo,
+  root: string,
+  destination: string,
+): Promise<ContainmentProof> {
+  if (root.split("/").includes("..")) {
+    return {
+      ok: false,
+      message: `refusing to write ${destination}: install root ${root} contains a ".." segment whose symlink-sensitive target cannot be established safely. --force replaces edited files; it does not override this refusal.`,
+    };
+  }
+  const resolvedRoot = await resolveThroughExisting(fs, root);
+  if (!resolvedRoot.ok) {
+    return {
+      ok: false,
+      message: `refusing to write ${destination}: the real install root ${root} could not be established: ${resolvedRoot.message}. --force replaces edited files; it does not override this refusal.`,
+    };
+  }
+
+  let finalEntry: { isSymbolicLink(): boolean } | null;
+  try {
+    finalEntry = await fs.lstat(destination);
+  } catch (error) {
+    if (!isMissingFile(error)) {
+      return {
+        ok: false,
+        message: `refusing to write ${destination}: the destination could not be inspected: ${describe(error)}. --force replaces edited files; it does not override this refusal.`,
+      };
+    }
+    finalEntry = null;
+  }
+  if (finalEntry?.isSymbolicLink() === true) {
+    let linkTarget: string;
+    try {
+      linkTarget = await fs.readlink(destination);
+    } catch (error) {
+      return {
+        ok: false,
+        message: `refusing to write ${destination}: it is a symbolic link whose target could not be read: ${describe(error)}. --force replaces edited files; it does not override this refusal.`,
+      };
+    }
+    let realTarget: string | null;
+    try {
+      realTarget = await fs.realpath(destination);
+    } catch {
+      realTarget = null;
+    }
+    return {
+      ok: false,
+      message:
+        realTarget === null
+          ? `refusing to write ${destination}: it is a symbolic link to ${linkTarget}, whose target could not be resolved. --force replaces edited files; it does not override this refusal.`
+          : `refusing to write ${destination}: it is a symbolic link to ${linkTarget} (real path ${realTarget}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.`,
+    };
+  }
+
+  const resolvedDestination = await resolveThroughExisting(fs, destination);
+  if (!resolvedDestination.ok) {
+    return {
+      ok: false,
+      message: `refusing to write ${destination}: its real path could not be established: ${resolvedDestination.message}. --force replaces edited files; it does not override this refusal.`,
+    };
+  }
+  if (escapes(resolvedRoot.path, resolvedDestination.path)) {
+    return {
+      ok: false,
+      message: `refusing to write ${destination}: its real path is ${resolvedDestination.path}, outside install root ${resolvedRoot.path}. --force replaces edited files; it does not permit writes outside the install root.`,
+    };
+  }
+  return { ok: true };
+}
+
+function escapes(root: string, target: string): boolean {
+  const inside = relative(root, target);
+  return (
+    inside === "" ||
+    inside === ".." ||
+    inside.startsWith(`..${sep}`) ||
+    inside.startsWith("/")
+  );
+}
+
+type ResolvedTarget =
+  | { readonly ok: true; readonly path: string }
+  | { readonly ok: false; readonly message: string };
+
+async function resolveThroughExisting(
+  fs: SurfaceIo,
+  target: string,
+): Promise<ResolvedTarget> {
+  const missing: string[] = [];
+  let candidate = target;
+  for (;;) {
+    try {
+      const real = await fs.realpath(candidate);
+      return {
+        ok: true,
+        path:
+          missing.length === 0 ? real : appendPath(real, ...missing.reverse()),
+      };
+    } catch (error) {
+      if (!isMissingFile(error)) {
+        return { ok: false, message: describe(error) };
+      }
+      const unresolvable = await describeUnresolvable(fs, candidate);
+      if (unresolvable !== null) {
+        return { ok: false, message: unresolvable };
+      }
+      const parent = dirname(candidate);
+      if (parent === candidate) {
+        return {
+          ok: false,
+          message: `no existing ancestor of ${target} could be resolved`,
+        };
+      }
+      missing.push(basename(candidate));
+      candidate = parent;
+    }
+  }
+}
+
+async function describeUnresolvable(
+  fs: SurfaceIo,
+  candidate: string,
+): Promise<string | null> {
+  let entry: { isSymbolicLink(): boolean };
+  try {
+    entry = await fs.lstat(candidate);
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return null;
+    }
+    return `path component ${candidate} could not be inspected: ${describe(error)}`;
+  }
+  if (!entry.isSymbolicLink()) {
+    return `path component ${candidate} exists but its real path could not be resolved`;
+  }
+  try {
+    const linkTarget = await fs.readlink(candidate);
+    return `path component ${candidate} is a symbolic link to ${linkTarget}, whose target could not be resolved`;
+  } catch {
+    return `path component ${candidate} is a symbolic link whose target could not be resolved`;
+  }
 }
 
 function isMissingFile(error: unknown): boolean {

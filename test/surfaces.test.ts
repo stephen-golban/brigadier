@@ -19,12 +19,23 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createTools } from "../src/mcp/tools.ts";
 import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
-import { runInstall, sha256 } from "../src/surfaces/install.ts";
+import { nodeSurfaceIo, runInstall, sha256 } from "../src/surfaces/install.ts";
 import { SURFACE_TEMPLATES } from "../src/surfaces/templates.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -175,6 +186,70 @@ async function install(
   };
   const code = await runInstall(argv, io);
   return { stdout, stderr, code };
+}
+
+interface BoundedInstall extends Collected {
+  readonly elapsedMs: number;
+}
+
+async function installWithin(
+  argv: readonly string[],
+  env: Record<string, string | undefined>,
+  fs?: SurfaceIo,
+): Promise<BoundedInstall> {
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      install(argv, env, fs),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("install exceeded 5,000 ms")),
+          5_000,
+        );
+      }),
+    ]);
+    return { ...result, elapsedMs: Date.now() - started };
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function outcomeDetail(stdout: string, path: string): string {
+  const lines = stdout.split("\n");
+  const index = lines.indexOf(`  refused    ${path}`);
+  return index < 0 ? "" : (lines[index + 1]?.trim() ?? "");
+}
+
+async function recordOwnedBytes(
+  home: string,
+  target: string,
+  contents: string,
+): Promise<void> {
+  const manifestPath = join(home, ".brigadier/surfaces.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    version: number;
+    files: Record<string, string>;
+  };
+  manifest.files[target] = sha256(contents);
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function fileDigest(path: string): Promise<{
+  readonly bytes: number;
+  readonly sha256: string;
+}> {
+  const bytes = await readFile(path);
+  return {
+    bytes: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
 }
 
 /** Only the per-file verdict lines, which is what the assertions are about. */
@@ -642,6 +717,281 @@ describe("brigadier install", () => {
     }
   });
 
+  test("a final symlink outside a symlinked install root is refused even with --force", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      const realConfig = `${scratch}/real-claude-config`;
+      const configLink = `${scratch}/claude-config-link`;
+      const outside = `${scratch}/dotfiles/SKILL.md`;
+      const outsideBytes = Buffer.from(
+        "FINAL OUTSIDE BYTES: do not overwrite\n",
+        "utf8",
+      );
+      await mkdir(realConfig, { recursive: true });
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await symlink(realConfig, configLink, "dir");
+      await install(["claude-code"], {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: configLink,
+      });
+
+      const target = `${configLink}/skills/brigadier/SKILL.md`;
+      await writeFile(outside, outsideBytes);
+      await recordOwnedBytes(home, target, outsideBytes.toString("utf8"));
+      await unlink(target);
+      await symlink(outside, target, "file");
+
+      const result = await installWithin(["claude-code"], {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: configLink,
+      });
+      const realOutside = await realpath(outside);
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(await fileDigest(outside)).toEqual({
+        bytes: 38,
+        sha256:
+          "c275d8c915d3ca3938ff5a18e19d85b53cacff23f7392cecc3ddfe62460bdad8",
+      });
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: it is a symbolic link to ${outside} (real path ${realOutside}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.`,
+      );
+      expect(await readFile(outside)).toEqual(outsideBytes);
+
+      const forced = await installWithin(["claude-code", "--force"], {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: configLink,
+      });
+      expect(forced.elapsedMs).toBeLessThan(5_000);
+      expect(await fileDigest(outside)).toEqual({
+        bytes: 38,
+        sha256:
+          "c275d8c915d3ca3938ff5a18e19d85b53cacff23f7392cecc3ddfe62460bdad8",
+      });
+      expect(forced.code).toBe(1);
+      expect(verdictLines(forced.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(forced.stdout, target)).toBe(
+        `refusing to write ${target}: it is a symbolic link to ${outside} (real path ${realOutside}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.`,
+      );
+      expect(await readFile(outside)).toEqual(outsideBytes);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("a symlink-sensitive dot-dot root is refused without writing either interpretation", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      const redirectTarget = `${scratch}/elsewhere/child`;
+      const redirect = `${scratch}/redirect`;
+      await mkdir(redirectTarget, { recursive: true });
+      await mkdir(`${scratch}/elsewhere/claude`, { recursive: true });
+      await symlink(redirectTarget, redirect, "dir");
+
+      // String concatenation is load-bearing: join() would erase `redirect/..`
+      // before the kernel could follow redirect to elsewhere/child.
+      const configuredRoot = `${redirect}/../claude`;
+      const result = await installWithin(["claude-code"], {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: configuredRoot,
+      });
+      const actualTarget = `${scratch}/elsewhere/claude/skills/brigadier/SKILL.md`;
+      const lexicallyCollapsedTarget = `${scratch}/claude/skills/brigadier/SKILL.md`;
+      const states = await Promise.all(
+        [actualTarget, lexicallyCollapsedTarget].map((path) =>
+          readFile(path).then(
+            () => "present",
+            (error: unknown) =>
+              error instanceof Error &&
+              (error as { readonly code?: unknown }).code === "ENOENT"
+                ? "absent"
+                : "unexpected read error",
+          ),
+        ),
+      );
+      const target = `${configuredRoot}/skills/brigadier/SKILL.md`;
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(states).toEqual(["absent", "absent"]);
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: install root ${configuredRoot} contains a ".." segment whose symlink-sensitive target cannot be established safely. --force replaces edited files; it does not override this refusal.`,
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("a mid-path symlink outside the install root is refused", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      await install(["claude-code"], { HOME: home });
+      const installRoot = `${home}/.claude`;
+      const linkedDirectory = `${installRoot}/skills/brigadier`;
+      const outsideDirectory = `${scratch}/dotfiles/brigadier`;
+      const target = `${linkedDirectory}/SKILL.md`;
+      const outside = `${outsideDirectory}/SKILL.md`;
+      const outsideBytes = Buffer.from(
+        "MID-PATH OUTSIDE BYTES: do not overwrite\n",
+        "utf8",
+      );
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await rename(linkedDirectory, outsideDirectory);
+      await writeFile(outside, outsideBytes);
+      await recordOwnedBytes(home, target, outsideBytes.toString("utf8"));
+      await symlink(outsideDirectory, linkedDirectory, "dir");
+
+      const result = await installWithin(["claude-code"], { HOME: home });
+      const realRoot = await realpath(installRoot);
+      const realOutside = await realpath(outside);
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(await fileDigest(outside)).toEqual({
+        bytes: 41,
+        sha256:
+          "2c50cdeed64da8436cff8e3860c794a727cbebcbd64ceb64aa22801069554f03",
+      });
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: its real path is ${realOutside}, outside install root ${realRoot}. --force replaces edited files; it does not permit writes outside the install root.`,
+      );
+      expect(await readFile(outside)).toEqual(outsideBytes);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("a dangling final symlink is refused instead of creating its outside target", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      await install(["claude-code"], { HOME: home });
+      const target = `${home}/.claude/skills/brigadier/SKILL.md`;
+      const outside = `${scratch}/dotfiles/new-SKILL.md`;
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await unlink(target);
+      await symlink(outside, target, "file");
+
+      const result = await installWithin(["claude-code"], { HOME: home });
+      const outsideState = await readFile(outside).then(
+        (bytes) => ({
+          exists: true,
+          bytes: bytes.byteLength,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        }),
+        (error: unknown) => ({
+          exists: false,
+          bytes: 0,
+          sha256:
+            error instanceof Error &&
+            (error as { readonly code?: unknown }).code === "ENOENT"
+              ? null
+              : "unexpected read error",
+        }),
+      );
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(outsideState).toEqual({ exists: false, bytes: 0, sha256: null });
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: it is a symbolic link to ${outside}, whose target could not be resolved. --force replaces edited files; it does not override this refusal.`,
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("a final symlink introduced after inspection cannot redirect the write", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      await install(["claude-code"], { HOME: home });
+      const target = `${home}/.claude/skills/brigadier/SKILL.md`;
+      const outside = `${scratch}/dotfiles/raced-SKILL.md`;
+      const outsideBytes = Buffer.from(
+        "RACED OUTSIDE BYTES: do not overwrite\n",
+        "utf8",
+      );
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await writeFile(target, outsideBytes);
+      await writeFile(outside, outsideBytes);
+      await recordOwnedBytes(home, target, outsideBytes.toString("utf8"));
+
+      let swapped = false;
+      const racingIo: SurfaceIo = {
+        ...nodeSurfaceIo,
+        async writeFile(path, contents, mode, expected) {
+          if (path === target && !swapped) {
+            swapped = true;
+            await unlink(target);
+            await symlink(outside, target, "file");
+          }
+          await nodeSurfaceIo.writeFile(path, contents, mode, expected);
+        },
+      };
+      const result = await installWithin(
+        ["claude-code"],
+        { HOME: home },
+        racingIo,
+      );
+      const realOutside = await realpath(outside);
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(await fileDigest(outside)).toEqual({
+        bytes: 38,
+        sha256:
+          "80ba87f60be66226ec1ad1b7a37aec984d2c5e13184edb5c830a37f668a722bf",
+      });
+      expect(swapped).toBe(true);
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)[0]).toBe(`  refused    ${target}`);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: it is a symbolic link to ${outside} (real path ${realOutside}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.`,
+      );
+      expect(await readFile(outside)).toEqual(outsideBytes);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("the computed manifest path cannot redirect its write outside BRIGADIER_HOME", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      await install(["claude-code"], { HOME: home });
+      const manifest = `${home}/.brigadier/surfaces.json`;
+      const outside = `${scratch}/dotfiles/surfaces.json`;
+      const outsideBytes = Buffer.from(
+        "MANIFEST OUTSIDE BYTES: do not overwrite\n",
+        "utf8",
+      );
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await writeFile(outside, outsideBytes);
+      await unlink(manifest);
+      await symlink(outside, manifest, "file");
+
+      const result = await installWithin(["claude-code"], { HOME: home });
+      const realOutside = await realpath(outside);
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(await fileDigest(outside)).toEqual({
+        bytes: 41,
+        sha256:
+          "0bf03d7155451c24397db54321b6f9c4445fd4bca0526a26cd99aa23cd5026ba",
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `brigadier install: could not safely read ${manifest}: refusing to write ${manifest}: it is a symbolic link to ${outside} (real path ${realOutside}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.\n`,
+      );
+      expect(await readFile(outside)).toEqual(outsideBytes);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test("a corrupt manifest fails safe: nothing is replaced", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
@@ -708,6 +1058,7 @@ describe("brigadier install", () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
       const failing: SurfaceIo = {
+        ...nodeSurfaceIo,
         mkdir: () => Promise.resolve(),
         readFile: () => {
           const error = new Error("ENOENT") as Error & { code: string };
