@@ -44,13 +44,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Verify tag matches package version
         shell: bash
-        run: |
-          package_version="$(bun -e 'console.log(require("./package.json").version)')"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "${package_version}" != "${tag_version}" ]]; then
-            echo "tag ${GITHUB_REF_NAME} does not match package version ${package_version}" >&2
-            exit 1
-          fi
+        run: ./scripts/verify-tag-version.sh
       - name: Build native executable
         run: |
           mkdir -p release-bin
