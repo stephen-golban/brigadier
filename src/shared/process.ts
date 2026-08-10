@@ -67,7 +67,9 @@ export function waitForProcessExit(
 /**
  * Terminates the entire detached process group within a fixed deadline.
  * Waiting on group existence, rather than only the direct child, ensures an
- * ignored SIGTERM in a grandchild still reaches the SIGKILL rung.
+ * ignored SIGTERM in a grandchild that remains in the group still reaches the
+ * SIGKILL rung. A descendant that creates its own process group or session has
+ * escaped this group and cannot be reached by `kill(-pid)`.
  */
 export async function shutdownProcessGroup(pid: number): Promise<void> {
   signalProcessGroup(pid, "SIGTERM");

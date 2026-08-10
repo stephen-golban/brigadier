@@ -10,7 +10,11 @@ import type {
   OutputStream,
   RunHarness,
 } from "../src/init/index.ts";
-import { buildRunDependencies, runCli } from "../src/init/index.ts";
+import {
+  buildRunDependencies,
+  createInterruptGate,
+  runCli,
+} from "../src/init/index.ts";
 import type {
   SliceResult,
   SliceRunInput,
@@ -106,6 +110,10 @@ class RecordingEngine implements WorktreeEngine {
   readonly committed: CommitSpec[] = [];
   readonly merges: MergeSpec[] = [];
   readonly removed: CreatedWorktree[] = [];
+  readonly released: WorktreeSession[] = [];
+  /** Set to make `remove` / `release` fail, which is a cleanup failure. */
+  removeError: Error | null = null;
+  releaseError: Error | null = null;
   #worktreeRoot: string;
 
   constructor(worktreeRoot = "/fake-worktrees") {
@@ -148,7 +156,21 @@ class RecordingEngine implements WorktreeEngine {
 
   remove(worktree: CreatedWorktree): Promise<void> {
     this.removed.push(worktree);
-    return Promise.resolve();
+    return this.removeError === null
+      ? Promise.resolve()
+      : Promise.reject(this.removeError);
+  }
+
+  /**
+   * The orchestrator's last cleanup step: retiring the session's refs. Recorded
+   * rather than performed, and able to fail on demand, because the sentence the
+   * report prints about an interrupt is a claim about exactly this call.
+   */
+  release(session: WorktreeSession): Promise<void> {
+    this.released.push(session);
+    return this.releaseError === null
+      ? Promise.resolve()
+      : Promise.reject(this.releaseError);
   }
 }
 
@@ -264,6 +286,16 @@ interface InvokeOptions {
   readonly config?: BrigadierConfig | null;
   readonly runner?: RecordingSliceRunner | null;
   readonly env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * Drives cancellation the way `src/cli.ts` does, minus the signal handler.
+   * No test in this file sends a real signal: doing so would kill the test
+   * runner and prove nothing repeatable.
+   */
+  readonly signal?: AbortSignal;
+  /** The seam `src/cli.ts` uses to arm its interrupt gate. */
+  readonly onCancellable?: () => void;
+  /** Mutates the recording engine before the CLI runs, to fail cleanup. */
+  readonly breakEngine?: (engine: RecordingEngine) => void;
 }
 
 async function invoke(options: InvokeOptions): Promise<Invocation> {
@@ -276,6 +308,7 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
     );
   }
   const engine = new RecordingEngine();
+  options.breakEngine?.(engine);
   const runner =
     options.runner === undefined
       ? new RecordingSliceRunner(succeed)
@@ -304,6 +337,10 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
     ...(options.stdin === undefined
       ? {}
       : { stdin: scriptedInput(options.stdin) }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.onCancellable === undefined
+      ? {}
+      : { onCancellable: options.onCancellable }),
   });
   return { code, stdout: stdout.text(), stderr: stderr.text(), engine, runner };
 }
@@ -1089,3 +1126,408 @@ test("the configured executable reaches the real spawn", async () => {
     expect(result.engine.committed).toEqual([]);
   });
 }, 30_000);
+
+/**
+ * The interrupt exit codes and the report an interrupted run prints.
+ *
+ * EVERY TEST HERE DRIVES AN `AbortController`, NEVER A SIGNAL. `src/cli.ts` is
+ * the only thing that turns SIGINT into an abort, and it is the one piece
+ * deliberately left untestable — a test that sent SIGINT would be sending it to
+ * the test runner.
+ *
+ * NONE OF THEM CAN HANG EITHER: `RecordingSliceRunner` settles on a fixed 1 ms
+ * timer regardless of the signal, so a CLI that ignored cancellation entirely
+ * finishes the run and fails on the exit code within milliseconds.
+ */
+describe("brigadier run: interrupts", () => {
+  test("SIGINT resolves 130 and SIGTERM resolves 143", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const sigint = new AbortController();
+      sigint.abort({ kind: "interrupt", signal: "SIGINT" });
+      const interrupted = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        signal: sigint.signal,
+      });
+      expect(interrupted.code).toBe(130);
+
+      const sigterm = new AbortController();
+      sigterm.abort({ kind: "interrupt", signal: "SIGTERM" });
+      const terminated = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        signal: sigterm.signal,
+      });
+      expect(terminated.code).toBe(143);
+    });
+  });
+
+  test("an abort with an unreadable reason still resolves 130", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      controller.abort();
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        signal: controller.signal,
+      });
+      expect(result.code).toBe(130);
+    });
+  });
+
+  test("an interrupt before prepare writes no ref and runs no slice", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      controller.abort({ kind: "interrupt", signal: "SIGINT" });
+      const runner = new RecordingSliceRunner(succeed);
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        runner,
+        signal: controller.signal,
+      });
+
+      expect(result.code).toBe(130);
+      expect(result.engine.prepared).toHaveLength(0);
+      expect(result.engine.created).toHaveLength(0);
+      expect(result.engine.released).toHaveLength(0);
+      expect(runner.inputs).toHaveLength(0);
+      expect(result.stdout).toContain(
+        "interrupted: workers were cancelled and worktrees removed",
+      );
+      // Both slices are named cancelled, and neither is called failed.
+      expect(result.stdout).toContain("s1  cancelled");
+      expect(result.stdout).toContain("s2  cancelled");
+      expect(result.stdout).not.toContain("failed  ");
+    });
+  });
+
+  test("a run interrupted while a slice is in flight releases the session's refs", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      // Aborts from inside the first slice, so the run is genuinely underway.
+      const runner = new RecordingSliceRunner((input) => {
+        controller.abort({ kind: "interrupt", signal: "SIGINT" });
+        return succeed(input);
+      });
+      const result = await invoke({
+        argv: ["run", "--plan", plan, "--max-workers", "1"],
+        cwd,
+        scratchHome,
+        runner,
+        signal: controller.signal,
+      });
+
+      expect(result.code).toBe(130);
+      // Exactly one slice was started; the second never was.
+      expect(runner.inputs.map((input) => input.slice.id)).toEqual(["s1"]);
+      // The session's refs were retired even though the run did not finish.
+      expect(result.engine.released.map((session) => session.slug)).toEqual([
+        "demo-plan",
+      ]);
+      expect(result.engine.removed).toHaveLength(1);
+    });
+  });
+
+  test("the signal the CLI is given is the signal every slice receives", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      const runner = new RecordingSliceRunner(succeed);
+      await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        runner,
+        signal: controller.signal,
+      });
+      expect(runner.inputs).toHaveLength(2);
+      for (const input of runner.inputs) {
+        expect(input.signal).toBe(controller.signal);
+      }
+    });
+  });
+
+  test("a run nobody interrupted still resolves its ordinary code", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      const clean = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        signal: controller.signal,
+      });
+      expect(clean.code).toBe(0);
+      expect(clean.stdout).not.toContain("interrupted:");
+
+      const failed = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        runner: new RecordingSliceRunner(failWorker),
+        signal: new AbortController().signal,
+      });
+      expect(failed.code).toBe(3);
+    });
+  });
+
+  test("--help documents both interrupt codes", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const result = await invoke({
+        argv: ["run", "--help"],
+        cwd,
+        scratchHome,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "130  the run was interrupted with SIGINT (Ctrl-C)",
+      );
+      expect(result.stdout).toContain(
+        "143  the run was interrupted with SIGTERM",
+      );
+    });
+  });
+});
+
+/**
+ * The interrupt policy, driven directly.
+ *
+ * `src/cli.ts` holds only the two things a test cannot touch — the real
+ * `process` and a real POSIX signal — and asks this gate what to do. So the
+ * decision is asserted here as a value: an exact message and an exact exit
+ * code, with no signal sent anywhere and nothing to wait on.
+ */
+describe("the interrupt gate", () => {
+  test("the first interrupt before a command arms the gate exits 130 and cancels nothing", () => {
+    const gate = createInterruptGate();
+    expect(gate.interrupt("SIGINT")).toEqual({
+      message: "\nbrigadier: SIGINT — exiting\n",
+      exitCode: 130,
+    });
+    // Nothing is in flight, so nothing was told to stop — and, critically, the
+    // user is not asked to press Ctrl-C a second time.
+    expect(gate.signal.aborted).toBe(false);
+  });
+
+  test("the first SIGTERM before arming exits 143", () => {
+    const gate = createInterruptGate();
+    expect(gate.interrupt("SIGTERM")).toEqual({
+      message: "\nbrigadier: SIGTERM — exiting\n",
+      exitCode: 143,
+    });
+    expect(gate.signal.aborted).toBe(false);
+  });
+
+  test("the first interrupt after arming cancels the run instead of exiting", () => {
+    const gate = createInterruptGate();
+    gate.arm();
+    expect(gate.interrupt("SIGINT")).toEqual({
+      message:
+        "\nbrigadier: SIGINT — cancelling workers and cleaning up; interrupt again to exit immediately\n",
+      exitCode: null,
+    });
+    expect(gate.signal.aborted).toBe(true);
+    expect(gate.signal.reason).toEqual({ kind: "interrupt", signal: "SIGINT" });
+  });
+
+  test("the second interrupt after arming is the escape hatch", () => {
+    const gate = createInterruptGate();
+    gate.arm();
+    gate.interrupt("SIGINT");
+    expect(gate.interrupt("SIGTERM")).toEqual({
+      message:
+        "\nbrigadier: SIGTERM again — exiting now without finishing cleanup\n",
+      exitCode: 143,
+    });
+  });
+
+  test("arming is idempotent and the graceful count survives it", () => {
+    const gate = createInterruptGate();
+    gate.arm();
+    gate.interrupt("SIGINT");
+    gate.arm();
+    expect(gate.interrupt("SIGINT").exitCode).toBe(130);
+  });
+});
+
+/**
+ * WHERE the gate is armed, which is what the policy above is worth nothing
+ * without. Arm too early and Ctrl-C during a blocking stdin read needs two
+ * presses; arm too late and a real worker survives the first one.
+ */
+describe("brigadier run: arming the interrupt gate", () => {
+  test("a real run arms the gate exactly once", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const armings: string[] = [];
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+        onCancellable: () => {
+          armings.push("armed");
+        },
+      });
+      expect(result.code).toBe(0);
+      expect(armings).toEqual(["armed"]);
+    });
+  });
+
+  test("a run that dies before the orchestrator never arms the gate", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const armings: string[] = [];
+      const result = await invoke({
+        argv: ["run", "--plan", join(cwd, "absent.json")],
+        cwd,
+        scratchHome,
+        onCancellable: () => {
+          armings.push("armed");
+        },
+      });
+      // Failed to start: nothing exists that an interrupt would have to wind
+      // down, so a Ctrl-C at this point must kill brigadier outright.
+      expect(result.code).toBe(1);
+      expect(armings).toEqual([]);
+    });
+  });
+
+  test("a usage error never arms the gate", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const armings: string[] = [];
+      const result = await invoke({
+        argv: ["run"],
+        cwd,
+        scratchHome,
+        onCancellable: () => {
+          armings.push("armed");
+        },
+      });
+      expect(result.code).toBe(2);
+      expect(armings).toEqual([]);
+    });
+  });
+
+  test("no command but run ever arms the gate", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const armings: string[] = [];
+      for (const argv of [["--version"], ["init", "--help"], ["nonsense"]]) {
+        await invoke({
+          argv,
+          cwd,
+          scratchHome,
+          onCancellable: () => {
+            armings.push(argv.join(" "));
+          },
+        });
+      }
+      expect(armings).toEqual([]);
+    });
+  });
+});
+
+/**
+ * What the report says about cleanup, which must be what actually happened.
+ *
+ * Asserted as an exact array of the rendered lines rather than a substring
+ * check, because the defect being fixed here is a sentence that was PRESENT
+ * when it should have been absent — and a `toContain` on the replacement would
+ * pass just as happily with the false one printed beside it.
+ */
+describe("brigadier run: the cleanup lines of the report", () => {
+  const cleanupLines = (stdout: string): readonly string[] =>
+    stdout
+      .split("\n")
+      .filter(
+        (line) =>
+          line.startsWith("  interrupted:") ||
+          line.startsWith("  cleanup failures:") ||
+          line.startsWith("    cleanup ") ||
+          line.startsWith("    release "),
+      );
+
+  test("an interrupt whose cleanup succeeded says so and says nothing else", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      const runner = new RecordingSliceRunner((input) => {
+        controller.abort({ kind: "interrupt", signal: "SIGINT" });
+        return succeed(input);
+      });
+      const result = await invoke({
+        argv: ["run", "--plan", plan, "--max-workers", "1"],
+        cwd,
+        scratchHome,
+        runner,
+        signal: controller.signal,
+      });
+
+      expect(result.code).toBe(130);
+      expect(cleanupLines(result.stdout)).toEqual([
+        "  interrupted: workers were cancelled and worktrees removed",
+      ]);
+    });
+  });
+
+  test("an interrupt whose cleanup failed refuses to claim the worktrees are gone", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const controller = new AbortController();
+      const runner = new RecordingSliceRunner((input) => {
+        controller.abort({ kind: "interrupt", signal: "SIGINT" });
+        return succeed(input);
+      });
+      const result = await invoke({
+        argv: ["run", "--plan", plan, "--max-workers", "1"],
+        cwd,
+        scratchHome,
+        runner,
+        signal: controller.signal,
+        breakEngine: (engine) => {
+          engine.removeError = new Error("worktree is busy");
+          engine.releaseError = new Error("a worktree is still active");
+        },
+      });
+
+      expect(result.code).toBe(130);
+      expect(cleanupLines(result.stdout)).toEqual([
+        "  interrupted: cleanup did not finish; a worker may still be running and a worktree may still exist — see cleanup failures below",
+        "  cleanup failures:",
+        "    cleanup s1: worktree is busy",
+        "    release demo-plan: a worktree is still active",
+      ]);
+    });
+  });
+
+  test("cleanup that failed on an uninterrupted run is still printed", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const result = await invoke({
+        argv: ["run", "--plan", plan, "--max-workers", "1"],
+        cwd,
+        scratchHome,
+        breakEngine: (engine) => {
+          engine.releaseError = new Error("a worktree is still active");
+        },
+      });
+
+      // The run succeeded; failing to tidy up does not undo that, and it does
+      // not turn an uninterrupted run into an interrupted one either.
+      expect(result.code).toBe(0);
+      expect(cleanupLines(result.stdout)).toEqual([
+        "  cleanup failures:",
+        "    release demo-plan: a worktree is still active",
+      ]);
+    });
+  });
+
+  test("an ordinary run prints no cleanup lines at all", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+      });
+      expect(result.code).toBe(0);
+      expect(cleanupLines(result.stdout)).toEqual([]);
+    });
+  });
+});

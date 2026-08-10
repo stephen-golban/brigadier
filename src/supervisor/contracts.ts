@@ -5,7 +5,8 @@
  * The supervisor is `brigadier run`: it takes a plan somebody already made,
  * routes each slice to a model, gives each slice its own git worktree, spawns a
  * worker CLI in it, commits what the worker produced, merges the commit into an
- * integration branch, and returns exactly one value describing all of it.
+ * integration branch, retires the refs it created, and returns exactly one
+ * value describing all of it.
  *
  * Two properties shape every type below.
  *
@@ -49,6 +50,83 @@ import type {
   WorktreeEngine,
   WorktreeSession,
 } from "../worktree/contracts.js";
+
+/**
+ * The two signals `brigadier run` treats as "stop, and stop cleanly".
+ *
+ * They are named rather than taken as `NodeJS.Signals` because only these two
+ * have a defined meaning here and only these two have a defined exit code.
+ */
+export type InterruptSignal = "SIGINT" | "SIGTERM";
+
+/**
+ * The value the executable shim passes to `AbortController.abort()`.
+ *
+ * An `AbortSignal` on its own says "stop" and nothing else, and this run has to
+ * answer two further questions after it stops: which exit code to resolve, and
+ * what to tell the user their workers were killed for. Carrying the signal name
+ * in the abort reason answers both without a second channel — and without
+ * making every module below the CLI aware that a POSIX signal exists.
+ *
+ * A caller that aborts with no reason, or with anything else, is still handled:
+ * `interruptExitCode` and `interruptMessage` both fall back to the SIGINT
+ * answer, because an abort of unknown provenance is still an abort.
+ */
+export interface RunInterruption {
+  readonly kind: "interrupt";
+  readonly signal: InterruptSignal;
+}
+
+/**
+ * 128 + the signal number, which is what a shell reports for a process killed
+ * by that signal. SIGINT is 2 and SIGTERM is 15.
+ */
+const INTERRUPT_EXIT_CODES: Readonly<Record<InterruptSignal, number>> = {
+  SIGINT: 130,
+  SIGTERM: 143,
+};
+
+/** The `RunInterruption` inside an abort reason, or null for anything else. */
+function asInterruption(reason: unknown): RunInterruption | null {
+  if (typeof reason !== "object" || reason === null) {
+    return null;
+  }
+  if (!("kind" in reason) || reason.kind !== "interrupt") {
+    return null;
+  }
+  if (!("signal" in reason)) {
+    return null;
+  }
+  const { signal } = reason;
+  return signal === "SIGINT" || signal === "SIGTERM"
+    ? { kind: "interrupt", signal }
+    : null;
+}
+
+/**
+ * The process exit code an interrupted run resolves, from its abort reason.
+ *
+ * Defaults to 130 rather than throwing: a run that was aborted for a reason
+ * this function cannot read was still aborted, and resolving 0 there would tell
+ * a CI step the run succeeded.
+ */
+export function interruptExitCode(reason: unknown): number {
+  const interruption = asInterruption(reason);
+  return interruption === null
+    ? INTERRUPT_EXIT_CODES.SIGINT
+    : INTERRUPT_EXIT_CODES[interruption.signal];
+}
+
+/**
+ * The sentence that names the interrupt, used both as the `CancelReason`
+ * message handed to a worker and as the text a report prints.
+ */
+export function interruptMessage(reason: unknown): string {
+  const interruption = asInterruption(reason);
+  return interruption === null
+    ? "brigadier was interrupted"
+    : `brigadier received ${interruption.signal}`;
+}
 
 /**
  * Per-slice planning metadata that `Slice` (frozen) has no room for.
@@ -124,6 +202,24 @@ export interface RunRequest {
    * whatever the isolated-worktree consent policy says.
    */
   readonly unsafeInPlace?: boolean;
+  /**
+   * Stops the run. Optional so every existing caller keeps compiling, and a
+   * caller that passes nothing gets exactly the behaviour it had before.
+   *
+   * WHAT ABORTING THIS SIGNAL GUARANTEES, because "cancellable" is not a claim
+   * worth making vaguely. Every worker still in flight is cancelled through
+   * `SpawnedWorker.cancel`, which terminates its whole detached process group
+   * rather than the direct child alone; no further slice and no further wave is
+   * started; every worktree the run created is still removed; and the refs the
+   * session created are still retired. What it does NOT do is unwind work that
+   * already landed — a slice that committed before the abort keeps its commit
+   * and is still merged, because throwing away a finished slice is a cost the
+   * user did not ask for when they asked the run to stop.
+   *
+   * Abort with a `RunInterruption` so the report and the exit code can name the
+   * signal; any other reason still stops the run.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -314,6 +410,16 @@ export const ATTEMPT_LIMIT = 2 as const;
  * worktree no longer compiles. The second half is still only a rule — a
  * tidy-minded orchestrator that removes a successful worktree before merging it
  * will type-check and fail every merge at runtime.
+ *
+ * CANCELLED IS NOT A THIRD VERDICT; IT IS A QUALIFIER ON THE FAILING ONE, and
+ * the shape says so. A slice stopped by Ctrl-C produced no commit, so it cannot
+ * be the `ok: true` arm — but reporting it as an ordinary failure would tell a
+ * user their code was broken when what actually happened is that they stopped
+ * the run. `cancelled` therefore rides on the `ok: false` arm and is declared
+ * `never` on the other, so "succeeded, and also cancelled" does not compile.
+ * It is optional rather than a required `false` because absent already means
+ * "failed on its own merits", and a boolean every existing construction site
+ * has to spell out adds a field to read without adding a fact to know.
  */
 export type SliceResult =
   | {
@@ -324,10 +430,37 @@ export type SliceResult =
       /** Live and un-removed; the orchestrator merges from it, then removes it. */
       readonly worktree: CreatedWorktree;
       readonly attempts: readonly SliceAttempt[];
+      /**
+       * Present on the successful arm too, and it is not symmetry for its own
+       * sake: a slice that failed at `high`, could not remove that attempt's
+       * worktree, and then succeeded at `xhigh` is `ok: true` and has still
+       * left a directory behind. See the `ok: false` arm for what it carries.
+       */
+      readonly cleanupFailures?: readonly string[];
+      /** A slice that committed was not cancelled. See the note above. */
+      readonly cancelled?: never;
     }
   | {
       readonly sliceId: string;
       readonly ok: false;
+      /**
+       * Present only when an interrupt stopped this slice: its worker was
+       * terminated, or the run was already stopping when its turn came. Absent
+       * means the slice failed on its own merits, and the two must not be
+       * conflated in anything a user reads.
+       */
+      readonly cancelled?: true;
+      /**
+       * Tidying this slice owed the run and could not finish: a worker whose
+       * process group would not die, a failed attempt's worktree that would not
+       * be removed. Absent when everything the runner touched was cleaned up.
+       *
+       * It is on the report rather than only inside a failure message because
+       * the run's summary has to be able to say "a worker may still be running"
+       * without parsing prose. The message still carries the same note, since a
+       * reader of one slice's failure needs it there too.
+       */
+      readonly cleanupFailures?: readonly string[];
       /** Null when routing failed before a worktree was ever created. */
       readonly branch: string | null;
       /**
@@ -359,7 +492,18 @@ export interface SliceMergeRecord {
  * These are deliberately coarse. The detail lives in `RunReport.planIssues` and
  * in each slice's `SliceFailure`; this reason exists so a caller — a CLI exit
  * code, a CI step — can branch on the shape of the failure without walking the
- * report. `SLICE_FAILED` and `MERGE_CONFLICT` are distinguished because they
+ * report.
+ *
+ * AN INTERRUPTED RUN REPORTS `SLICE_FAILED`, AND THAT IS DELIBERATE RATHER THAN
+ * A GAP. What an interrupt leaves behind is exactly the shape that member
+ * describes: slices whose work was not produced. That a human stopped them is
+ * not a coarser thing a caller branches on, it is a finer thing a caller reads,
+ * so it lives where the detail already lives — `RunReport.interrupted` for the
+ * run and `SliceResult.cancelled` for each slice, with the message naming the
+ * cancelled ids separately from the failed ones. A sixth member would state the
+ * same fact in a second place and let the two disagree.
+ *
+ * `SLICE_FAILED` and `MERGE_CONFLICT` are distinguished because they
  * demand opposite responses: the first means work was not produced, the second
  * means work was produced and cannot be combined.
  */
@@ -431,6 +575,36 @@ export interface RunReport {
   readonly ok: boolean;
   readonly slug: string;
   readonly dryRun: boolean;
+  /**
+   * Whether this run's `RunRequest.signal` had been aborted by the time the
+   * report was built.
+   *
+   * Separate from `ok` because the two answer different questions and can
+   * disagree in both directions: an interrupt that arrives after the last merge
+   * has landed leaves a run that both succeeded and was interrupted, and a run
+   * that failed on its own before anyone touched the keyboard is not
+   * interrupted at all. A caller rendering the outcome needs both.
+   */
+  readonly interrupted: boolean;
+  /**
+   * Every piece of tidying this run could not finish, in the order it failed:
+   * a worker whose process group would not die, a worktree that would not be
+   * removed, a session whose refs would not retire. Empty on every ordinary
+   * run, including a failed one.
+   *
+   * IT IS ON THE REPORT BECAUSE A RENDERER CANNOT BE HONEST WITHOUT IT. The
+   * sentence an interrupted run wants to print — "workers were cancelled and
+   * worktrees removed" — is a claim about exactly these calls, and a report
+   * that carried only the log had no way to know the claim was false. A user
+   * whose worker survived the interrupt is still paying for it and has to be
+   * told to go kill it, so this is a field rather than a log line.
+   *
+   * A cleanup failure never changes `ok` and never becomes a
+   * `RunFailureReason`: it is reported beside the run's real outcome, because
+   * the merges that landed are still landed and the slices that failed still
+   * failed for their own reasons.
+   */
+  readonly cleanupFailures: readonly string[];
   readonly integrationBranch: string | null;
   readonly slices: readonly SliceResult[];
   readonly merges: readonly SliceMergeRecord[];
@@ -496,6 +670,16 @@ export interface SliceRunInput {
     | readonly [AttemptSlot, AttemptSlot];
   readonly routing: RoutingInput;
   readonly unsafeInPlace: boolean;
+  /**
+   * The run's abort signal, forwarded unchanged.
+   *
+   * The runner is the only component holding a `SpawnedWorker`, so it is the
+   * only component that can terminate one. Handing it the signal rather than a
+   * callback keeps the responsibility where the handle is: the orchestrator
+   * stops scheduling, the runner stops processes, and neither has to know how
+   * the other does it.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -513,6 +697,15 @@ export interface SliceRunInput {
  * `merge()` is what materializes it. So a run that interleaved merging with
  * running would not merely produce a surprising ref; it would make the last
  * slices in the schedule uncommittable. Run everything, then reconcile.
+ *
+ * CANCELLATION IS ALSO AN OBLIGATION, not merely something an implementation
+ * may honour. An implementation given an aborted `SliceRunInput.signal` must
+ * terminate any worker it spawned through `SpawnedWorker.cancel` — which kills
+ * the whole detached process group rather than the direct child — must remove
+ * the worktree it created, and must resolve with `ok: false` and
+ * `cancelled: true`. It must not start a retry after an abort: the second
+ * attempt would spawn a fresh worker against a run the user has already
+ * stopped, which is the exact failure cancellation exists to prevent.
  */
 export interface SliceRunner {
   run(input: SliceRunInput): Promise<SliceResult>;

@@ -20,6 +20,7 @@
  *   5. run the waves                — bounded concurrency, dependency-ordered
  *   6. reconcile                    — merge in a stable order, after everything
  *   7. remove surviving worktrees   — after reconcile, never before
+ *   8. release the session's refs   — after every worktree is gone
  *
  * Steps 1 through 3 are all "fail before creating anything". Step 6 is after
  * step 5 in its entirety rather than interleaved with it, because
@@ -28,7 +29,20 @@
  * interleaved run would not merely produce a surprising ref, it would make the
  * last slices in the schedule uncommittable. Step 7 is after step 6 for the
  * mirror-image reason: `engine.merge()` opens with a registry lookup of the
- * worktree it is handed and rejects one that was already removed.
+ * worktree it is handed and rejects one that was already removed. Step 8 is
+ * after step 7 because `engine.release()` refuses to retire refs while a
+ * worktree created from the session is still active.
+ *
+ * INTERRUPTION DOES NOT GET ITS OWN PATH THROUGH THIS SEQUENCE, and that is the
+ * design rather than an omission. An aborted `RunRequest.signal` stops the run
+ * from STARTING anything further — no new slice inside a wave, no later wave —
+ * and the slice runner terminates the workers already in flight. Everything
+ * after that is the ordinary sequence: the slices that finished are still
+ * merged, every worktree is still removed, and the refs are still released.
+ * A cleanup that a Ctrl-C could skip would strand exactly the worktrees and
+ * refs that a Ctrl-C is most likely to create, so steps 6 through 8 sit in a
+ * `finally` and run on the interrupted path, the failed path, and the happy
+ * path alike.
  *
  * A run reports rather than throws. Everything a caller could legitimately hand
  * this orchestrator comes back as a `RunReport`; the only exceptions that escape
@@ -59,7 +73,7 @@ import type {
   SliceRunner,
   SupervisorPorts,
 } from "./contracts.js";
-import { ATTEMPT_LIMIT } from "./contracts.js";
+import { ATTEMPT_LIMIT, interruptMessage } from "./contracts.js";
 
 /** The `ok: true` arm of `SliceResult`, where `worktree` and `commit` are live. */
 type SucceededSlice = Extract<SliceResult, { readonly ok: true }>;
@@ -193,6 +207,9 @@ async function executeRun(
         message: `unsafeInPlace=true cannot be combined with maxWorkers=${request.maxWorkers}; isolated worktrees are what make concurrent slices safe`,
       },
       durationMs: 0,
+      interrupted: request.signal?.aborted === true,
+      // Nothing was created, so nothing could fail to be cleaned up.
+      cleanupFailures: [],
     };
   }
 
@@ -200,6 +217,24 @@ async function executeRun(
   const startedAt = ports.now();
   const plan = request.document.plan;
   const dryRun = request.dryRun === true;
+  /**
+   * Read through a function, never captured once into a boolean: the signal can
+   * abort at any await in this file, so a snapshot taken at the top would be
+   * stale by the time the first wave finished.
+   */
+  const interrupted = (): boolean => request.signal?.aborted === true;
+
+  /**
+   * Tidying this run could not finish, in the order it failed.
+   *
+   * Declared above `finish` rather than beside the other run-local
+   * accumulators because `finish` closes over it and is called from the
+   * early-return paths above them. It is READ, not merely written: every
+   * report this function builds carries it, and `renderRunReport` prints it.
+   * A collector nothing reads is how the previous version of this file told
+   * users their worktrees were gone when they were not.
+   */
+  const cleanupFailures: string[] = [];
 
   const finish = (fields: {
     readonly ok: boolean;
@@ -221,6 +256,13 @@ async function executeRun(
     planIssues: fields.planIssues,
     failure: fields.failure,
     durationMs: ports.now() - startedAt,
+    // Sampled here rather than passed in by each caller, so no return path can
+    // forget it and no return path can disagree with another about it.
+    interrupted: interrupted(),
+    // Copied rather than aliased: `finish` runs while the accumulator is still
+    // in scope, and a report that kept growing after it was returned would let
+    // a caller read a different answer than the one it was handed.
+    cleanupFailures: [...cleanupFailures],
   });
 
   /* ---------------------- 1. validate the plan ------------------------- */
@@ -344,6 +386,26 @@ async function executeRun(
 
   /* ------------------- 4. prepare the worktree session ------------------- */
 
+  // `prepare` is the first call that writes a ref. An abort that arrived while
+  // the quota probes above were running must not be answered by creating one:
+  // there is then nothing to release, nothing to remove, and nothing for the
+  // user to clean up by hand.
+  if (interrupted()) {
+    return finish({
+      ok: false,
+      integrationBranch: null,
+      slices: preflightSlices.map((result) =>
+        cancelledResult(result.sliceId, result.attempts),
+      ),
+      merges: [],
+      planIssues: [],
+      failure: {
+        reason: "SLICE_FAILED",
+        message: `run interrupted before any ref was written: ${interruptMessage(request.signal?.reason)}`,
+      },
+    });
+  }
+
   let session: WorktreeSession;
   try {
     session = await ports.engine.prepare({
@@ -378,7 +440,6 @@ async function executeRun(
   const results = new Map<string, SliceResult>();
   const survivors: SucceededSlice[] = [];
   const merges: SliceMergeRecord[] = [];
-  const removalErrors: string[] = [];
   const skipped: string[] = [];
   let sliceFailed = false;
   let mergeFailure: string | null = null;
@@ -386,6 +447,22 @@ async function executeRun(
 
   try {
     for (const wave of validation.waves) {
+      if (interrupted()) {
+        // STOP STARTING WAVES. Unlike the dependency case below, the slices
+        // already in flight are NOT left to finish: the runner is terminating
+        // them, because the user asked for the run to stop rather than for its
+        // remainder to be skipped.
+        //
+        // UNREACHABLE TODAY, AND KEPT ANYWAY. `validatePlan` rejects any slice
+        // declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every plan
+        // that gets this far is a single wave and this condition is false on
+        // the only iteration there is. The guard that actually stops work now
+        // is the per-slice one below, which the pool consults every time a slot
+        // frees. This one is the same rule at the wave level, in place for the
+        // day dependency waves land.
+        skipped.push(...wave);
+        continue;
+      }
       if (sliceFailed) {
         // LATER WAVES DEPEND ON EARLIER ONES BY CONSTRUCTION. Running this wave
         // would spawn workers against prerequisites that were never produced,
@@ -401,6 +478,15 @@ async function executeRun(
         request.maxWorkers,
         async (sliceId): Promise<SliceResult> => {
           const startedSliceAt = ports.now();
+          // STOP STARTING SLICES. The pool hands this task out the moment a
+          // slot frees up, so this is the checkpoint that keeps an abort from
+          // spending the freed slot on a brand new worktree and a brand new
+          // subprocess. It is checked here rather than inside `runBounded` so
+          // the pool stays a general-purpose scheduler with no opinion about
+          // what it is scheduling.
+          if (interrupted()) {
+            return cancelledResult(sliceId, []);
+          }
           try {
             const entry = byId.get(sliceId);
             if (entry === undefined) {
@@ -417,6 +503,9 @@ async function executeRun(
               ),
               routing: routingInput,
               unsafeInPlace: request.unsafeInPlace === true,
+              ...(request.signal === undefined
+                ? {}
+                : { signal: request.signal }),
             };
             return await sliceRunner.run(input);
           } catch (error) {
@@ -436,6 +525,17 @@ async function executeRun(
       );
       for (const result of waveResults) {
         results.set(result.sliceId, result);
+        // The runner owns the only handle that can kill a worker's process
+        // group and the only handle to a failed attempt's worktree, so a
+        // failure to do either is discovered there and reported here. It
+        // reaches the run's summary the same way this orchestrator's own
+        // removals do, because a user reading "workers were cancelled" has no
+        // reason to care which layer failed to cancel one. Read on BOTH arms:
+        // a slice whose first attempt leaked a worktree and whose second
+        // attempt succeeded is `ok: true` and still leaked one.
+        if (result.cleanupFailures !== undefined) {
+          cleanupFailures.push(...result.cleanupFailures);
+        }
         if (result.ok) {
           survivors.push(result);
         } else {
@@ -502,8 +602,11 @@ async function executeRun(
     // In a `finally` so the removals happen even when a slice throws or a merge
     // fails, and each removal in its own `try` so one failure does not abandon
     // the rest. A removal failure leaves a directory behind; it does not
-    // invalidate merges that already landed, so it is logged rather than
-    // promoted to a run failure.
+    // invalidate merges that already landed, so it is recorded on the report
+    // and logged rather than promoted to a run failure. RECORDED ON THE REPORT
+    // IS THE LOAD-BEARING HALF: the log is a stream nobody can query, and the
+    // summary has to be able to say a worktree survived instead of claiming it
+    // was removed.
     const cleanupOrder = [...survivors].sort(
       (a, b) => sliceNumberOf(byId, a.sliceId) - sliceNumberOf(byId, b.sliceId),
     );
@@ -512,14 +615,48 @@ async function executeRun(
         await ports.engine.remove(result.worktree);
       } catch (error) {
         const message = `cleanup ${result.sliceId}: ${errorMessage(error)}`;
-        removalErrors.push(message);
+        cleanupFailures.push(message);
         ports.log(message);
       }
     }
+
+    /* -------------------- 8. release the session's refs ------------------- */
+
+    // AFTER EVERY `remove()`, AND UNCONDITIONALLY. `release` retires the
+    // scratch base branch and every slice branch that survived, and it throws
+    // if a worktree created from this session is still active — which is why it
+    // is the last thing in this block rather than the first. It is a no-op once
+    // an integration branch has been materialized, because `merge()` retired
+    // those refs itself, so calling it on the happy path costs nothing and
+    // calling it on the interrupted path is the only thing that stops a
+    // Ctrl-C from leaving `brigadier/<slug>/base` and a pile of
+    // `brigadier/<slug>/slice-N` refs behind in the user's repository.
+    //
+    // Wrapped for the same reason each `remove()` is: this runs while the run's
+    // real outcome is already decided, and a failure to tidy up must be
+    // reported beside that outcome rather than replace it or take the process
+    // down. `release` throwing while worktrees are somehow still live is
+    // precisely the case that would otherwise escape a `finally` and discard
+    // the whole report.
+    try {
+      await ports.engine.release(session);
+    } catch (error) {
+      const message = `release ${request.slug}: ${errorMessage(error)}`;
+      cleanupFailures.push(message);
+      ports.log(message);
+    }
   }
 
+  // A slice with no result at all was never reached. Which sentence that
+  // deserves depends on why: a run stopped by an interrupt cancelled it, and a
+  // run stopped by a failing predecessor never attempted it. Both are
+  // `ok: false` with no attempts; only `cancelled` tells them apart.
   const slices = plan.slices.map(
-    (slice) => results.get(slice.id) ?? notAttemptedResult(slice.id),
+    (slice) =>
+      results.get(slice.id) ??
+      (interrupted()
+        ? cancelledResult(slice.id, [])
+        : notAttemptedResult(slice.id)),
   );
 
   // SLICE FAILURE OUTRANKS MERGE CONFLICT. `RunFailureReason` is ordered by how
@@ -527,14 +664,22 @@ async function executeRun(
   // problem: work that was never produced has to be dealt with before work that
   // was produced and could not be combined. Both are still fully visible — the
   // failed slices in `slices`, every merge in `merges`.
+  //
+  // CANCELLED SLICES ARE COUNTED SEPARATELY FROM FAILED ONES. They share the
+  // `SLICE_FAILED` reason because they share its shape — work that was not
+  // produced — but they must not share its sentence: telling a user that the
+  // slice they interrupted "did not complete" reads as a verdict on their code.
   const failedIds = slices
-    .filter((result) => !result.ok)
+    .filter((result) => !result.ok && result.cancelled !== true)
+    .map((result) => result.sliceId);
+  const cancelledIds = slices
+    .filter((result) => !result.ok && result.cancelled === true)
     .map((result) => result.sliceId);
   const failure =
-    failedIds.length > 0
+    failedIds.length > 0 || cancelledIds.length > 0
       ? {
           reason: "SLICE_FAILED" as const,
-          message: `${failedIds.length} slice(s) did not complete: ${failedIds.join(", ")}`,
+          message: describeStoppage(failedIds, cancelledIds, request.signal),
         }
       : mergeFailure !== null
         ? { reason: "MERGE_CONFLICT" as const, message: mergeFailure }
@@ -765,6 +910,57 @@ function notAttemptedResult(sliceId: string): SliceResult {
   };
 }
 
+/**
+ * The `SliceResult` for a slice an interrupt stopped before the runner saw it.
+ *
+ * `attempts` is passed in rather than assumed empty because two different
+ * moments produce this: a slice the pool never handed out, which has none, and
+ * a slice the pre-flight had already routed when the abort arrived, which has
+ * the routing attempt and should keep it.
+ */
+function cancelledResult(
+  sliceId: string,
+  attempts: readonly SliceAttempt[],
+): SliceResult {
+  return {
+    sliceId,
+    ok: false,
+    cancelled: true,
+    branch: null,
+    commit: null,
+    worktree: null,
+    attempts,
+  };
+}
+
+/**
+ * The run-failure sentence, with the cancelled slices named apart from the
+ * failed ones.
+ *
+ * The failed-only wording is byte-for-byte what this function's predecessor
+ * produced, because a run with nothing cancelled must read exactly as it always
+ * did — the interrupt vocabulary is an addition to the report, not a rewrite of
+ * it.
+ */
+function describeStoppage(
+  failedIds: readonly string[],
+  cancelledIds: readonly string[],
+  signal: AbortSignal | undefined,
+): string {
+  const parts: string[] = [];
+  if (failedIds.length > 0) {
+    parts.push(
+      `${failedIds.length} slice(s) did not complete: ${failedIds.join(", ")}`,
+    );
+  }
+  if (cancelledIds.length > 0) {
+    parts.push(
+      `${cancelledIds.length} slice(s) cancelled by ${interruptMessage(signal?.reason)}: ${cancelledIds.join(", ")}`,
+    );
+  }
+  return parts.join("; ");
+}
+
 /** The `SliceResult` for a runner that rejected instead of reporting. */
 function runnerThrewResult(
   sliceId: string,
@@ -815,7 +1011,10 @@ function sliceLogLine(result: SliceResult): string {
     return `slice ${result.sliceId}: ok ${result.branch} ${result.commit}`;
   }
   const kind = result.attempts.at(-1)?.failure?.kind ?? "NOT_ATTEMPTED";
-  return `slice ${result.sliceId}: failed ${kind}`;
+  // "failed" is a verdict on the work. A cancelled slice has not earned one.
+  return result.cancelled === true
+    ? `slice ${result.sliceId}: cancelled`
+    : `slice ${result.sliceId}: failed ${kind}`;
 }
 
 function errorMessage(error: unknown): string {

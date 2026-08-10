@@ -66,6 +66,7 @@ interface SessionState {
   readonly sliceHeads: Map<string, string>;
   readonly activeWorktrees: Set<CreatedWorktree>;
   integrationMaterialized: boolean;
+  refsReleased: boolean;
 }
 
 interface WorktreeState {
@@ -236,12 +237,16 @@ export class GitWorktreeEngine implements WorktreeEngine {
       sliceHeads: new Map(),
       activeWorktrees: new Set(),
       integrationMaterialized: false,
+      refsReleased: false,
     });
     return session;
   }
 
   async create(spec: WorktreeSpec): Promise<CreatedWorktree> {
     const sessionState = this.#sessionState(spec.session);
+    if (sessionState.refsReleased) {
+      throw new Error("worktree session refs have already been released");
+    }
     if (!Number.isSafeInteger(spec.slice) || spec.slice <= 0) {
       throw new RangeError("slice must be a positive whole number");
     }
@@ -492,6 +497,60 @@ export class GitWorktreeEngine implements WorktreeEngine {
     }
     this.#worktrees.delete(worktree);
     state.sessionState.activeWorktrees.delete(worktree);
+  }
+
+  async release(session: WorktreeSession): Promise<void> {
+    const state = this.#sessionState(session);
+    if (state.activeWorktrees.size > 0) {
+      throw new Error(
+        `cannot release worktree session ${session.slug}: ${state.activeWorktrees.size} worktree(s) are still active`,
+      );
+    }
+    if (state.integrationMaterialized || state.refsReleased) {
+      return;
+    }
+
+    await this.#refreshRedactionValues(state);
+    const expectedRefs = new Map<string, string>([
+      [`refs/heads/${session.baseBranch}`, session.baseCommit],
+      ...[...state.sliceHeads].map(
+        ([branch, head]) => [`refs/heads/${branch}`, head] as const,
+      ),
+    ]);
+    const survivingRefs: [string, string][] = [];
+    for (const [ref, expectedHead] of expectedRefs) {
+      const result = await this.#git(["show-ref", "--verify", "--quiet", ref], {
+        cwd: session.repositoryPath,
+        redactionValues: state.redactionValues,
+        allowedExitCodes: [0, 1],
+      });
+      if (result.exitCode === 1) {
+        continue;
+      }
+      const actualHead = await this.#revParse(
+        session.repositoryPath,
+        ref,
+        state.redactionValues,
+      );
+      if (actualHead !== expectedHead) {
+        throw new Error(`engine-created ref ${ref} moved unexpectedly`);
+      }
+      survivingRefs.push([ref, expectedHead]);
+    }
+
+    if (survivingRefs.length > 0) {
+      const transaction = ["start"];
+      for (const [ref, expectedHead] of survivingRefs) {
+        transaction.push(`delete ${ref} ${expectedHead}`);
+      }
+      transaction.push("prepare", "commit", "");
+      await this.#git(["update-ref", "--stdin"], {
+        cwd: session.repositoryPath,
+        input: transaction.join("\n"),
+        redactionValues: state.redactionValues,
+      });
+    }
+    state.refsReleased = true;
   }
 
   #sessionState(session: WorktreeSession): SessionState {

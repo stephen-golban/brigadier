@@ -31,6 +31,7 @@ import type { SliceDifficulty } from "../src/routing/contracts.js";
 import { buildCapabilities } from "../src/supervisor/capabilities.js";
 import type {
   PlanDocument,
+  RunInterruption,
   RunReport,
   RunRequest,
   SliceResult,
@@ -176,6 +177,8 @@ interface FakeEngineOptions {
   readonly mergeThrows?: readonly string[];
   /** Slice branches whose removal throws. */
   readonly removeThrows?: readonly string[];
+  /** When set, `release` throws with this message. */
+  readonly releaseThrows?: string;
 }
 
 function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
@@ -223,6 +226,12 @@ function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
         throw new Error(`remove exploded for ${worktree.branch}`);
       }
     },
+    release: async (session: WorktreeSession): Promise<void> => {
+      ops.push(`release ${session.slug}`);
+      if (options.releaseThrows !== undefined) {
+        throw new Error(options.releaseThrows);
+      }
+    },
   };
   return { engine, ops };
 }
@@ -241,6 +250,7 @@ function forbiddenEngine(): FakeEngine {
     merge: refuse("merge"),
     redact: refuse("redact"),
     remove: refuse("remove"),
+    release: refuse("release"),
   };
   return { engine, ops };
 }
@@ -288,6 +298,20 @@ interface FakeRunnerOptions {
   readonly throwing?: readonly string[];
   /** Microtask hops each slice takes, defaulting to 1. */
   readonly hops?: Readonly<Record<string, number>>;
+  /**
+   * Called with each slice id the instant its run begins, before the fake does
+   * any work. It is how a cancellation test aborts from a point that is
+   * provably inside the run rather than before it, without a timer and without
+   * a real worker.
+   */
+  readonly onStart?: (sliceId: string) => void;
+  /**
+   * Cleanup this runner reports it could not finish, keyed by slice id. It is
+   * how a test drives the half of `RunReport.cleanupFailures` that originates
+   * below the orchestrator — a worker whose process group would not die, a
+   * failed attempt's worktree that would not be removed.
+   */
+  readonly cleanupFailures?: Readonly<Record<string, readonly string[]>>;
 }
 
 function worktreeFor(input: SliceRunInput): CreatedWorktree {
@@ -312,11 +336,13 @@ function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
   const runner: SliceRunner = {
     run: async (input: SliceRunInput): Promise<SliceResult> => {
       inputs.push(input);
+      options.onStart?.(input.slice.id);
       live += 1;
       maxLive = Math.max(maxLive, live);
       try {
         await tick(options.hops?.[input.slice.id] ?? 1);
         completions.push(input.slice.id);
+        const leaked = options.cleanupFailures?.[input.slice.id];
         if (options.throwing?.includes(input.slice.id) === true) {
           throw new Error(`runner exploded for ${input.slice.id}`);
         }
@@ -324,6 +350,7 @@ function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
           return {
             sliceId: input.slice.id,
             ok: false,
+            ...(leaked === undefined ? {} : { cleanupFailures: leaked }),
             branch: null,
             commit: null,
             worktree: null,
@@ -346,6 +373,7 @@ function fakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
         return {
           sliceId: input.slice.id,
           ok: true,
+          ...(leaked === undefined ? {} : { cleanupFailures: leaked }),
           branch: worktree.branch,
           commit: `commit-${input.slice.id}`,
           worktree,
@@ -565,6 +593,8 @@ describe("unsafe in-place concurrency", () => {
       ok: false,
       slug: "demo",
       dryRun: false,
+      interrupted: false,
+      cleanupFailures: [],
       integrationBranch: null,
       slices: [],
       merges: [],
@@ -1023,6 +1053,7 @@ describe("wave failure", () => {
       "merge brigadier/demo/slice-5",
       "remove brigadier/demo/slice-3",
       "remove brigadier/demo/slice-5",
+      "release demo",
     ]);
     expect(
       harness.log.filter((line) => line.startsWith("wave stopped:")),
@@ -1058,6 +1089,7 @@ describe("wave failure", () => {
       "prepare /repo/demo demo consent=true linked=0",
       "merge brigadier/demo/slice-3",
       "remove brigadier/demo/slice-3",
+      "release demo",
     ]);
   });
 
@@ -1082,6 +1114,7 @@ describe("wave failure", () => {
       "prepare /repo/demo demo consent=true linked=0",
       "merge brigadier/demo/slice-3",
       "remove brigadier/demo/slice-3",
+      "release demo",
     ]);
   });
 });
@@ -1119,6 +1152,7 @@ describe("reconciliation", () => {
       "remove brigadier/demo/slice-1",
       "remove brigadier/demo/slice-3",
       "remove brigadier/demo/slice-5",
+      "release demo",
     ]);
   });
 
@@ -1190,6 +1224,7 @@ describe("reconciliation", () => {
       "remove brigadier/demo/slice-1",
       "remove brigadier/demo/slice-3",
       "remove brigadier/demo/slice-5",
+      "release demo",
     ]);
   });
 
@@ -1235,6 +1270,7 @@ describe("reconciliation", () => {
       "merge brigadier/demo/slice-3",
       "remove brigadier/demo/slice-1",
       "remove brigadier/demo/slice-3",
+      "release demo",
     ]);
   });
 });
@@ -1273,6 +1309,7 @@ describe("cleanup", () => {
       "remove brigadier/demo/slice-1",
       "remove brigadier/demo/slice-3",
       "remove brigadier/demo/slice-5",
+      "release demo",
     ]);
     expect(harness.log).toContain(
       "cleanup a: remove exploded for brigadier/demo/slice-1",
@@ -1387,6 +1424,8 @@ describe("the report", () => {
       ok: true,
       slug: "demo",
       dryRun: false,
+      interrupted: false,
+      cleanupFailures: [],
       integrationBranch: INTEGRATION_BRANCH,
       slices: [
         {
@@ -1442,5 +1481,361 @@ describe("the report", () => {
       "merge a: merged",
       "merge b: merged",
     ]);
+  });
+});
+
+/* ------------------------------ cancellation ----------------------------- */
+
+/**
+ * NOT ONE OF THESE TESTS SENDS A SIGNAL, and not one of them can hang.
+ *
+ * The abort is raised from inside the fake runner's first slice, which is a
+ * point provably inside the run, reached without a timer. Every other fake
+ * still settles on its own after its fixed hop count, so an orchestrator that
+ * ignored the signal entirely would finish the whole plan and fail these tests
+ * on their counts — in milliseconds, and with a diff that names what it ran.
+ */
+const SIGINT_REASON: RunInterruption = { kind: "interrupt", signal: "SIGINT" };
+
+/** A request carrying a signal, since `runRequest` deliberately has no defaults. */
+function interruptibleRequest(
+  document: PlanDocument,
+  maxWorkers: number,
+  signal: AbortSignal,
+): RunRequest {
+  return { ...runRequest(document, maxWorkers), signal };
+}
+
+describe("cancellation", () => {
+  test("an abort mid-wave starts no further slice and reports the rest cancelled", async () => {
+    const controller = new AbortController();
+    const runner = fakeRunner({
+      onStart: (sliceId) => {
+        if (sliceId === "a") {
+          controller.abort(SIGINT_REASON);
+        }
+      },
+    });
+    const engine = fakeEngine();
+    const harness = await execute(
+      interruptibleRequest(
+        planDocument([slice("a"), slice("b"), slice("c")]),
+        1,
+        controller.signal,
+      ),
+      engine,
+      runner,
+    );
+
+    // Exactly one slice was ever handed to the runner.
+    expect(harness.runner.inputs().map((input) => input.slice.id)).toEqual([
+      "a",
+    ]);
+    expect(harness.report.interrupted).toBe(true);
+
+    // `a` finished before the abort took effect and keeps its commit.
+    expect(harness.report.slices[0]?.ok).toBe(true);
+    // `b` and `c` were never started, and say so without claiming a failure.
+    for (const index of [1, 2]) {
+      const result = harness.report.slices[index];
+      expect(result?.ok).toBe(false);
+      expect(result?.cancelled).toBe(true);
+      expect(result?.attempts).toEqual([]);
+      expect(result?.branch).toBeNull();
+      expect(result?.worktree).toBeNull();
+    }
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message: "2 slice(s) cancelled by brigadier received SIGINT: b, c",
+    });
+  });
+
+  test("an interrupted run still merges what landed, removes every worktree, and releases the refs", async () => {
+    const controller = new AbortController();
+    const runner = fakeRunner({
+      onStart: (sliceId) => {
+        if (sliceId === "a") {
+          controller.abort(SIGINT_REASON);
+        }
+      },
+    });
+    const engine = fakeEngine();
+    await execute(
+      interruptibleRequest(
+        planDocument([slice("a"), slice("b")]),
+        1,
+        controller.signal,
+      ),
+      engine,
+      runner,
+    );
+
+    expect(engine.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "merge brigadier/demo/slice-1",
+      "remove brigadier/demo/slice-1",
+      "release demo",
+    ]);
+  });
+
+  test("the run's signal is what each slice run input carries", async () => {
+    const controller = new AbortController();
+    const runner = fakeRunner();
+    const harness = await execute(
+      interruptibleRequest(planDocument([slice("a")]), 1, controller.signal),
+      fakeEngine(),
+      runner,
+    );
+    expect(harness.runner.inputs()).toHaveLength(1);
+    expect(harness.runner.inputs()[0]?.signal).toBe(controller.signal);
+  });
+
+  test("a run given no signal hands none down and reports interrupted false", async () => {
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      fakeEngine(),
+      fakeRunner(),
+    );
+    expect(harness.runner.inputs()[0]?.signal).toBeUndefined();
+    expect(harness.report.interrupted).toBe(false);
+  });
+
+  /**
+   * There is no "a later wave is not started after an abort" test here, and the
+   * reason is that a later wave cannot currently exist: `validatePlan` refuses
+   * any slice declaring `dependsOn` with `DEPENDENCIES_UNSUPPORTED`, so every
+   * schedulable plan is exactly one wave. The orchestrator's wave-level guard
+   * is unreachable today and is kept for the day dependency waves land; the
+   * guard that actually stops work now is the per-slice one, proven above by
+   * the exact input count.
+   */
+
+  test("cancelled slices are counted apart from slices that failed on their own", async () => {
+    const controller = new AbortController();
+    const runner = fakeRunner({
+      failing: ["a"],
+      onStart: (sliceId) => {
+        if (sliceId === "a") {
+          controller.abort(SIGINT_REASON);
+        }
+      },
+    });
+    const harness = await execute(
+      interruptibleRequest(
+        planDocument([slice("a"), slice("b"), slice("c")]),
+        1,
+        controller.signal,
+      ),
+      fakeEngine(),
+      runner,
+    );
+
+    expect(harness.report.slices[0]?.cancelled).toBeUndefined();
+    expect(harness.report.slices[1]?.cancelled).toBe(true);
+    expect(harness.report.slices[2]?.cancelled).toBe(true);
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message:
+        "1 slice(s) did not complete: a; 2 slice(s) cancelled by brigadier received SIGINT: b, c",
+    });
+  });
+
+  test("an abort landing before prepare writes no ref at all", async () => {
+    const controller = new AbortController();
+    controller.abort(SIGINT_REASON);
+    const engine = forbiddenEngine();
+    const harness = await execute(
+      interruptibleRequest(
+        planDocument([slice("a"), slice("b")]),
+        2,
+        controller.signal,
+      ),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.ops).toEqual([]);
+    expect(harness.runner.inputs()).toEqual([]);
+    expect(harness.report.interrupted).toBe(true);
+    expect(harness.report.integrationBranch).toBeNull();
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message:
+        "run interrupted before any ref was written: brigadier received SIGINT",
+    });
+    // The pre-flight routing already done is kept rather than discarded.
+    for (const index of [0, 1]) {
+      const result = harness.report.slices[index];
+      expect(result?.cancelled).toBe(true);
+      expect(result?.attempts).toHaveLength(1);
+      expect(result?.attempts[0]?.routed?.model).toBe("claude-sonnet-5");
+      expect(result?.attempts[0]?.failure).toBeNull();
+    }
+  });
+});
+
+describe("releasing the session's refs", () => {
+  test("release runs after every remove, even when a remove throws", async () => {
+    const engine = fakeEngine({
+      removeThrows: ["brigadier/demo/slice-1"],
+    });
+    const harness = await execute(
+      runRequest(planDocument([slice("a"), slice("b")]), 2),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "merge brigadier/demo/slice-1",
+      "merge brigadier/demo/slice-3",
+      "remove brigadier/demo/slice-1",
+      "remove brigadier/demo/slice-3",
+      "release demo",
+    ]);
+    expect(harness.report.ok).toBe(true);
+  });
+
+  test("a release that throws is logged and leaves the run's verdict alone", async () => {
+    const engine = fakeEngine({
+      releaseThrows: "refusing to retire refs while a worktree is active",
+    });
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.log).toContain(
+      "release demo: refusing to retire refs while a worktree is active",
+    );
+    // The run itself succeeded, and a failure to tidy up does not undo that.
+    expect(harness.report.ok).toBe(true);
+    expect(harness.report.failure).toBeNull();
+    expect(harness.report.integrationBranch).toBe(INTEGRATION_BRANCH);
+  });
+
+  test("release is not called when prepare never produced a session", async () => {
+    const engine = fakeEngine({ prepareError: "no repository here" });
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      engine,
+      fakeRunner(),
+    );
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+    ]);
+    expect(harness.report.failure?.reason).toBe("PREPARE_FAILED");
+  });
+
+  /**
+   * THE ONLY CASE `release` EXISTS FOR, AND THE ONE EVERY OTHER TEST IN THIS
+   * FILE MISSES. `release` is a no-op once an integration branch has been
+   * materialized, so in every run that merged something it is called and does
+   * nothing — which means those tests would keep passing if the call were
+   * deleted for exactly the runs that need it. A run where nothing merged is
+   * the run that strands `brigadier/demo/base` and every slice ref, and it is
+   * the run that cannot be re-attempted afterwards because `create` refuses a
+   * branch that already exists.
+   */
+  test("the refs are released when nothing merged at all", async () => {
+    const engine = fakeEngine();
+    const harness = await execute(
+      runRequest(planDocument([slice("a"), slice("b")]), 2),
+      engine,
+      fakeRunner({ failing: ["a", "b"] }),
+    );
+
+    // NOT ONE `merge` ENTRY, which is what makes this the counterfactual: with
+    // no integration branch, `release` is the only thing that retires the base
+    // and slice refs. There is no `remove` either, and that is correct rather
+    // than missing — the orchestrator removes SURVIVORS, a run with none has
+    // none, and each failed attempt's worktree was the runner's to remove.
+    expect(harness.ops).toEqual([
+      "prepare /repo/demo demo consent=true linked=0",
+      "release demo",
+    ]);
+    expect(harness.report.ok).toBe(false);
+    expect(harness.report.integrationBranch).toBeNull();
+    expect(harness.report.merges).toEqual([]);
+    expect(harness.report.cleanupFailures).toEqual([]);
+    expect(harness.report.failure).toEqual({
+      reason: "SLICE_FAILED",
+      message: "2 slice(s) did not complete: a, b",
+    });
+  });
+});
+
+/**
+ * Cleanup that failed is on the report, not merely in the log.
+ *
+ * A log line is a stream nobody can query. The renderer has to be able to say
+ * "a worker may still be running" instead of "workers were cancelled", and it
+ * can only do that from a field.
+ */
+describe("cleanup failures", () => {
+  test("a failed remove and a failed release are both carried, in order", async () => {
+    const engine = fakeEngine({
+      removeThrows: ["brigadier/demo/slice-1"],
+      releaseThrows: "refusing to retire refs while a worktree is active",
+    });
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      engine,
+      fakeRunner(),
+    );
+
+    expect(harness.report.cleanupFailures).toEqual([
+      "cleanup a: remove exploded for brigadier/demo/slice-1",
+      "release demo: refusing to retire refs while a worktree is active",
+    ]);
+    // The run's own verdict is untouched by a failure to tidy up.
+    expect(harness.report.ok).toBe(true);
+    expect(harness.report.failure).toBeNull();
+  });
+
+  test("cleanup the runner could not finish is carried beside the orchestrator's own", async () => {
+    const engine = fakeEngine({ releaseThrows: "refs are pinned" });
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      engine,
+      fakeRunner({
+        failing: ["a"],
+        cleanupFailures: {
+          a: [
+            "slice a attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running",
+          ],
+        },
+      }),
+    );
+
+    expect(harness.report.cleanupFailures).toEqual([
+      "slice a attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running",
+      "release demo: refs are pinned",
+    ]);
+  });
+
+  test("a slice that leaked on attempt 1 and then succeeded still reports the leak", async () => {
+    const harness = await execute(
+      runRequest(planDocument([slice("a")]), 1),
+      fakeEngine(),
+      fakeRunner({
+        cleanupFailures: { a: ["slice a attempt 1: worktree survived"] },
+      }),
+    );
+
+    expect(harness.report.slices[0]?.ok).toBe(true);
+    expect(harness.report.cleanupFailures).toEqual([
+      "slice a attempt 1: worktree survived",
+    ]);
+  });
+
+  test("an ordinary run reports no cleanup failures at all", async () => {
+    const harness = await execute(
+      runRequest(planDocument([slice("a"), slice("b")]), 2),
+      fakeEngine(),
+      fakeRunner(),
+    );
+    expect(harness.report.cleanupFailures).toEqual([]);
   });
 });

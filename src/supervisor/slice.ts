@@ -13,6 +13,36 @@
  * down its siblings or gets swallowed, and both are worse than a recorded
  * failure. The only price is that every stage below has to be total, which is
  * why each one is wrapped rather than allowed to propagate.
+ *
+ * IT IS ALSO THE ONLY PLACE THAT CAN STOP A RUNNING WORKER. Workers are spawned
+ * into detached process groups, and the handle that can kill a whole group —
+ * `SpawnedWorker.cancel` — exists nowhere but here, between `spawn` and the
+ * awaited completion. So `SliceRunInput.signal` is checked at the two points
+ * where this file is about to spend something the user has already said to stop
+ * spending, and raced at the one place a slice spends most of its life:
+ *
+ *   1. at the top of an attempt, before it is routed — nothing has been spent
+ *      yet, so an abort already in hand costs no worktree and no subprocess;
+ *   2. immediately before `spawn`, the last moment before a real process
+ *      exists;
+ *   3. against the running worker, as a race rather than a check.
+ *
+ * THERE IS DELIBERATELY NO CHECK BETWEEN THE WORKTREE AND THE SPAWN. Creating
+ * the worktree and writing its placeholder files both happen after check 1 and
+ * before check 2, unguarded, because they are cheap writes inside a directory
+ * this attempt tears down on every failure path anyway. Check 2 is what makes
+ * that safe: it is re-read precisely because routing, `create`, and the
+ * placeholder writes all await, and the abort may have landed during any of
+ * them. An abort at check 2 or in the race calls `cancel` and then takes the
+ * ordinary failure path, so the worktree is torn down exactly as it would be
+ * for any other failed attempt.
+ *
+ * CLEANUP THAT ITSELF FAILS IS REPORTED, NOT SWALLOWED. Killing a process group
+ * and removing a worktree can both fail, and either leaves something of the
+ * user's still running or still on disk. Each is appended to the attempt's
+ * failure message AND carried structurally on `SliceResult.cleanupFailures`, so
+ * the run's summary can say a worker may have survived instead of asserting it
+ * was cancelled.
  */
 
 import { mkdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
@@ -27,6 +57,7 @@ import {
 } from "node:path";
 import type {
   AnyWorker,
+  CancelReason,
   Slice,
   SpawnedWorker,
   WorkerEvent,
@@ -58,6 +89,7 @@ import type {
   SliceRunner,
   SupervisorPorts,
 } from "./contracts.js";
+import { interruptMessage } from "./contracts.js";
 import { buildWorkerSpec, type SpecBuildInput } from "./spec.js";
 
 /**
@@ -153,6 +185,10 @@ type AttemptOutcome =
        * is "this exact model already failed this exact slice".
        */
       readonly workerRan: boolean;
+      /** Present only when the run's signal aborted this attempt. */
+      readonly cancelled?: true;
+      /** See `SliceResult.cleanupFailures`; absent when nothing leaked. */
+      readonly cleanupFailures?: readonly string[];
     };
 
 /** What happened inside a created worktree. Total: it never throws. */
@@ -168,6 +204,14 @@ type WorktreeOutcome =
       readonly outcome: WorkerOutcome | null;
       /** See `AttemptOutcome.workerRan`. */
       readonly workerRan: boolean;
+      /** See `AttemptOutcome.cancelled`. */
+      readonly cancelled?: true;
+      /**
+       * Set when terminating the worker's process group failed, which is the
+       * one piece of cleanup this stage owns and the one thing that can leave a
+       * worker alive after the run believes it is dead.
+       */
+      readonly cleanupFailure?: string;
     };
 
 export class DefaultSliceRunner implements SliceRunner {
@@ -189,6 +233,11 @@ export class DefaultSliceRunner implements SliceRunner {
     const attempts: SliceAttempt[] = [];
     const excluded: ExcludedModel[] = [];
     let branch: string | null = null;
+    let cancelled = false;
+    // Accumulated across attempts rather than per attempt, because the run's
+    // summary asks "did anything this slice touched survive", and attempt 1's
+    // leaked worktree is still leaked when attempt 2 succeeds.
+    const cleanupFailures: string[] = [];
 
     for (const [index, slot] of input.attemptSlots.entries()) {
       const attempt = await this.#runAttempt(input, slot, index + 1, excluded);
@@ -202,11 +251,30 @@ export class DefaultSliceRunner implements SliceRunner {
           // Live and un-removed on purpose: `engine.merge` rejects a worktree
           // that has already been removed, and merging is the orchestrator's job.
           worktree: attempt.worktree,
+          ...(cleanupFailures.length === 0 ? {} : { cleanupFailures }),
           attempts,
         };
       }
+      if (attempt.cleanupFailures !== undefined) {
+        cleanupFailures.push(...attempt.cleanupFailures);
+      }
       if (attempt.branch !== null) {
         branch = attempt.branch;
+      }
+      if (attempt.cancelled === true) {
+        // TWO THINGS HAPPEN HERE, AND ONLY ONE OF THEM IS REDUNDANT. The break
+        // is belt-and-braces: `isRetryable` below already refuses a second
+        // attempt, because every cancellation this file records carries a
+        // `retryable: false` `WorkerFailure`. Stating it directly means a
+        // cancelled slice is never retried for a reason that reads as
+        // "cancelled" rather than one that depends on a flag three functions
+        // away staying false.
+        //
+        // The flag is not redundant at all: it is the only thing that
+        // distinguishes "the user stopped this" from "this slice failed" in
+        // everything downstream, and nothing else in this loop can set it.
+        cancelled = true;
+        break;
       }
       const routed = attempt.record.routed;
       // Identity-based history: this exact pair already failed this exact
@@ -233,6 +301,8 @@ export class DefaultSliceRunner implements SliceRunner {
     return {
       sliceId,
       ok: false,
+      ...(cancelled ? { cancelled: true as const } : {}),
+      ...(cleanupFailures.length === 0 ? {} : { cleanupFailures }),
       branch,
       commit: null,
       worktree: null,
@@ -249,6 +319,28 @@ export class DefaultSliceRunner implements SliceRunner {
     const startedAt = this.#ports.now();
     const elapsed = (): number => this.#ports.now() - startedAt;
     const sliceId = input.slice.id;
+
+    // Nothing has been spent yet, so an abort already in hand costs this slice
+    // a recorded attempt and no worktree, no subprocess, and no ref.
+    if (input.signal?.aborted === true) {
+      return {
+        ok: false,
+        branch: null,
+        workerRan: false,
+        cancelled: true,
+        record: {
+          attempt,
+          routed: null,
+          outcome: null,
+          commit: null,
+          failure: cancellationFailure(
+            input.signal,
+            `slice ${sliceId} attempt ${attempt} was cancelled before it was routed`,
+          ),
+          durationMs: elapsed(),
+        },
+      };
+    }
 
     const decision = this.#routeAttempt(input, attempt, excluded);
     if (!decision.ok) {
@@ -367,10 +459,24 @@ export class DefaultSliceRunner implements SliceRunner {
       cleanupNote === null
         ? body.failure
         : appendNote(body.failure, cleanupNote);
+    // A worker that would not die and a worktree that would not be removed are
+    // two independent leaks, and an attempt can produce both. Ordered as they
+    // happened: the cancel is attempted before the removal.
+    const cleanupFailures: string[] = [];
+    if (body.cleanupFailure !== undefined) {
+      cleanupFailures.push(body.cleanupFailure);
+    }
+    if (cleanupNote !== null) {
+      cleanupFailures.push(
+        `slice ${sliceId} attempt ${attempt}: ${cleanupNote}`,
+      );
+    }
     return {
       ok: false,
       branch: created.branch,
       workerRan: body.workerRan,
+      ...(body.cancelled === true ? { cancelled: true as const } : {}),
+      ...(cleanupFailures.length === 0 ? {} : { cleanupFailures }),
       record: {
         attempt,
         routed,
@@ -485,6 +591,25 @@ export class DefaultSliceRunner implements SliceRunner {
       );
     }
 
+    // THE LAST MOMENT BEFORE A REAL PROCESS EXISTS. Everything above this line
+    // is recoverable bookkeeping; below it there is a detached process group
+    // burning the user's quota, so the signal is re-read here even though it was
+    // read at the top of the attempt — the routing, the worktree creation and
+    // the placeholder writes above all await, and the abort may have landed
+    // during any of them.
+    if (input.signal?.aborted === true) {
+      return {
+        ok: false,
+        workerRan: false,
+        cancelled: true,
+        outcome: null,
+        failure: cancellationFailure(
+          input.signal,
+          `slice ${sliceId} attempt ${attempt} was cancelled before a ${routed.vendor}/${routed.model} worker was spawned`,
+        ),
+      };
+    }
+
     let spawned: SpawnedWorker;
     try {
       spawned = await spawnWorker(worker, spec);
@@ -504,7 +629,62 @@ export class DefaultSliceRunner implements SliceRunner {
     // `Promise.all` cannot abandon the other one half-run.
     const drain = this.#drainEvents(spawned.events);
     const completion: Promise<WorkerOutcome> = spawned.completion;
-    const [drained, completed] = await Promise.all([drain, settle(completion)]);
+    // Neither half rejects, so the combined promise cannot reject either — which
+    // is what makes it safe to walk away from below when the abort wins the
+    // race. An abandoned promise that could reject would surface later as an
+    // unhandled rejection with nothing left to catch it.
+    const running = Promise.all([drain, settle(completion)]);
+    const raced = await raceAbort(input.signal, running);
+
+    if (raced === ABORTED) {
+      // The one call in this codebase that reaches a detached process group.
+      // Awaited rather than fired and forgotten: the worktree is removed
+      // immediately after this returns, and removing a directory a live worker
+      // is still writing into is how a `git worktree remove` fails and a
+      // half-written tree survives the run.
+      const cancelNote = await cancelQuietly(spawned, input.signal);
+      const placeholderNote = await removeEmptyPlaceholders(placeholders);
+      if (placeholderNote !== null) {
+        this.#ports.log(
+          `slice ${sliceId} attempt ${attempt}: ${placeholderNote}`,
+        );
+      }
+      const terminationDetail =
+        cancelNote === null
+          ? `${routed.vendor}/${routed.model} was terminated`
+          : `the ${routed.vendor}/${routed.model} worker (pid ${spawned.pid ?? "none"}) may still be running — ${cancelNote}`;
+      this.#ports.log(
+        cancelNote === null
+          ? `slice ${sliceId} attempt ${attempt}: cancelled ${routed.vendor}/${routed.model} (pid ${spawned.pid ?? "none"})`
+          : `slice ${sliceId} attempt ${attempt}: ${terminationDetail}`,
+      );
+      return {
+        ok: false,
+        // True because a process was spawned and cancellation was attempted. It
+        // does not put this model on the excluded list, because `run` breaks out
+        // of the attempt loop on `cancelled` before it ever reads this — a model
+        // is excluded for failing a slice, and an interrupted attempt is not a
+        // model failure. Any unconfirmed termination is carried separately as a
+        // cleanup failure.
+        workerRan: true,
+        cancelled: true,
+        outcome: null,
+        // The same fact in two places on purpose: the message is what a reader
+        // of THIS slice's failure sees, and `cleanupFailure` is what the run's
+        // summary needs in order to stop claiming the worker was cancelled.
+        ...(cancelNote === null
+          ? {}
+          : {
+              cleanupFailure: `slice ${sliceId} attempt ${attempt}: the ${routed.vendor}/${routed.model} worker (pid ${spawned.pid ?? "none"}) may still be running — ${cancelNote}`,
+            }),
+        failure: cancellationFailure(
+          input.signal,
+          `slice ${sliceId} attempt ${attempt}: ${terminationDetail}`,
+        ),
+      };
+    }
+
+    const [drained, completed] = raced;
 
     if (drained.error !== null) {
       this.#ports.log(
@@ -638,6 +818,152 @@ export class DefaultSliceRunner implements SliceRunner {
 /** Convenience constructor for callers that only want the interface. */
 export function createSliceRunner(options: SliceRunnerOptions): SliceRunner {
   return new DefaultSliceRunner(options);
+}
+
+/** What `raceAbort` resolves when the signal wins. */
+const ABORTED = Symbol("aborted");
+const CANCELLATION_COMPLETION_BOUND_MS = 100;
+const COMPLETION_TIMEOUT = Symbol("completion timeout");
+
+/**
+ * `work`'s value, or `ABORTED` the moment the signal fires — whichever is first.
+ *
+ * THE LISTENER IS REMOVED IN A `finally`, AND THAT IS NOT TIDINESS. One signal
+ * is shared by every slice in the run, so a listener left behind by each
+ * finished slice accumulates on a single `AbortSignal` for the whole run; Node
+ * warns at eleven and the leak is real regardless.
+ *
+ * `work` is not cancelled when the abort wins — nothing here could cancel it —
+ * so every caller must hand in a promise that cannot reject. An abandoned
+ * promise that rejects has no `await` left to catch it and becomes an unhandled
+ * rejection at some unrelated later moment.
+ */
+async function raceAbort<T>(
+  signal: AbortSignal | undefined,
+  work: Promise<T>,
+): Promise<T | typeof ABORTED> {
+  if (signal === undefined) {
+    return work;
+  }
+  if (signal.aborted) {
+    return ABORTED;
+  }
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<typeof ABORTED>((resolve) => {
+    onAbort = (): void => {
+      resolve(ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, interrupted]);
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+/**
+ * Terminates the worker's whole process group, reporting rather than throwing.
+ *
+ * A rejected `cancel`, a non-cancellation completion, or a completion that does
+ * not settle promptly means the worker may still be running. That is exactly
+ * the thing the user pressed Ctrl-C to stop, so it is said out loud in the
+ * slice's failure message AND carried up as a cleanup failure, rather than
+ * swallowed. It must not throw: this runs on the way to a recorded failure, and
+ * losing the record to a second failure would leave the report with nothing to
+ * show for the interrupt at all.
+ *
+ * Returns null when completion confirms cancellation, and the reason
+ * termination was not confirmed otherwise.
+ */
+async function cancelQuietly(
+  spawned: SpawnedWorker,
+  signal: AbortSignal | undefined,
+): Promise<string | null> {
+  const reason: CancelReason = {
+    kind: "shutdown",
+    message: interruptMessage(signal?.reason),
+  };
+  try {
+    await spawned.cancel(reason);
+  } catch (error) {
+    // Null for success rather than an empty string, so a caller that has to
+    // report the failure structurally can tell the two apart without testing a
+    // string for emptiness.
+    return `terminating its process group failed: ${describeError(error)}`;
+  }
+
+  // WorkerLifecycle settles completion before cancel resolves. Bound this read
+  // anyway: an out-of-contract adapter must not wedge shutdown indefinitely.
+  const completion: Promise<WorkerOutcome> = spawned.completion;
+  const completed = await settleWithin(
+    completion,
+    CANCELLATION_COMPLETION_BOUND_MS,
+  );
+  if (completed === COMPLETION_TIMEOUT) {
+    return `termination was not confirmed because completion did not settle within ${CANCELLATION_COMPLETION_BOUND_MS} ms`;
+  }
+  if (!completed.ok) {
+    return `termination was not confirmed because completion rejected: ${describeError(completed.error)}`;
+  }
+  if (!completed.value.ok) {
+    if (completed.value.failure.kind === "CANCELLED") {
+      return null;
+    }
+    return `termination was not confirmed because completion settled with ${completed.value.failure.kind}: ${completed.value.failure.message}`;
+  }
+  return "termination was not confirmed because completion settled successfully";
+}
+
+async function settleWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<Settled<T> | typeof COMPLETION_TIMEOUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof COMPLETION_TIMEOUT>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(COMPLETION_TIMEOUT);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([settle(promise), timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * The `SliceFailure` for an attempt an interrupt stopped.
+ *
+ * `WORKER_FAILED` carrying a `CANCELLED` `WorkerFailure` rather than a new
+ * `SliceFailureKind`, because that is the same shape the vendor adapters
+ * themselves produce for a cancellation (`cancellationFailure` in
+ * `src/worker/shared.ts` returns `kind: "CANCELLED"`, `retryable: false` for a
+ * `shutdown` reason). One vocabulary for "a worker was stopped on purpose",
+ * whether the stop came from this file or from the adapter's own idle timer.
+ *
+ * `retryable: false` is what stops the attempt loop from spending the slice's
+ * escalation on a run that is already shutting down.
+ */
+function cancellationFailure(
+  signal: AbortSignal | undefined,
+  detail: string,
+): SliceFailure {
+  const message = `${detail}: ${interruptMessage(signal?.reason)}`;
+  return {
+    kind: "WORKER_FAILED",
+    message,
+    failure: {
+      kind: "CANCELLED",
+      message,
+      retryable: false,
+      statusCode: null,
+    },
+  };
 }
 
 interface DrainReport {

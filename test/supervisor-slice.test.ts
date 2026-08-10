@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type { BrigadierConfig } from "../src/config/contracts.js";
 import { CONFIG_VERSION } from "../src/config/contracts.js";
 import type {
@@ -38,8 +39,10 @@ import type {
   RoutingInput,
   RoutingRequest,
 } from "../src/routing/contracts.js";
+import type { DetachedProcess } from "../src/shared/process.js";
 import type {
   AttemptSlot,
+  RunInterruption,
   SliceAttempt,
   SliceDirective,
   SliceResult,
@@ -52,6 +55,7 @@ import {
   type LaunchEnv,
   requireLaunchEnv,
 } from "../src/supervisor/slice.js";
+import { WorkerLifecycle } from "../src/worker/lifecycle.js";
 import type {
   CommitResult,
   CommitSpec,
@@ -170,6 +174,21 @@ const FAILED_OUTCOME: LaunchedWorkerOutcome = {
   },
 };
 
+const CANCELLED_OUTCOME: LaunchedWorkerOutcome = {
+  ok: false,
+  output: "",
+  usage: USAGE,
+  durationMs: 0,
+  exitCode: null,
+  signal: null,
+  failure: {
+    kind: "CANCELLED",
+    message: "fake worker cancellation completed",
+    retryable: false,
+    statusCode: null,
+  },
+};
+
 /**
  * A failure the vendor itself calls permanent. `retryable: false` is the whole
  * point: bad credentials are the operator's, not the model's, so a second model
@@ -277,6 +296,8 @@ class FakeEngine implements WorktreeEngine {
   commitError: Error | null = null;
   removeError: Error | null = null;
   onCommit: (() => void) | null = null;
+  /** Fires after the worktree exists and before the runner can spawn into it. */
+  onCreate: (() => void) | null = null;
   #commits = 0;
 
   prepare(): Promise<WorktreeSession> {
@@ -295,6 +316,7 @@ class FakeEngine implements WorktreeEngine {
         ? spec.session.repositoryPath
         : (spec.path ?? spec.session.repositoryPath);
     await mkdir(path, { recursive: true });
+    this.onCreate?.();
     return {
       repositoryPath: spec.session.repositoryPath,
       path,
@@ -331,6 +353,18 @@ class FakeEngine implements WorktreeEngine {
     }
     await rm(worktree.path, { recursive: true, force: true });
   }
+
+  /**
+   * Retiring the session's refs is the orchestrator's step 8, never the
+   * runner's, so reaching it from here is a defect worth failing on. It is a
+   * required member of `WorktreeEngine`, which is why the rejection is the
+   * implementation rather than the method being absent.
+   */
+  release(): Promise<void> {
+    return Promise.reject(
+      new Error("the slice runner must never call engine.release"),
+    );
+  }
 }
 
 interface SpawnScript {
@@ -341,23 +375,40 @@ interface SpawnScript {
   readonly completionError?: Error;
   readonly spawnError?: Error;
   readonly onSpawn?: (spec: WorkerSpec) => Promise<void>;
+  /**
+   * Runs after `events[index]` has been yielded, so a test can abort the run
+   * from a point that is provably inside the runner's wait rather than before
+   * it. NOTHING HERE EVER BLOCKS: the generator still finishes, so a runner
+   * that ignores the signal completes normally and the test fails on an
+   * assertion instead of hanging the suite.
+   */
+  readonly onEvent?: (index: number) => void;
+  /** Makes `cancel` reject, so the runner's own failure note can be asserted. */
+  readonly cancelError?: Error;
 }
 
 interface FakeAdapter<V extends "claude" | "codex"> {
   readonly worker: Worker<V>;
   readonly specs: readonly WorkerSpec[];
   drainedCount(): number;
+  /** Every `cancel` reason, in call order. Empty when nothing was cancelled. */
+  cancels(): readonly CancelReason[];
 }
 
-function launch(script: SpawnScript, onDrained: () => void): SpawnedWorker {
+function launch(
+  script: SpawnScript,
+  onDrained: () => void,
+  onCancel: (reason: CancelReason) => void,
+): SpawnedWorker {
   let release: () => void = () => undefined;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
   const events: AsyncIterable<WorkerEvent> = {
     [Symbol.asyncIterator]: async function* iterate() {
-      for (const event of script.events ?? []) {
+      for (const [index, event] of (script.events ?? []).entries()) {
         yield event;
+        script.onEvent?.(index);
       }
       onDrained();
       release();
@@ -375,7 +426,12 @@ function launch(script: SpawnScript, onDrained: () => void): SpawnedWorker {
     pid: 4242,
     events,
     completion,
-    cancel: (_reason: CancelReason) => Promise.resolve(),
+    cancel: (reason: CancelReason) => {
+      onCancel(reason);
+      return script.cancelError === undefined
+        ? Promise.resolve()
+        : Promise.reject(script.cancelError);
+    },
   };
 }
 
@@ -394,10 +450,12 @@ function scriptFor(
 
 function claudeAdapter(scripts: readonly SpawnScript[]): FakeAdapter<"claude"> {
   const specs: ClaudeWorkerSpec[] = [];
+  const cancels: CancelReason[] = [];
   let drained = 0;
   return {
     specs,
     drainedCount: () => drained,
+    cancels: () => cancels,
     worker: {
       vendor: "claude",
       processCompletion: "signals-then-must-be-killed",
@@ -408,9 +466,15 @@ function claudeAdapter(scripts: readonly SpawnScript[]): FakeAdapter<"claude"> {
           throw script.spawnError;
         }
         await script.onSpawn?.(spec);
-        return launch(script, () => {
-          drained += 1;
-        });
+        return launch(
+          script,
+          () => {
+            drained += 1;
+          },
+          (reason) => {
+            cancels.push(reason);
+          },
+        );
       },
     },
   };
@@ -418,10 +482,12 @@ function claudeAdapter(scripts: readonly SpawnScript[]): FakeAdapter<"claude"> {
 
 function codexAdapter(scripts: readonly SpawnScript[]): FakeAdapter<"codex"> {
   const specs: CodexWorkerSpec[] = [];
+  const cancels: CancelReason[] = [];
   let drained = 0;
   return {
     specs,
     drainedCount: () => drained,
+    cancels: () => cancels,
     worker: {
       vendor: "codex",
       processCompletion: "self-exits",
@@ -432,9 +498,113 @@ function codexAdapter(scripts: readonly SpawnScript[]): FakeAdapter<"codex"> {
           throw script.spawnError;
         }
         await script.onSpawn?.(spec);
-        return launch(script, () => {
-          drained += 1;
+        return launch(
+          script,
+          () => {
+            drained += 1;
+          },
+          (reason) => {
+            cancels.push(reason);
+          },
+        );
+      },
+    },
+  };
+}
+
+interface ShutdownThrowingAdapter extends FakeAdapter<"claude"> {
+  completion(): Promise<LaunchedWorkerOutcome>;
+  shutdownCalls(): number;
+}
+
+/**
+ * Uses the real lifecycle seam from both production adapters. Its injected
+ * shutdown throws exactly as `shutdownProcessGroup` does after a surviving
+ * SIGKILL, so `cancel` resolves only after completion settles UNKNOWN_FAILURE.
+ */
+function shutdownThrowingAdapter(
+  controller: AbortController,
+): ShutdownThrowingAdapter {
+  const specs: ClaudeWorkerSpec[] = [];
+  const cancels: CancelReason[] = [];
+  let drained = 0;
+  let shutdowns = 0;
+  let launchedCompletion: Promise<LaunchedWorkerOutcome> | null = null;
+  return {
+    specs,
+    drainedCount: () => drained,
+    cancels: () => cancels,
+    shutdownCalls: () => shutdowns,
+    completion: () => {
+      if (launchedCompletion === null) {
+        throw new Error("the shutdown-throwing adapter has not spawned");
+      }
+      return launchedCompletion;
+    },
+    worker: {
+      vendor: "claude",
+      processCompletion: "signals-then-must-be-killed",
+      spawn: async (spec: ClaudeWorkerSpec): Promise<SpawnedWorker> => {
+        specs.push(spec);
+        const processHandle = {
+          pid: 4242,
+          stdin: new PassThrough(),
+          stdout: new PassThrough(),
+          stderr: new PassThrough(),
+        } as unknown as DetachedProcess;
+        const lifecycle = new WorkerLifecycle({
+          processHandle,
+          idleTimeoutMs: 60_000,
+          timeoutMs: null,
+          cancellationOutcome: (reason) => ({
+            ok: false,
+            output: "",
+            usage: USAGE,
+            durationMs: 0,
+            exitCode: null,
+            signal: null,
+            failure: {
+              kind: "CANCELLED",
+              message: reason.message ?? "worker cancelled",
+              retryable: false,
+              statusCode: null,
+            },
+          }),
+          unexpectedFailureOutcome: (error) => ({
+            ok: false,
+            output: "",
+            usage: USAGE,
+            durationMs: 0,
+            exitCode: null,
+            signal: null,
+            failure: {
+              kind: "UNKNOWN_FAILURE",
+              message: error instanceof Error ? error.message : String(error),
+              retryable: false,
+              statusCode: null,
+            },
+          }),
+          shutdown: async () => {
+            shutdowns += 1;
+            throw new Error("process group 4242 survived SIGKILL");
+          },
         });
+        launchedCompletion = lifecycle.completion;
+        return {
+          pid: 4242,
+          events: {
+            [Symbol.asyncIterator]: async function* iterate() {
+              yield MESSAGE_EVENT;
+              controller.abort(SIGINT_REASON);
+              drained += 1;
+            },
+          },
+          completion: lifecycle.completion,
+          cancel: async (reason) => {
+            cancels.push(reason);
+            await lifecycle.cancel(reason);
+          },
+        };
       },
     },
   };
@@ -1932,6 +2102,11 @@ describe("DefaultSliceRunner worktree ownership", () => {
         statusCode: 503,
       },
     });
+    // The same leak, structurally, so the run's summary can name the directory
+    // that survived instead of reporting a clean cleanup.
+    expect(result.cleanupFailures).toEqual([
+      `slice slice-auth attempt 1: cleanup of worktree ${join(world.root, "wt", "slice-7")} also failed: git worktree remove: directory is busy`,
+    ]);
   });
 
   test("durations come from ports.now, never from the wall clock", async () => {
@@ -1999,5 +2174,525 @@ describe("requireLaunchEnv", () => {
     expect(() =>
       requireLaunchEnv({ HOME: "/Users/worker", PATH: "/usr/bin", USER: "" }),
     ).toThrow("cannot launch a worker: USER is missing from the environment");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation
+//
+// NOT ONE OF THESE TESTS SENDS A SIGNAL. They abort an `AbortController`
+// directly, which is the whole reason `runCli` takes an `AbortSignal` rather
+// than installing handlers of its own: a test that killed the test process
+// would prove nothing repeatable and would take the suite with it.
+//
+// AND NOT ONE OF THEM CAN HANG. Every fake worker here finishes on its own —
+// finite events, a completion that resolves — so a runner that ignored the
+// signal entirely would commit and return `ok: true`, and each test would fail
+// on an assertion in milliseconds instead of waiting forever for a cancellation
+// that is never coming. `withBound` is the second net, not the first.
+// ---------------------------------------------------------------------------
+
+/** The abort reason `src/cli.ts` raises for Ctrl-C. */
+const SIGINT_REASON: RunInterruption = { kind: "interrupt", signal: "SIGINT" };
+const SIGTERM_REASON: RunInterruption = {
+  kind: "interrupt",
+  signal: "SIGTERM",
+};
+
+describe("cancellation", () => {
+  test("an abort while the worker runs terminates its process group with the exact shutdown reason", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        events: [MESSAGE_EVENT],
+        // Fired from inside the runner's own wait: the drain is already being
+        // consumed and the abort listener is already installed.
+        onEvent: () => {
+          controller.abort(SIGINT_REASON);
+        },
+        completionAfterDrain: true,
+        outcome: CANCELLED_OUTCOME,
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        // TWO slots, so "no retry after an interrupt" is a real claim rather
+        // than an artefact of there being nowhere to retry to.
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    // The process group, killed exactly once, with exactly this reason.
+    expect(adapter.cancels()).toEqual([
+      { kind: "shutdown", message: "brigadier received SIGINT" },
+    ]);
+    expect(adapter.specs).toHaveLength(1);
+
+    expect(result.ok).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.commit).toBe(null);
+    expect(result.worktree).toBe(null);
+    expect(result.branch).toBe("brigadier/wo-011/slice-7");
+    expect(result.attempts).toHaveLength(1);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKER_FAILED",
+      message:
+        "slice slice-auth attempt 1: claude/claude-opus-5 was terminated: brigadier received SIGINT",
+      failure: {
+        kind: "CANCELLED",
+        message:
+          "slice slice-auth attempt 1: claude/claude-opus-5 was terminated: brigadier received SIGINT",
+        retryable: false,
+        statusCode: null,
+      },
+    });
+
+    // Nothing was committed, and the worktree is gone.
+    expect(harness.engine.commits).toHaveLength(0);
+    expect(harness.engine.removes.map((worktree) => worktree.branch)).toEqual([
+      "brigadier/wo-011/slice-7",
+    ]);
+    expect(await exists(join(world.root, "wt", "slice-7"))).toBe(false);
+  });
+
+  test("SIGTERM names itself in the reason the worker is cancelled with", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        events: [MESSAGE_EVENT],
+        onEvent: () => {
+          controller.abort(SIGTERM_REASON);
+        },
+        completionAfterDrain: true,
+        outcome: CANCELLED_OUTCOME,
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(adapter.cancels()).toEqual([
+      { kind: "shutdown", message: "brigadier received SIGTERM" },
+    ]);
+  });
+
+  test("an abort with no reason still cancels, in words that claim nothing", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        events: [MESSAGE_EVENT],
+        onEvent: () => {
+          controller.abort();
+        },
+        completionAfterDrain: true,
+        outcome: CANCELLED_OUTCOME,
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(adapter.cancels()).toEqual([
+      { kind: "shutdown", message: "brigadier was interrupted" },
+    ]);
+    expect(result.cancelled).toBe(true);
+  });
+
+  test("an abort already in hand spends no worktree, no spawn, and no ref", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    controller.abort(SIGINT_REASON);
+    const adapter = claudeAdapter([]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(harness.engine.creates).toHaveLength(0);
+    expect(adapter.specs).toHaveLength(0);
+    expect(adapter.cancels()).toHaveLength(0);
+    expect(harness.routeRequests).toHaveLength(0);
+    expect(result.ok).toBe(false);
+    expect(result.cancelled).toBe(true);
+    expect(result.branch).toBe(null);
+    expect(result.attempts).toHaveLength(1);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKER_FAILED",
+      message:
+        "slice slice-auth attempt 1 was cancelled before it was routed: brigadier received SIGINT",
+      failure: {
+        kind: "CANCELLED",
+        message:
+          "slice slice-auth attempt 1 was cancelled before it was routed: brigadier received SIGINT",
+        retryable: false,
+        statusCode: null,
+      },
+    });
+  });
+
+  test("an abort between the worktree and the spawn starts no worker and still removes the worktree", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const engine = new FakeEngine();
+    engine.onCreate = () => {
+      controller.abort(SIGINT_REASON);
+    };
+    const adapter = claudeAdapter([]);
+    const harness = makeHarness({
+      engine,
+      workers: { claude: adapter.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(engine.creates).toHaveLength(1);
+    expect(adapter.specs).toHaveLength(0);
+    expect(result.cancelled).toBe(true);
+    expect(result.attempts).toHaveLength(1);
+    expect(attemptAt(result, 0).failure?.message).toBe(
+      "slice slice-auth attempt 1 was cancelled before a claude/claude-opus-5 worker was spawned: brigadier received SIGINT",
+    );
+    expect(engine.removes.map((worktree) => worktree.branch)).toEqual([
+      "brigadier/wo-011/slice-7",
+    ]);
+    expect(await exists(join(world.root, "wt", "slice-7"))).toBe(false);
+  });
+
+  test("a shutdown throw that resolves cancel reports the pid as possibly still running", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = shutdownThrowingAdapter(controller);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "shutdown-throw run",
+    );
+
+    expect(adapter.cancels()).toEqual([
+      { kind: "shutdown", message: "brigadier received SIGINT" },
+    ]);
+    expect(adapter.shutdownCalls()).toBe(1);
+    expect(
+      await withBound(adapter.completion(), 100, "shutdown-throw completion"),
+    ).toEqual({
+      ok: false,
+      output: "",
+      usage: USAGE,
+      durationMs: 0,
+      exitCode: null,
+      signal: null,
+      failure: {
+        kind: "UNKNOWN_FAILURE",
+        message: "process group 4242 survived SIGKILL",
+        retryable: false,
+        statusCode: null,
+      },
+    });
+    expect(result.cancelled).toBe(true);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKER_FAILED",
+      message:
+        "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL: brigadier received SIGINT",
+      failure: {
+        kind: "CANCELLED",
+        message:
+          "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL: brigadier received SIGINT",
+        retryable: false,
+        statusCode: null,
+      },
+    });
+    expect(result.cleanupFailures).toEqual([
+      "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL",
+    ]);
+    expect(harness.logs).toEqual([
+      "slice slice-auth attempt 1: routed to claude/claude-opus-5 at high effort",
+      "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion settled with UNKNOWN_FAILURE: process group 4242 survived SIGKILL",
+    ]);
+  });
+
+  test("a resolved cancel cannot hang on an adapter whose completion never settles", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const cancels: CancelReason[] = [];
+    const completion = new Promise<LaunchedWorkerOutcome>(() => {});
+    const worker: Worker<"claude"> = {
+      vendor: "claude",
+      processCompletion: "signals-then-must-be-killed",
+      spawn: async () => ({
+        pid: 4242,
+        events: {
+          [Symbol.asyncIterator]: async function* iterate() {
+            yield MESSAGE_EVENT;
+            controller.abort(SIGINT_REASON);
+          },
+        },
+        completion,
+        cancel: async (reason) => {
+          cancels.push(reason);
+        },
+      }),
+    };
+    const harness = makeHarness({ workers: { claude: worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      1000,
+      "never-settling completion run",
+    );
+
+    expect(cancels).toEqual([
+      { kind: "shutdown", message: "brigadier received SIGINT" },
+    ]);
+    expect(result.cancelled).toBe(true);
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKER_FAILED",
+      message:
+        "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion did not settle within 100 ms: brigadier received SIGINT",
+      failure: {
+        kind: "CANCELLED",
+        message:
+          "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion did not settle within 100 ms: brigadier received SIGINT",
+        retryable: false,
+        statusCode: null,
+      },
+    });
+    expect(result.cleanupFailures).toEqual([
+      "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — termination was not confirmed because completion did not settle within 100 ms",
+    ]);
+  });
+
+  test("a cancel that rejects is reported beside the cancellation, never instead of it", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        events: [MESSAGE_EVENT],
+        onEvent: () => {
+          controller.abort(SIGINT_REASON);
+        },
+        completionAfterDrain: true,
+        cancelError: new Error("process group 4242 survived SIGKILL"),
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.cancelled).toBe(true);
+    expect(attemptAt(result, 0).failure?.message).toBe(
+      "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — terminating its process group failed: process group 4242 survived SIGKILL: brigadier received SIGINT",
+    );
+    // AND STRUCTURALLY, not only in prose. The run's summary has to decide
+    // whether it may say "workers were cancelled", and it cannot make that
+    // decision by reading a failure message. This is the field it reads.
+    expect(result.cleanupFailures).toEqual([
+      "slice slice-auth attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running — terminating its process group failed: process group 4242 survived SIGKILL",
+    ]);
+  });
+
+  test("a cancel that worked leaves no cleanup failure behind", async () => {
+    const world = await makeWorld();
+    const controller = new AbortController();
+    const adapter = claudeAdapter([
+      {
+        events: [MESSAGE_EVENT],
+        onEvent: () => {
+          controller.abort(SIGINT_REASON);
+        },
+        completionAfterDrain: true,
+        outcome: CANCELLED_OUTCOME,
+      },
+    ]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        signal: controller.signal,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.cancelled).toBe(true);
+    expect(attemptAt(result, 0).failure?.message).toBe(
+      "slice slice-auth attempt 1: claude/claude-opus-5 was terminated: brigadier received SIGINT",
+    );
+    expect(result.cleanupFailures).toBeUndefined();
+    expect(harness.logs).toEqual([
+      "slice slice-auth attempt 1: routed to claude/claude-opus-5 at high effort",
+      "slice slice-auth attempt 1: cancelled claude/claude-opus-5 (pid 4242)",
+    ]);
+  });
+
+  test("a run with no signal behaves exactly as it always did", async () => {
+    const world = await makeWorld();
+    const adapter = claudeAdapter([{ events: [MESSAGE_EVENT] }]);
+    const harness = makeHarness({ workers: { claude: adapter.worker } });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.cancelled).toBeUndefined();
+    expect(adapter.cancels()).toHaveLength(0);
   });
 });

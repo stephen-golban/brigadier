@@ -30,6 +30,14 @@ import type { AnyWorker, Effort, Vendor } from "../contracts.js";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
 import type { RoutedWorker } from "../routing/index.js";
+// Imported from the module rather than the barrel on purpose: the interrupt
+// helpers are CLI plumbing, not supervisor API, and `src/index.ts` re-exports
+// the supervisor barrel wholesale.
+import type {
+  InterruptSignal,
+  RunInterruption,
+} from "../supervisor/contracts.js";
+import { interruptExitCode } from "../supervisor/contracts.js";
 import type {
   LaunchEnv,
   RunnerDependencies,
@@ -456,6 +464,113 @@ export interface CliOptions {
   readonly cwd?: string;
   /** Injected in tests so `run` touches neither git nor a subprocess. */
   readonly harness?: RunHarness;
+  /**
+   * Stops a run in progress. `src/cli.ts` builds one `AbortController` — inside
+   * an `InterruptGate` — and aborts it with a `RunInterruption` from its SIGINT
+   * and SIGTERM handlers; tests drive the same controller directly, which is
+   * what keeps every assertion about cancellation out of the business of
+   * sending real signals to the test process.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Called at most once, at the exact moment this invocation acquires something
+   * an interrupt would have to clean up. See `InterruptGate.arm`.
+   *
+   * Only `run` calls it, and only immediately before it hands control to the
+   * orchestrator. `init` never does, which is the point: `init` creates no
+   * worktree and spawns no worker, so a Ctrl-C in it has nothing to wind down
+   * and must kill brigadier on the first press.
+   */
+  readonly onCancellable?: () => void;
+}
+
+/**
+ * What the shim must do about one interrupt.
+ *
+ * A value rather than a pair of side effects, so the decision — which is
+ * policy — is testable without a real `process` and without a real signal, and
+ * the shim is left with only the two things it alone can do: write to the real
+ * stderr and exit the real process.
+ */
+export interface InterruptDecision {
+  /** Exactly what to write to stderr, newline-terminated on both ends. */
+  readonly message: string;
+  /** Null to keep running; a number to exit with that code immediately. */
+  readonly exitCode: number | null;
+}
+
+/**
+ * The interrupt policy, minus the signals.
+ *
+ * REGISTERING A SIGNAL HANDLER DISABLES NODE'S DEFAULT TERMINATION, for the
+ * whole life of the process and not merely for the part of it that has workers
+ * to kill. That is the trap this type exists to close. `brigadier run --plan -`
+ * can sit on a blocking stdin read, config loading, and environment validation
+ * long before the orchestrator exists, and `brigadier init` never reaches an
+ * orchestrator at all — and in every one of those moments a handler that
+ * unconditionally "cancels workers" would swallow the user's first Ctrl-C,
+ * announce a cleanup of nothing, and make them press it again. One press used
+ * to be enough. It has to stay enough.
+ *
+ * So the gate starts DISARMED and terminates on the first interrupt, exactly
+ * as the default would have. A command arms it at the moment it acquires
+ * something an interrupt would have to wind down — for `run`, immediately
+ * before control passes to the orchestrator, which is the first instant a
+ * worker process or a worktree can exist. From then on the first interrupt is
+ * graceful and the second is the escape hatch, because a user who has run out
+ * of patience must never be trapped watching a cleanup they cannot escape.
+ */
+export interface InterruptGate {
+  /**
+   * Aborted with a `RunInterruption` when a graceful interrupt is accepted.
+   * Hand it to `runCli` as `signal`.
+   */
+  readonly signal: AbortSignal;
+  /**
+   * Switches this gate from "terminate now" to "cancel, then terminate on the
+   * next one". Idempotent, and there is no way back: a run that started is
+   * cancellable for the rest of the process's life, because its worktrees are.
+   */
+  arm(): void;
+  /** Records one interrupt and answers what the shim must do about it. */
+  interrupt(signal: InterruptSignal): InterruptDecision;
+}
+
+export function createInterruptGate(): InterruptGate {
+  const controller = new AbortController();
+  let armed = false;
+  let gracefulInterrupts = 0;
+  return {
+    signal: controller.signal,
+    arm: (): void => {
+      armed = true;
+    },
+    interrupt: (signal: InterruptSignal): InterruptDecision => {
+      const reason: RunInterruption = { kind: "interrupt", signal };
+      if (!armed) {
+        // Nothing is in flight, so there is nothing to say beyond the fact of
+        // stopping. Claiming workers were cancelled here would be false, and
+        // it is the sentence a user reads while wondering why Ctrl-C did not
+        // work.
+        return {
+          message: `\nbrigadier: ${signal} — exiting\n`,
+          exitCode: interruptExitCode(reason),
+        };
+      }
+      gracefulInterrupts += 1;
+      if (gracefulInterrupts > 1) {
+        return {
+          message: `\nbrigadier: ${signal} again — exiting now without finishing cleanup\n`,
+          exitCode: interruptExitCode(reason),
+        };
+      }
+      controller.abort(reason);
+      return {
+        message: `\nbrigadier: ${signal} — cancelling workers and cleaning up; interrupt again to exit immediately\n`,
+        exitCode: null,
+      };
+    },
+  };
 }
 
 export const USAGE = `Usage: brigadier <command> [options]
@@ -493,6 +608,12 @@ Exit codes:
   2  usage error
   3  the run started and did not succeed; the "run failed:" line names which
      stage stopped it, and each slice's line names what happened to it
+  130  the run was interrupted with SIGINT (Ctrl-C): every worker still running
+     was terminated along with its whole process group, its worktree was
+     removed, and the refs the run created were retired. Interrupt a second
+     time to skip that cleanup and exit at once
+  143  the run was interrupted with SIGTERM; identical to 130 in every respect
+     but the signal
 `;
 
 /** Parses argv and dispatches; resolves the process exit code. */
@@ -522,6 +643,10 @@ export async function runCli(options: CliOptions): Promise<number> {
       ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
       ...(options.io === undefined ? {} : { io: options.io }),
       ...(options.harness === undefined ? {} : { harness: options.harness }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onCancellable === undefined
+        ? {}
+        : { onCancellable: options.onCancellable }),
     });
   }
   if (command !== "init") {
@@ -618,6 +743,15 @@ async function loadDiscoverer(): Promise<Discoverer> {
  * that needs the finer answer has it printed: the reason is on the
  * `run failed:` line by name. What a script can usefully branch on is whether
  * the run happened at all, and that is exactly the 1/3 split.
+ *
+ * AN INTERRUPTED RUN RESOLVES 130 OR 143 INSTEAD, and those two are not part of
+ * that scheme at all — they are 128 plus the signal number, which is what every
+ * shell reports for a process a signal killed. A run stopped by SIGINT is not
+ * "a run that did not succeed" in the sense a CI step cares about; it is a run
+ * nobody finished asking for, and giving it 3 would make a Ctrl-C in a terminal
+ * indistinguishable from a plan whose slices genuinely failed. The interrupt
+ * code outranks the report's own verdict, including a report that came back
+ * `ok: true` because the abort landed after the last merge.
  */
 const RUN_OK = 0;
 const RUN_NOT_STARTED = 1;
@@ -680,6 +814,10 @@ export interface RunOptions {
   readonly stdin?: InputStream;
   readonly io?: ConfigIo;
   readonly harness?: RunHarness;
+  /** See `CliOptions.signal`. */
+  readonly signal?: AbortSignal;
+  /** See `CliOptions.onCancellable`. */
+  readonly onCancellable?: () => void;
 }
 
 /** Runs `brigadier run` and resolves the process exit code. */
@@ -779,7 +917,21 @@ export async function runPlan(options: RunOptions): Promise<number> {
     maxWorkers: invocation.maxWorkers,
     dryRun: invocation.dryRun,
     unsafeInPlace: invocation.unsafeInPlace,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
+
+  // THE LAST LINE BEFORE AN INTERRUPT HAS ANYTHING TO CLEAN UP. Every failure
+  // above this point returns without having created a ref, a worktree, or a
+  // process, so a Ctrl-C anywhere above it — including one that lands while
+  // `--plan -` is still blocked on stdin — must kill brigadier outright rather
+  // than announce a cleanup of nothing and demand a second press. From here on
+  // the orchestrator owns worktrees and the runner owns worker process groups,
+  // and a first interrupt has to be allowed to wind them down.
+  //
+  // Armed for a dry run too, which creates neither: a dry run returns before
+  // `prepare`, so the window is microseconds wide, and arming on the same line
+  // for every run is worth more than a branch that makes the rule conditional.
+  options.onCancellable?.();
 
   let report: RunReport;
   try {
@@ -787,17 +939,34 @@ export async function runPlan(options: RunOptions): Promise<number> {
   } catch (error) {
     // `run` is documented to report rather than throw for anything a caller can
     // legitimately hand it, so this is a defect rather than an outcome. It still
-    // owes the user a sentence instead of a stack trace.
+    // owes the user a sentence instead of a stack trace. An interrupt still
+    // outranks it: a user who pressed Ctrl-C gets the signal's code, not a
+    // "brigadier could not start" that would send them looking for a bad config.
     stderr.write(
       `brigadier run: the run did not complete: ${describe(error)}\n`,
     );
-    return RUN_NOT_STARTED;
+    return interruptedExitCode(options.signal) ?? RUN_NOT_STARTED;
   } finally {
     await disposeOracles(dependencies.ports, stderr);
   }
 
   renderRunReport(stdout, report);
-  return report.ok ? RUN_OK : RUN_FAILED;
+  return (
+    interruptedExitCode(options.signal) ?? (report.ok ? RUN_OK : RUN_FAILED)
+  );
+}
+
+/**
+ * The exit code an interrupt earns, or null when the run was not interrupted.
+ *
+ * Read off the signal rather than off `RunReport.interrupted` because only the
+ * signal carries WHICH interrupt it was, and 130 and 143 differ by exactly
+ * that. The two agree by construction — the orchestrator samples the same
+ * signal — so this is a matter of which value has the answer, not of which
+ * source to trust.
+ */
+function interruptedExitCode(signal: AbortSignal | undefined): number | null {
+  return signal?.aborted === true ? interruptExitCode(signal.reason) : null;
 }
 
 /**
@@ -1158,6 +1327,31 @@ function renderRunReport(out: OutputStream, report: RunReport): void {
   out.write(
     `\n${report.dryRun ? "dry run" : "run"} ${report.slug}: ${report.slices.length} slice(s) in ${report.durationMs}ms\n`,
   );
+  // Printed before the slice lines rather than with the failure at the bottom,
+  // because it changes how every line below it should be read: "cancelled" on a
+  // slice means something different when the user knows they caused it.
+  //
+  // THE CLEAN WORDING IS A CLAIM ABOUT `cancel()`, `remove()` AND `release()`,
+  // AND IT IS ONLY MADE WHEN THEY ALL SUCCEEDED. Printing it unconditionally
+  // told a user their workers were dead and their worktrees were gone at
+  // exactly the moment a worker was still alive and still spending their paid
+  // quota — the one moment they most needed to be told to go kill it.
+  if (report.interrupted) {
+    out.write(
+      report.cleanupFailures.length === 0
+        ? "  interrupted: workers were cancelled and worktrees removed\n"
+        : "  interrupted: cleanup did not finish; a worker may still be running and a worktree may still exist — see cleanup failures below\n",
+    );
+  }
+  // Printed whether or not the run was interrupted: a worktree that would not
+  // be removed on the ordinary path is the same leak and needs the same
+  // sentence.
+  if (report.cleanupFailures.length > 0) {
+    out.write("  cleanup failures:\n");
+    for (const failure of report.cleanupFailures) {
+      out.write(`    ${failure}\n`);
+    }
+  }
   for (const slice of report.slices) {
     out.write(`  ${slice.sliceId}  ${describeSliceVerdict(report, slice)}\n`);
     for (const attempt of slice.attempts) {
@@ -1223,10 +1417,21 @@ function renderRejections(out: OutputStream, attempt: SliceAttempt): void {
  * the answer the user asked for, and labelling it "would run" would report a
  * refusal as a plan. The failure is therefore checked first, and "would run" is
  * reserved for a slice that routed and was deliberately not executed.
+ *
+ * CANCELLED IS CHECKED BEFORE THE FAILURE KIND, for a related reason. A
+ * cancelled slice does carry a `SliceFailure` — the runner records why it
+ * stopped — so reading the kind first would print `failed WORKER_FAILED` for a
+ * worker the user themselves killed, which is the single most misleading line
+ * this report could produce.
  */
 function describeSliceVerdict(report: RunReport, slice: SliceResult): string {
   if (slice.ok) {
     return `ok  ${slice.branch}  ${slice.commit}`;
+  }
+  if (slice.cancelled === true) {
+    return slice.attempts.length === 0
+      ? "cancelled  (never started)"
+      : "cancelled";
   }
   const kind = slice.attempts.at(-1)?.failure?.kind;
   if (kind !== undefined) {

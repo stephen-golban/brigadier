@@ -760,10 +760,20 @@ describe("GitWorktreeEngine", () => {
         await fixture.engine.commit({ worktree: second, message: "second" });
         const firstMerge = await fixture.engine.merge({ worktree: first });
         expect(firstMerge.status).toBe("merged");
-        const integrationBeforeConflict = await gitText(fixture.repository, [
-          "rev-parse",
-          session.integrationBranch,
+        if (firstMerge.status !== "merged") {
+          throw new Error("expected the first slice to merge cleanly");
+        }
+        const integrationRef = `refs/heads/${session.integrationBranch}`;
+        expect(integrationRef).toBe("refs/heads/brigadier/conflict");
+        const integrationBeforeConflict = await gitBuffer(fixture.repository, [
+          "show-ref",
+          "--verify",
+          "--hash",
+          integrationRef,
         ]);
+        expect(integrationBeforeConflict).toEqual(
+          Buffer.from(`${firstMerge.commit}\n`),
+        );
 
         const conflict = await fixture.engine.merge({ worktree: second });
         expect(conflict.status).toBe("conflicted");
@@ -772,11 +782,17 @@ describe("GitWorktreeEngine", () => {
         }
         expect(conflict.details).toContain("tracked.txt");
         expect(
-          await gitText(fixture.repository, [
-            "rev-parse",
-            session.integrationBranch,
+          await gitBuffer(fixture.repository, [
+            "show-ref",
+            "--verify",
+            "--hash",
+            integrationRef,
           ]),
-        ).toBe(integrationBeforeConflict);
+        ).toEqual(integrationBeforeConflict);
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/brigadier/conflict ${firstMerge.commit}\n` +
+            `refs/heads/main ${(await gitText(fixture.repository, ["rev-parse", "main"])).trim()}\n`,
+        );
       });
     },
     TEST_TIMEOUT_MS,
@@ -851,6 +867,217 @@ describe("GitWorktreeEngine", () => {
             "--porcelain",
           ]),
         ).not.toContain(worktree.path);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "releases every all-failed ref idempotently and permits the same slug again",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = await gitBuffer(fixture.repository, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        const originalHeadRef = await gitBuffer(fixture.repository, [
+          "symbolic-ref",
+          "HEAD",
+        ]);
+        const originalMainRef = await gitBuffer(fixture.repository, [
+          "show-ref",
+          "--verify",
+          "--hash",
+          "refs/heads/main",
+        ]);
+        const originalCommit = originalHead.toString("utf8").trim();
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "all-failed",
+        );
+        const first = await createWorktree(fixture, session, 1);
+        const second = await createWorktree(fixture, session, 2);
+
+        await fixture.engine.remove(first);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(first), 1);
+        await fixture.engine.remove(second);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(second), 1);
+        // A prior cleanup may already have removed one engine-owned ref.
+        await gitText(fixture.repository, [
+          "update-ref",
+          "-d",
+          "refs/heads/brigadier/all-failed/slice-2",
+          session.baseCommit,
+        ]);
+
+        await fixture.engine.release(session);
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/main ${originalCommit}\n`,
+        );
+        expect(
+          await gitBuffer(fixture.repository, ["rev-parse", "HEAD"]),
+        ).toEqual(originalHead);
+        expect(
+          await gitBuffer(fixture.repository, ["symbolic-ref", "HEAD"]),
+        ).toEqual(originalHeadRef);
+        expect(
+          await gitBuffer(fixture.repository, [
+            "show-ref",
+            "--verify",
+            "--hash",
+            "refs/heads/main",
+          ]),
+        ).toEqual(originalMainRef);
+
+        await fixture.engine.release(session);
+        // Released sessions are tombstoned instead of silently recreating refs.
+        await expect(
+          fixture.engine.create({
+            session,
+            slice: 3,
+            path: join(fixture.root, "released-slice-3"),
+          }),
+        ).rejects.toThrow("worktree session refs have already been released");
+
+        const retried = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "all-failed",
+        );
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/brigadier/all-failed/base ${retried.baseCommit}\n` +
+            `refs/heads/main ${originalCommit}\n`,
+        );
+        await fixture.engine.release(retried);
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/main ${originalCommit}\n`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses to release a session while an engine-created worktree is active",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = (
+          await gitText(fixture.repository, ["rev-parse", "HEAD"])
+        ).trim();
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "active-release",
+        );
+        await createWorktree(fixture, session, 1);
+
+        await expect(fixture.engine.release(session)).rejects.toThrow(
+          "cannot release worktree session active-release: 1 worktree(s) are still active",
+        );
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/brigadier/active-release/base ${session.baseCommit}\n` +
+            `refs/heads/brigadier/active-release/slice-1 ${session.baseCommit}\n` +
+            `refs/heads/main ${originalHead}\n`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "rejects foreign sessions and moved refs without partially releasing",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = (
+          await gitText(fixture.repository, ["rev-parse", "HEAD"])
+        ).trim();
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "release-guards",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        await fixture.engine.remove(worktree);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(worktree), 1);
+
+        const foreignEngine = new GitWorktreeEngine({
+          commandTimeoutMs: GIT_TIMEOUT_MS,
+        });
+        await expect(foreignEngine.release(session)).rejects.toThrow(
+          "worktree session was not prepared by this engine",
+        );
+
+        await gitText(fixture.repository, [
+          "update-ref",
+          "refs/heads/brigadier/release-guards/slice-1",
+          originalHead,
+          session.baseCommit,
+        ]);
+        await expect(fixture.engine.release(session)).rejects.toThrow(
+          "engine-created ref refs/heads/brigadier/release-guards/slice-1 moved unexpectedly",
+        );
+        expect(await headRefListing(fixture.repository)).toBe(
+          `refs/heads/brigadier/release-guards/base ${session.baseCommit}\n` +
+            `refs/heads/brigadier/release-guards/slice-1 ${originalHead}\n` +
+            `refs/heads/main ${originalHead}\n`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "keeps a materialized integration branch unchanged when release is called",
+    async () => {
+      await withFixture(async (fixture) => {
+        const originalHead = (
+          await gitText(fixture.repository, ["rev-parse", "HEAD"])
+        ).trim();
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "release-merged",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, "merged-output.txt"),
+          "merged output\n",
+        );
+        const slice = await fixture.engine.commit({
+          worktree,
+          message: "completed slice",
+        });
+        const merged = await fixture.engine.merge({ worktree });
+        expect(merged.status).toBe("merged");
+        if (merged.status !== "merged") {
+          throw new Error("expected a clean merge");
+        }
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "-s",
+            "--format=%P",
+            merged.commit,
+          ]),
+        ).toBe(`${session.baseCommit} ${slice.commit}\n`);
+
+        await fixture.engine.remove(worktree);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(worktree), 1);
+        const refsBeforeRelease =
+          `refs/heads/brigadier/release-merged ${merged.commit}\n` +
+          `refs/heads/main ${originalHead}\n`;
+        expect(await headRefListing(fixture.repository)).toBe(
+          refsBeforeRelease,
+        );
+        await fixture.engine.release(session);
+        await fixture.engine.release(session);
+        expect(await headRefListing(fixture.repository)).toBe(
+          refsBeforeRelease,
+        );
+        expect(
+          await gitText(fixture.repository, ["cat-file", "-t", merged.commit]),
+        ).toBe("commit\n");
       });
     },
     TEST_TIMEOUT_MS,
@@ -1064,6 +1291,15 @@ async function scanAllGitObjects(
 
 async function gitText(cwd: string, args: readonly string[]): Promise<string> {
   return (await gitBuffer(cwd, args)).toString("utf8");
+}
+
+async function headRefListing(repository: string): Promise<string> {
+  return await gitText(repository, [
+    "for-each-ref",
+    "--sort=refname",
+    "--format=%(refname) %(objectname)",
+    "refs/heads/",
+  ]);
 }
 
 async function gitBuffer(

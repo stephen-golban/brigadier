@@ -41,6 +41,15 @@
  *   The factory is the supported construction; the class is named so the unit's
  *   tests can reach the `route` seam that exists only to assert the exact
  *   `RoutingRequest` an escalation builds.
+ * - `interruptExitCode` and `interruptMessage` (`./contracts.js`) are how the
+ *   CLI turns an abort reason into a process exit code and a sentence. The
+ *   TYPES that reason is built from — `RunInterruption`, `InterruptSignal` —
+ *   are exported above, because a consumer aborting `RunRequest.signal` needs
+ *   to construct one for the report to name the signal. The two functions are
+ *   not: 130 and 143 are a promise `brigadier`-the-executable makes to a shell,
+ *   not one this package makes to a library consumer, and a consumer who wants
+ *   that mapping is better served writing the two lines than inheriting a
+ *   commitment to them.
  * - `CAPABILITY_TABLE`, `CapabilityRule`, and `matchCapabilityRule`
  *   (`./capabilities.js`) are the pattern-matching implementation behind
  *   `buildCapabilities`. This is NOT the `COMPETENCE_TABLE` case: that table is
@@ -55,8 +64,10 @@
 export { buildCapabilities } from "./capabilities.js";
 export type {
   AttemptSlot,
+  InterruptSignal,
   PlanDocument,
   RunFailureReason,
+  RunInterruption,
   RunReport,
   RunRequest,
   SliceAttempt,
