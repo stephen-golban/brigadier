@@ -170,6 +170,8 @@ export function proposeConfig(
     version: CONFIG_VERSION,
     vendors: vendors.map((entry) => entry.config),
     secretsConsent: existing?.secretsConsent ?? false,
+    linkedSecretPaths:
+      existing?.secretsConsent === true ? existing.linkedSecretPaths : [],
     allowDegradedRouting: existing?.allowDegradedRouting ?? false,
   });
 
@@ -418,6 +420,13 @@ export function withSecretsConsent(
   consent: boolean,
 ): BrigadierConfig {
   return parseConfig({ ...config, secretsConsent: consent });
+}
+
+export function withLinkedSecretPaths(
+  config: BrigadierConfig,
+  linkedSecretPaths: readonly string[],
+): BrigadierConfig {
+  return parseConfig({ ...config, linkedSecretPaths });
 }
 
 function mapVendor(

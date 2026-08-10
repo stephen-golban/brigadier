@@ -68,6 +68,7 @@ export {
   withDefaultModel,
   withDegradedRouting,
   withEffortCeiling,
+  withLinkedSecretPaths,
   withSecretsConsent,
 } from "./init/index.js";
 export type {

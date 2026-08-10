@@ -44,7 +44,7 @@ import type {
  * three — two absolute, independently checkable outcomes.
  */
 const CONFIG: BrigadierConfig = {
-  version: 2,
+  version: 3,
   vendors: [
     {
       vendor: "claude",
@@ -65,6 +65,7 @@ const CONFIG: BrigadierConfig = {
     },
   ],
   secretsConsent: false,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 

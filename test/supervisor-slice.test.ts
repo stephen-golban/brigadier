@@ -113,6 +113,7 @@ const CONFIG: BrigadierConfig = {
     },
   ],
   secretsConsent: true,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 

@@ -60,7 +60,12 @@ import { createClaudeWorker, createCodexWorker } from "../worker/index.js";
 import type { MergeResult, WorktreeEngine } from "../worktree/index.js";
 import { GitWorktreeEngine } from "../worktree/index.js";
 import type { InputStream, OutputStream, PromptIo } from "./prompt.js";
-import { confirmPrompt, LineReader, selectPrompt } from "./prompt.js";
+import {
+  confirmPrompt,
+  LineReader,
+  selectPrompt,
+  textPrompt,
+} from "./prompt.js";
 import type {
   DroppedVendor,
   Proposal,
@@ -72,6 +77,7 @@ import {
   withDefaultModel,
   withDegradedRouting,
   withEffortCeiling,
+  withLinkedSecretPaths,
   withSecretsConsent,
 } from "./propose.js";
 
@@ -99,6 +105,11 @@ const EFFORT_CEILING_NOTE =
 /** Decision #19 and #7, said out loud so the config is not mistaken for a router. */
 const ROUTER_NOTE =
   "This config layers on top of brigadier's router: it records which models are permitted and how high their effort may go. Routing still filters by capability, ranks by competence, then weighs difficulty, effort, and cost. Vendor is never a routing input.";
+
+const LINKED_SECRET_PATHS_QUESTION =
+  "Secret file paths as a JSON array of repository-relative strings:";
+
+const LINKED_SECRET_PATH_ATTEMPTS = 3;
 
 export interface InitOptions {
   readonly discoverer: Discoverer;
@@ -310,6 +321,9 @@ function renderProposal(stdout: OutputStream, proposal: Proposal): void {
     `\n  secrets consent: ${proposal.config.secretsConsent ? "yes" : "no"}\n`,
   );
   stdout.write(
+    `  linked secret paths: ${proposal.config.linkedSecretPaths.length === 0 ? "(none)" : proposal.config.linkedSecretPaths.join(", ")}\n`,
+  );
+  stdout.write(
     `  run below-difficulty models rather than fail: ${proposal.config.allowDegradedRouting ? "yes" : "no"}\n`,
   );
   stdout.write(`\n${ROUTER_NOTE}\n`);
@@ -325,6 +339,44 @@ function describeAllowed(ranked: RankedModel | undefined): string {
     return "";
   }
   return `  (vendor supports ${ranked.allowedEfforts.join(", ")})`;
+}
+
+async function promptLinkedSecretPaths(
+  io: PromptIo,
+  config: BrigadierConfig,
+): Promise<BrigadierConfig> {
+  const defaultValue = JSON.stringify(config.linkedSecretPaths);
+  for (let attempt = 0; attempt < LINKED_SECRET_PATH_ATTEMPTS; attempt += 1) {
+    const answer = await textPrompt(
+      io,
+      LINKED_SECRET_PATHS_QUESTION,
+      defaultValue,
+    );
+    let value: unknown;
+    try {
+      value = JSON.parse(answer);
+    } catch {
+      io.output.write("  Enter a JSON array of strings.\n");
+      continue;
+    }
+    if (
+      !Array.isArray(value) ||
+      !value.every((path) => typeof path === "string")
+    ) {
+      io.output.write("  Enter a JSON array of strings.\n");
+      continue;
+    }
+    try {
+      return withLinkedSecretPaths(config, value);
+    } catch (error) {
+      if (!(error instanceof ConfigValidationError)) {
+        throw error;
+      }
+      io.output.write(`  ${error.message}\n`);
+    }
+  }
+  io.output.write("  Keeping the current linked secret paths.\n");
+  return config;
 }
 
 async function confirmInteractively(
@@ -379,7 +431,11 @@ async function confirmInteractively(
     "Allow brigadier to link secret files (for example .env) into worker worktrees?",
     config.secretsConsent,
   );
-  return withSecretsConsent(config, consent);
+  config = withSecretsConsent(config, consent);
+  if (!consent) {
+    return withLinkedSecretPaths(config, []);
+  }
+  return promptLinkedSecretPaths(io, config);
 }
 
 async function promptEffortCeilings(
@@ -1499,5 +1555,6 @@ export {
   withDefaultModel,
   withDegradedRouting,
   withEffortCeiling,
+  withLinkedSecretPaths,
   withSecretsConsent,
 } from "./propose.js";

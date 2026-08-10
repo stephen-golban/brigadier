@@ -114,6 +114,7 @@ function makeConfig(models: readonly string[]): BrigadierConfig {
   return parseConfig({
     version: CONFIG_VERSION,
     secretsConsent: true,
+    linkedSecretPaths: [],
     allowDegradedRouting: false,
     vendors: [
       {

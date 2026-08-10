@@ -75,6 +75,7 @@ const PUBLIC_API: readonly string[] = [
   "withDefaultModel",
   "withDegradedRouting",
   "withEffortCeiling",
+  "withLinkedSecretPaths",
   "withSecretsConsent",
   "writeConfig",
 ];
@@ -83,7 +84,7 @@ test("root barrel exposes exactly the curated public surface", () => {
   const exports = Object.keys(packageApi).sort();
 
   expect(exports).toEqual([...PUBLIC_API]);
-  expect(exports).toHaveLength(61);
+  expect(exports).toHaveLength(62);
 });
 
 test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {

@@ -33,6 +33,8 @@ import {
   runInit,
   withDefaultModel,
   withDegradedRouting,
+  withLinkedSecretPaths,
+  withSecretsConsent,
 } from "../src/init/index.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -185,7 +187,7 @@ const BOTH_VENDORS_REPORT: DiscoveryReport = {
 };
 
 const BOTH_VENDORS_CONFIG: BrigadierConfig = {
-  version: 2,
+  version: 3,
   vendors: [
     {
       vendor: "claude",
@@ -211,6 +213,7 @@ const BOTH_VENDORS_CONFIG: BrigadierConfig = {
     },
   ],
   secretsConsent: false,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 
@@ -290,6 +293,7 @@ describe("brigadier init --yes", () => {
         resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
       );
       expect(written?.secretsConsent).toBe(false);
+      expect(written?.linkedSecretPaths).toEqual([]);
       expect(JSON.stringify(written)).not.toContain("token");
       expect(JSON.stringify(written)).not.toContain("apiKey");
     });
@@ -359,9 +363,10 @@ describe("brigadier init --print-config", () => {
 
       expect(code).toBe(0);
       expect(JSON.parse(stdout.text())).toEqual({
-        version: 2,
+        version: 3,
         vendors: [],
         secretsConsent: false,
+        linkedSecretPaths: [],
         allowDegradedRouting: false,
       });
     });
@@ -474,6 +479,142 @@ describe("degraded routing", () => {
       );
       expect(stdout.text()).not.toContain("quota fallback");
     });
+  });
+});
+
+describe("linked secret paths", () => {
+  test("asks for paths only after consent and persists the exact list", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // accept model, keep ceilings, degraded routing no, secrets yes, paths
+        stdin: scriptedInput([
+          "",
+          "",
+          "",
+          "y",
+          '[".env","config/./secrets.env"]',
+        ]),
+        assumeYes: false,
+        printConfig: false,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+      );
+      expect(written?.secretsConsent).toBe(true);
+      expect(written?.linkedSecretPaths).toEqual([
+        ".env",
+        "config/./secrets.env",
+      ]);
+      expect(
+        stdout
+          .text()
+          .split(
+            "Secret file paths as a JSON array of repository-relative strings: [[]]",
+          ).length - 1,
+      ).toBe(1);
+      expect(
+        stdout.text().split("  linked secret paths: (none)\n").length - 1,
+      ).toBe(1);
+    });
+  });
+
+  test("does not ask for paths without consent and stores an empty list", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const configPath = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const prior = withLinkedSecretPaths(
+        withSecretsConsent(proposeConfig(CODEX_REPORT, null).config, true),
+        [".env"],
+      );
+      await writeConfig(configPath, prior);
+
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        stdin: scriptedInput(["", "", "", "n"]),
+        assumeYes: false,
+        printConfig: false,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(configPath);
+      expect(written?.secretsConsent).toBe(false);
+      expect(written?.linkedSecretPaths).toEqual([]);
+      expect(
+        stdout
+          .text()
+          .split(
+            "Secret file paths as a JSON array of repository-relative strings:",
+          ).length - 1,
+      ).toBe(0);
+    });
+  });
+
+  test("bounds invalid path input at three attempts and keeps the safe default", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const stdout = collector();
+      const traversal = "config/" + "../" + ".env";
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        stdin: scriptedInput([
+          "",
+          "",
+          "",
+          "y",
+          JSON.stringify([traversal]),
+          JSON.stringify([traversal]),
+          JSON.stringify([traversal]),
+        ]),
+        assumeYes: false,
+        printConfig: false,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+      );
+      expect(written?.linkedSecretPaths).toEqual([]);
+      expect(
+        stdout
+          .text()
+          .split(
+            "Secret file paths as a JSON array of repository-relative strings:",
+          ).length - 1,
+      ).toBe(3);
+      expect(
+        stdout.text().split("Keeping the current linked secret paths.").length -
+          1,
+      ).toBe(1);
+    });
+  });
+
+  test("proposal and transforms preserve consented paths and clear unconsented ones", () => {
+    const base = proposeConfig(CODEX_REPORT, null).config;
+    const consented = withSecretsConsent(base, true);
+    const linked = withLinkedSecretPaths(consented, [
+      ".env",
+      "config/secrets.env",
+    ]);
+
+    expect(
+      proposeConfig(CODEX_REPORT, linked).config.linkedSecretPaths,
+    ).toEqual([".env", "config/secrets.env"]);
+    expect(
+      proposeConfig(CODEX_REPORT, withSecretsConsent(linked, false)).config
+        .linkedSecretPaths,
+    ).toEqual([]);
   });
 });
 
@@ -969,7 +1110,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       const prior: BrigadierConfig = {
-        version: 2,
+        version: 3,
         vendors: [
           {
             vendor: "codex",
@@ -983,6 +1124,7 @@ describe("re-running init", () => {
           },
         ],
         secretsConsent: true,
+        linkedSecretPaths: [".env", "config/secrets.env"],
         allowDegradedRouting: true,
       };
       await writeConfig(path, prior);
@@ -1029,7 +1171,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 2,
+        version: 3,
         vendors: [
           {
             vendor: "codex",
@@ -1040,6 +1182,7 @@ describe("re-running init", () => {
           },
         ],
         secretsConsent: false,
+        linkedSecretPaths: [],
         allowDegradedRouting: true,
       });
 
@@ -1070,7 +1213,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 2,
+        version: 3,
         vendors: [
           {
             vendor: "claude",
@@ -1081,6 +1224,7 @@ describe("re-running init", () => {
           },
         ],
         secretsConsent: false,
+        linkedSecretPaths: [],
         allowDegradedRouting: false,
       });
 
@@ -1114,7 +1258,7 @@ describe("re-running init", () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await writeConfig(path, {
-        version: 2,
+        version: 3,
         vendors: [
           {
             vendor: "codex",
@@ -1125,6 +1269,7 @@ describe("re-running init", () => {
           },
         ],
         secretsConsent: false,
+        linkedSecretPaths: [],
         allowDegradedRouting: false,
       });
 
