@@ -53,11 +53,12 @@ const CANONICAL: BrigadierConfig = {
     },
   ],
   secretsConsent: false,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 
 const CANONICAL_BYTES = `{
-  "version": 2,
+  "version": 3,
   "vendors": [
     {
       "vendor": "codex",
@@ -77,6 +78,7 @@ const CANONICAL_BYTES = `{
     }
   ],
   "secretsConsent": false,
+  "linkedSecretPaths": [],
   "allowDegradedRouting": false
 }
 `;
@@ -100,6 +102,22 @@ const VERSION_ONE_ON_DISK = {
     },
   ],
   secretsConsent: false,
+};
+
+/** A complete version-2 file, before `linkedSecretPaths` was added. */
+const VERSION_TWO_ON_DISK = {
+  version: 2,
+  vendors: [
+    {
+      vendor: "codex",
+      executable: "/opt/homebrew/bin/codex",
+      version: "0.145.0",
+      defaultModel: "gpt-5.6-sol",
+      models: [{ id: "gpt-5.6-sol", effortCeiling: "high" }],
+    },
+  ],
+  secretsConsent: false,
+  allowDegradedRouting: false,
 };
 
 describe("config location", () => {
@@ -178,7 +196,7 @@ describe("parseConfig", () => {
    * whole issue list, not a substring, because "one actionable error" is the
    * claim being made and a list of length one is the only way to make it.
    */
-  test("rejects a version-1 config with one actionable error and nothing else", () => {
+  test("rejects version-1 and version-2 configs with one actionable error each", () => {
     expect(() => parseConfig(VERSION_ONE_ON_DISK)).toThrow(
       ConfigValidationError,
     );
@@ -189,15 +207,33 @@ describe("parseConfig", () => {
       expect(error).toBeInstanceOf(ConfigValidationError);
       const validation = error as ConfigValidationError;
       expect(validation.issues).toEqual([
-        "config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+        "config version must be 3, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       ]);
       expect(validation.message).toBe(
-        "invalid brigadier config: config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+        "invalid brigadier config: config version must be 3, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       );
       // The keys that changed are never named: they are symptoms of the version
       // difference, and listing them would send the user editing JSON by hand.
       expect(validation.message).not.toContain("quotaFallbackModel");
       expect(validation.message).not.toContain("allowDegradedRouting");
+    }
+
+    expect(() => parseConfig(VERSION_TWO_ON_DISK)).toThrow(
+      ConfigValidationError,
+    );
+    try {
+      parseConfig(VERSION_TWO_ON_DISK);
+      throw new Error("expected parseConfig to reject the version-2 config");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigValidationError);
+      const validation = error as ConfigValidationError;
+      expect(validation.issues).toEqual([
+        "config version must be 3, received 2; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+      ]);
+      expect(validation.message).toBe(
+        "invalid brigadier config: config version must be 3, received 2; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+      );
+      expect(validation.message).not.toContain("linkedSecretPaths");
     }
   });
 
@@ -224,12 +260,16 @@ describe("parseConfig", () => {
         'invalid brigadier config: config: unknown key "apiKey"',
       ],
       [
-        { ...CANONICAL, version: 3 },
-        "invalid brigadier config: config version must be 2, received 3; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+        { ...CANONICAL, version: 4 },
+        "invalid brigadier config: config version must be 3, received 4; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       ],
       [
         { ...CANONICAL, secretsConsent: "yes" },
         "invalid brigadier config: secretsConsent must be a boolean",
+      ],
+      [
+        { ...CANONICAL, linkedSecretPaths: "secrets/.env" },
+        "invalid brigadier config: linkedSecretPaths must be an array",
       ],
       [
         { ...CANONICAL, allowDegradedRouting: "yes" },
@@ -299,6 +339,49 @@ describe("parseConfig", () => {
 
     for (const [value, message] of cases) {
       expect(() => parseConfig(value)).toThrow(message);
+    }
+  });
+
+  test("refuses unsafe linked secret paths without rewriting path bytes", () => {
+    expect(
+      parseConfig({
+        ...CANONICAL,
+        linkedSecretPaths: [".env", "config/./secrets.env"],
+      }).linkedSecretPaths,
+    ).toEqual([".env", "config/./secrets.env"]);
+
+    const traversal = "config/" + "../" + ".env";
+    const controlled = `config/.env${String.fromCharCode(0)}`;
+    const cases: readonly (readonly [string, string])[] = [
+      [
+        "/etc/secrets.env",
+        "invalid brigadier config: linkedSecretPaths[0] must be a repository-relative POSIX path",
+      ],
+      [
+        "C:/secrets.env",
+        "invalid brigadier config: linkedSecretPaths[0] must be a repository-relative POSIX path",
+      ],
+      [
+        "config\\secrets.env",
+        "invalid brigadier config: linkedSecretPaths[0] must be a repository-relative POSIX path",
+      ],
+      [
+        traversal,
+        'invalid brigadier config: linkedSecretPaths[0] must not contain ".." path segments',
+      ],
+      [
+        controlled,
+        "invalid brigadier config: linkedSecretPaths[0] must not contain control characters",
+      ],
+      [
+        "",
+        "invalid brigadier config: linkedSecretPaths[0] must be a non-empty string",
+      ],
+    ];
+    for (const [path, message] of cases) {
+      expect(() =>
+        parseConfig({ ...CANONICAL, linkedSecretPaths: [path] }),
+      ).toThrow(message);
     }
   });
 });
@@ -383,7 +466,7 @@ describe("atomic config write", () => {
       await writeFile(path, `${JSON.stringify(VERSION_ONE_ON_DISK)}\n`, "utf8");
 
       await expect(readConfig(path)).rejects.toThrow(
-        "invalid brigadier config: config version must be 2, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
+        "invalid brigadier config: config version must be 3, received 1; this file was written by a different version of brigadier — run `brigadier init` again to rewrite it",
       );
     });
   });

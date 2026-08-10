@@ -58,6 +58,7 @@ function makeConfig(
   return parseConfig({
     version: CONFIG_VERSION,
     secretsConsent: false,
+    linkedSecretPaths: [],
     allowDegradedRouting,
     vendors: specs.map((spec) => ({
       vendor: spec.vendor,
