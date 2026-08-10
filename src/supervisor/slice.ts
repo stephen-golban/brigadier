@@ -294,12 +294,17 @@ export class DefaultSliceRunner implements SliceRunner {
         excluded.push({ vendor: routed.vendor, model: routed.model });
       }
       // A second attempt costs a full worktree, a full worker run, and the
-      // slice's only retry. Spending it on a failure the vendor itself calls
-      // permanent — bad credentials, a denied permission, a refusal, an
-      // unknown model — buys a slower report of the same answer.
+      // slice's only retry. Spending it on a failure that is already known to
+      // be permanent — bad credentials, a denied permission, a refusal, an
+      // unknown model, an owned path that cannot be contained in any slot —
+      // buys a slower report of the same answer.
+      //
+      // The sentence names no source because there are two: the vendor's own
+      // `retryable` verdict, and this file's own proof that a refusal does not
+      // depend on the slot it happened in.
       if (!isRetryable(attempt.record.failure)) {
         this.#ports.log(
-          `slice ${sliceId} attempt ${index + 1}: not retrying a failure the worker reported as permanent`,
+          `slice ${sliceId} attempt ${index + 1}: not retrying a failure a second attempt cannot change`,
         );
         break;
       }
@@ -560,6 +565,13 @@ export class DefaultSliceRunner implements SliceRunner {
         failure: {
           kind: "WORKTREE_FAILED",
           message: `slice ${sliceId} attempt ${attempt}: ${contained.message}`,
+          // The refusal is about the slice's owned paths and the shape of the
+          // user's repository, and a retry changes neither: it moves to another
+          // path under the same parent, with the same owned paths and the same
+          // symbolic links. Without this marker the slice spends its second
+          // slot re-deriving this exact sentence with a different attempt
+          // number in it.
+          deterministic: true,
         },
       };
     }
@@ -1306,14 +1318,23 @@ function launchFailure(message: string): WorktreeOutcome {
  * cause is the operator's credentials or configuration, and no second model
  * changes either one.
  *
- * The other members stay retryable on purpose, and each for a reason that is
- * specific rather than optimistic. `ROUTING_FAILED` on attempt 1 is re-asked
+ * `WORKTREE_FAILED` is the one member that answers this question two different
+ * ways, which is what `SliceFailure.deterministic` exists to record. A worktree
+ * that could not be CREATED is retried into a DIFFERENT slot — a different path
+ * and a different branch — so the condition that caused it may simply not exist
+ * there, and it is retried. A refusal that `proveOwnedPathsContained` derived
+ * from the slice's owned paths and the repository's symbolic links carries the
+ * marker, because the next slot has the same owned paths and the same symbolic
+ * links: the second attempt is guaranteed to produce the identical refusal with
+ * a different attempt number in it, and the report would show a duplicate
+ * failure that reads like flakiness.
+ *
+ * The remaining members stay retryable on purpose, and each for a reason that
+ * is specific rather than optimistic. `ROUTING_FAILED` on attempt 1 is re-asked
  * with `escalated: true`, which is the only thing that unlocks `xhigh`, so the
- * second ask genuinely differs from the first. `WORKTREE_FAILED` is retried
- * into a DIFFERENT slot — a different path and a different branch — so the
- * condition that caused it may simply not exist there. `NO_CHANGES` and
- * `COMMIT_FAILED` describe a worker that did the wrong thing, which is the case
- * escalation exists for.
+ * second ask genuinely differs from the first. `NO_CHANGES` and `COMMIT_FAILED`
+ * describe a worker that did the wrong thing, which is the case escalation
+ * exists for.
  */
 function isRetryable(failure: SliceFailure | null): boolean {
   if (failure === null) {
@@ -1321,6 +1342,9 @@ function isRetryable(failure: SliceFailure | null): boolean {
   }
   if (failure.kind === "WORKER_FAILED") {
     return failure.failure.retryable;
+  }
+  if (failure.kind === "WORKTREE_FAILED") {
+    return failure.deterministic !== true;
   }
   return true;
 }
@@ -1343,7 +1367,17 @@ function appendNote(failure: SliceFailure, note: string): SliceFailure {
         rejected: failure.rejected,
       };
     case "WORKTREE_FAILED":
-      return { kind: "WORKTREE_FAILED", message };
+      // The marker is copied, not dropped. A cleanup note is appended AFTER the
+      // attempt has already failed, and losing the marker here would hand
+      // `isRetryable` a failure that looks retryable purely because tidying up
+      // also went wrong.
+      return {
+        kind: "WORKTREE_FAILED",
+        message,
+        ...(failure.deterministic === true
+          ? { deterministic: true as const }
+          : {}),
+      };
     case "WORKER_FAILED":
       return { kind: "WORKER_FAILED", message, failure: failure.failure };
     case "NO_CHANGES":

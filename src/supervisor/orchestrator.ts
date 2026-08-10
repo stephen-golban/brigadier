@@ -21,6 +21,8 @@
  *   6. reconcile                    — merge in a stable order, after everything
  *   7. remove surviving worktrees   — after reconcile, never before
  *   8. release the session's refs   — after every worktree is gone
+ *   9. remove the empty scaffold    — the two directories the worktrees hung
+ *                                     under, and only while they are empty
  *
  * Steps 1 through 3 are all "fail before creating anything". Step 6 is after
  * step 5 in its entirety rather than interleaved with it, because
@@ -31,7 +33,9 @@
  * mirror-image reason: `engine.merge()` opens with a registry lookup of the
  * worktree it is handed and rejects one that was already removed. Step 8 is
  * after step 7 because `engine.release()` refuses to retire refs while a
- * worktree created from the session is still active.
+ * worktree created from the session is still active. Step 9 is last because
+ * `<repo>-brigadier/<slug>` cannot be empty until every worktree beneath it has
+ * been removed, and it removes nothing that is not empty.
  *
  * INTERRUPTION DOES NOT GET ITS OWN PATH THROUGH THIS SEQUENCE, and that is the
  * design rather than an omission. An aborted `RunRequest.signal` stops the run
@@ -40,7 +44,7 @@
  * after that is the ordinary sequence: the slices that finished are still
  * merged, every worktree is still removed, and the refs are still released.
  * A cleanup that a Ctrl-C could skip would strand exactly the worktrees and
- * refs that a Ctrl-C is most likely to create, so steps 6 through 8 sit in a
+ * refs that a Ctrl-C is most likely to create, so steps 6 through 9 sit in a
  * `finally` and run on the interrupted path, the failed path, and the happy
  * path alike.
  *
@@ -52,6 +56,7 @@
  * That matches the convention every layer beneath this one already follows.
  */
 
+import { rmdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { BrigadierConfig } from "../config/contracts.js";
 import type { Capability, QuotaSnapshot, Slice } from "../contracts.js";
@@ -151,11 +156,7 @@ export function allocateAttemptSlots(
   if (!Number.isSafeInteger(sliceIndex) || sliceIndex < 0) {
     throw new RangeError("sliceIndex must be a non-negative safe integer");
   }
-  const root = join(
-    dirname(repositoryPath),
-    `${basename(repositoryPath)}-brigadier`,
-    slug,
-  );
+  const root = scaffoldDirectories(repositoryPath, slug).slugDirectory;
   const first = sliceIndex * ATTEMPT_LIMIT + 1;
   const second = first + 1;
   return [
@@ -167,6 +168,86 @@ export function allocateAttemptSlots(
 /** The first slot's number, which is what merge and cleanup order by. */
 function firstSliceNumber(sliceIndex: number): number {
   return sliceIndex * ATTEMPT_LIMIT + 1;
+}
+
+/**
+ * The two directories a run's worktree paths hang under, outermost first.
+ *
+ * Computed in ONE place and consumed by both the allocator above and the
+ * removal below, because the removal's whole safety story is that it is
+ * deleting a directory this file created. Two independent compositions of the
+ * same string would let a change to one silently point the other at a directory
+ * nobody here made.
+ */
+function scaffoldDirectories(
+  repositoryPath: string,
+  slug: string,
+): { readonly parent: string; readonly slugDirectory: string } {
+  const parent = join(
+    dirname(repositoryPath),
+    `${basename(repositoryPath)}-brigadier`,
+  );
+  return { parent, slugDirectory: join(parent, slug) };
+}
+
+/**
+ * Remove the scaffold directories this run's worktrees hung under, if and only
+ * if they are now empty. Returns what could not be tidied, never throws.
+ *
+ * WHY IT EXISTS. `allocateAttemptSlots` builds every worktree path as
+ * `<repo>-brigadier/<slug>/slice-N`. The engine removes the `slice-N`
+ * directories and has never owned the two above them, so every run — successful,
+ * failed, and interrupted alike — used to leave an empty `<repo>-brigadier/`
+ * and `<repo>-brigadier/<slug>/` sitting beside the user's repository forever.
+ *
+ * `rmdir` IS THE SAFETY PROPERTY, NOT AN IMPLEMENTATION DETAIL. It refuses a
+ * directory that is not empty, and that refusal is the entire guarantee that
+ * brigadier cannot delete a user's files by walking a path it computed: this
+ * function's argument is a string composed from `repositoryPath`, and if that
+ * string is ever wrong, the worst a wrong-but-empty directory costs is one
+ * removed empty directory. A recursive delete here would turn the same mistake
+ * into data loss, so THERE IS NO RECURSIVE DELETE IN THIS FILE and none may be
+ * added to it.
+ *
+ * ENOTEMPTY IS THE ORDINARY ANSWER, NOT A FAILURE. It means the user put
+ * something there, or a concurrent run for another slug still owns a directory
+ * inside the shared parent — the exact case the parent must survive. ENOENT is
+ * equally ordinary: `--unsafe-in-place` runs never create a scaffold at all,
+ * and a run that failed before its first worktree never created the slug
+ * directory. Anything else is reported the same way a failed `remove` is,
+ * beside the run's real outcome rather than in place of it.
+ *
+ * ORDER MATTERS. The slug directory is removed first, because the parent cannot
+ * become empty until it is gone; the parent is then attempted and will fail
+ * harmlessly whenever another slug is still living in it.
+ */
+async function removeEmptyScaffold(
+  repositoryPath: string,
+  slug: string,
+): Promise<readonly string[]> {
+  const directories = scaffoldDirectories(repositoryPath, slug);
+  const failures: string[] = [];
+  for (const directory of [directories.slugDirectory, directories.parent]) {
+    try {
+      await rmdir(directory);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === "ENOTEMPTY" || code === "ENOENT") {
+        continue;
+      }
+      failures.push(`scaffold ${directory}: ${errorMessage(error)}`);
+    }
+  }
+  return failures;
+}
+
+/** The `code` of a Node filesystem error, or null when it carries none. */
+function errorCode(error: unknown): string | null {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { readonly code: unknown }).code;
+    return typeof code === "string" ? code : null;
+  }
+  return null;
 }
 
 interface SlicePlan {
@@ -633,6 +714,24 @@ async function executeRun(
       await ports.engine.release(session);
     } catch (error) {
       const message = `release ${request.slug}: ${errorMessage(error)}`;
+      cleanupFailures.push(message);
+      ports.log(message);
+    }
+
+    /* ------------------- 9. remove the empty scaffold --------------------- */
+
+    // LAST, AND ONLY WHEN EMPTY. Every worktree under `<repo>-brigadier/<slug>`
+    // has to be gone before that directory can be, which is why this follows
+    // step 7 rather than sitting beside it; it follows step 8 as well only so
+    // that a `release` failure is reported before a scaffold one, in the order
+    // the run actually attempted them.
+    //
+    // `removeEmptyScaffold` never throws and never deletes recursively. A
+    // directory the user put something into is left exactly as it is.
+    for (const message of await removeEmptyScaffold(
+      request.repositoryPath,
+      request.slug,
+    )) {
       cleanupFailures.push(message);
       ports.log(message);
     }

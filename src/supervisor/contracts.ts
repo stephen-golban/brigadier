@@ -294,14 +294,18 @@ export type SliceFailureKind =
  * exists. Reading the retry as gate-driven would suggest a guarantee about
  * quality that nothing in this unit provides.
  *
- * Every member has a `message`, which is what a human reads. Two members carry
- * more, because two stages produce a structured explanation that a summary
- * string would destroy: routing returns the rejected-model list that answers
- * "what did it even look at", and a worker returns a normalized `WorkerFailure`
- * whose `kind` and `retryable` flag decide whether the earned escalation is
- * worth spending. The other three stages produce a git error and nothing more,
- * so they carry nothing more; a payload invented for symmetry would be a field
- * every caller has to check and no caller can trust.
+ * Every member has a `message`, which is what a human reads. Three members
+ * carry more, and each carries only what its own stage can actually produce.
+ * Routing returns the rejected-model list that answers "what did it even look
+ * at". A worker returns a normalized `WorkerFailure` whose `kind` and
+ * `retryable` flag decide whether the earned escalation is worth spending. The
+ * worktree stage returns an optional `deterministic` marker, because it is the
+ * one stage that produces two genuinely different failures — one that a
+ * different slot might survive and one that no slot can — and nothing outside
+ * that stage can tell them apart from the message. `NO_CHANGES` and
+ * `COMMIT_FAILED` produce a git error and nothing more, so they carry nothing
+ * more; a payload invented for symmetry would be a field every caller has to
+ * check and no caller can trust.
  */
 export type SliceFailure =
   | {
@@ -310,7 +314,34 @@ export type SliceFailure =
       readonly reason: RoutingFailureReason;
       readonly rejected: readonly RoutingRejection[];
     }
-  | { readonly kind: "WORKTREE_FAILED"; readonly message: string }
+  | {
+      readonly kind: "WORKTREE_FAILED";
+      readonly message: string;
+      /**
+       * Set when this refusal is a property of the PLAN AND THE REPOSITORY
+       * rather than of the slot it happened in, so a second attempt is known in
+       * advance to reach the identical answer.
+       *
+       * The distinction it draws is the whole reason it exists. A worktree that
+       * could not be CREATED is retried into a different slot — a different
+       * path and a different branch — and the condition that stopped it may
+       * simply not exist there, so it carries no marker. A containment refusal
+       * is decided by the slice's owned paths and by a symbolic link inside the
+       * user's repository; neither of those follows the slot, both of them
+       * follow the slice, and re-deriving the same refusal costs the slice its
+       * one escalation and puts a duplicate failure on the report that reads
+       * like flakiness.
+       *
+       * IT LIVES ON THIS ARM AND ONLY THIS ARM, and it is `true` or absent
+       * rather than `boolean`. Every other member's retry answer is already
+       * decided by something else — the vendor's own `retryable` verdict for
+       * `WORKER_FAILED`, the escalated re-ask for `ROUTING_FAILED` — so a
+       * marker reachable from them would be a field nothing reads and every
+       * reader has to wonder about. `false` is not spellable because "not
+       * deterministic" is the absence of a claim, not a claim of its own.
+       */
+      readonly deterministic?: true;
+    }
   | {
       readonly kind: "WORKER_FAILED";
       readonly message: string;

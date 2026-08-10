@@ -1116,7 +1116,7 @@ describe("DefaultSliceRunner retry policy", () => {
     });
     expect(
       harness.logs.includes(
-        "slice slice-auth attempt 1: not retrying a failure the worker reported as permanent",
+        "slice slice-auth attempt 1: not retrying a failure a second attempt cannot change",
       ),
     ).toBe(true);
   });
@@ -1253,6 +1253,137 @@ describe("DefaultSliceRunner retry policy", () => {
     expect(harness.routeRequests[1]?.excluded).toEqual([
       { vendor: "claude", model: "claude-opus-5" },
     ]);
+  });
+
+  /**
+   * THE TWO HALVES OF THE `WORKTREE_FAILED` RETRY RULE, ASSERTED TOGETHER.
+   *
+   * A containment refusal is decided by the plan's owned paths and by a symlink
+   * in the user's repository. Neither of those changes when the retry moves to
+   * a different slot, so the second attempt re-derives the identical refusal —
+   * one slot spent, one duplicate failure in the report that reads like
+   * flakiness. This half asserts exactly one attempt, one routing ask, and one
+   * worktree ever created.
+   *
+   * The next test is the other half, and it is why this one cannot be satisfied
+   * by simply making every `WORKTREE_FAILED` terminal: a worktree that could
+   * not be CREATED really may succeed in a different slot, because the slot is
+   * a different path and a different branch. A fix that kills that retry would
+   * pass the test above and regress the escalation.
+   */
+  test("a containment refusal ends the slice after exactly one attempt", async () => {
+    const world = await makeWorld();
+    const outside = join(world.root, "outside");
+    mkdirSync(outside, { recursive: true });
+    const engine = new FakeEngine();
+    // The real paths the refusal message names, captured while the worktree is
+    // still on disk: the refused attempt tears it down before `run` returns, and
+    // on macOS the temp root sits under `/var`, reached through a symlink.
+    const realWorktrees: string[] = [];
+    // Planted in EVERY worktree the engine creates, which is the condition the
+    // deterministic marker claims: the second slot is no cleaner than the first.
+    engine.onCreate = () => {
+      const spec = engine.creates[engine.creates.length - 1];
+      if (spec === undefined) {
+        throw new Error("onCreate fired with no recorded create");
+      }
+      const path = spec.path ?? spec.session.repositoryPath;
+      mkdirSync(join(path, "src"), { recursive: true });
+      if (!existsSync(join(path, "src", "link"))) {
+        symlinkSync(outside, join(path, "src", "link"));
+      }
+      realWorktrees.push(realpathSync(path));
+    };
+    const harness = makeHarness({ engine });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      // Two decisions on purpose: a second attempt is available and would
+      // route cleanly, so the assertion below is about the runner's choice.
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: { ...SLICE, ownedPaths: ["src/link/victim.ts"] },
+        directive: DIRECTIVE,
+        session: world.session,
+        // BOTH slots offered. Only the first may be spent.
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.attempts.length).toBe(1);
+    expect(harness.routeRequests.length).toBe(1);
+    expect(engine.creates.length).toBe(1);
+    expect(engine.creates[0]?.path).toBe(world.slots[0].worktreePath);
+    const realVictim = await realpath(outside);
+    expect(realWorktrees.length).toBe(1);
+    const realWorktree = realWorktrees[0];
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      deterministic: true,
+      message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/victim.ts": an existing path component is a symbolic link leading to ${join(realVictim, "victim.ts")}, outside worktree root ${realWorktree}`,
+    });
+    expect(harness.logs).toContain(
+      "slice slice-auth attempt 1: not retrying a failure a second attempt cannot change",
+    );
+  });
+
+  /** The other half: a creation failure is NOT deterministic and still retries. */
+  test("a worktree that could not be created still spends the second slot", async () => {
+    const world = await makeWorld();
+    const engine = new FakeEngine();
+    engine.createError = new Error(
+      "refusing to overwrite existing branch brigadier/wo-011/slice-7",
+    );
+    const harness = makeHarness({ engine });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.attempts.length).toBe(2);
+    expect(harness.routeRequests.length).toBe(2);
+    expect(engine.creates.length).toBe(2);
+    expect(engine.creates[0]?.path).toBe(world.slots[0].worktreePath);
+    expect(engine.creates[1]?.path).toBe(world.slots[1].worktreePath);
+    // No marker on either failure: nothing here proved the condition follows
+    // the slice into its next slot.
+    expect(attemptAt(result, 0).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      message: `could not create worktree for slice slice-auth attempt 1 at ${world.slots[0].worktreePath}: refusing to overwrite existing branch brigadier/wo-011/slice-7`,
+    });
+    expect(attemptAt(result, 1).failure).toEqual({
+      kind: "WORKTREE_FAILED",
+      message: `could not create worktree for slice slice-auth attempt 2 at ${world.slots[1].worktreePath}: refusing to overwrite existing branch brigadier/wo-011/slice-7`,
+    });
   });
 });
 
@@ -1562,6 +1693,7 @@ describe("DefaultSliceRunner worktree containment", () => {
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
+      deterministic: true,
       message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/victim.ts": an existing path component is a symbolic link leading to ${realVictim}, outside worktree root ${realWorktree}`,
     });
     // The refused attempt still tears its worktree down.
@@ -1769,6 +1901,7 @@ describe("DefaultSliceRunner worktree containment", () => {
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
+      deterministic: true,
       message: `slice slice-auth attempt 1: refusing to grant owned path "src/link.ts": the real path of ${ownedPath} could not be resolved: path component ${ownedPath} is a symbolic link to ${danglingTarget}, whose target could not be resolved`,
     });
     expect(harness.engine.removes.length).toBe(1);
@@ -1848,6 +1981,7 @@ describe("DefaultSliceRunner worktree containment", () => {
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
+      deterministic: true,
       message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/victim.ts": the real path of ${join(worktree, "src", "link", "victim.ts")} could not be resolved: path component ${linkPath} is a symbolic link to ${danglingTarget}, whose target could not be resolved`,
     });
     expect(harness.engine.removes.length).toBe(1);
@@ -2001,6 +2135,7 @@ describe("DefaultSliceRunner worktree containment", () => {
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
+      deterministic: true,
       message: `slice slice-auth attempt 1: refusing to grant owned path "/etc/hosts": it is absolute and does not belong to worktree root ${worktree}`,
     });
     expect(adapter.specs.length).toBe(0);
@@ -2097,6 +2232,7 @@ describe("DefaultSliceRunner worktree containment", () => {
     expect(result.ok).toBe(false);
     expect(attemptAt(result, 0).failure).toEqual({
       kind: "WORKTREE_FAILED",
+      deterministic: true,
       message: `slice slice-auth attempt 1: refusing to grant owned path "src/link/../victim.ts": it contains a ".." segment, which may leave worktree root ${worktree} through a symbolic link`,
     });
     // The refused attempt still tears its worktree down.

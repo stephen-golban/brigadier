@@ -17,7 +17,18 @@
  * which proves `withinBound` actually fires.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BrigadierConfig } from "../src/config/contracts.js";
 import { CONFIG_VERSION, parseConfig } from "../src/config/contracts.js";
 import type {
@@ -181,6 +192,12 @@ interface FakeEngineOptions {
   readonly removeThrows?: readonly string[];
   /** When set, `release` throws with this message. */
   readonly releaseThrows?: string;
+  /**
+   * Runs before `remove` decides whether to throw. The real engine deletes the
+   * worktree directory here, so a test that cares what is left on disk after a
+   * run needs the fake to do the same.
+   */
+  readonly onRemove?: (worktree: CreatedWorktree) => Promise<void>;
 }
 
 function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
@@ -225,6 +242,7 @@ function fakeEngine(options: FakeEngineOptions = {}): FakeEngine {
     redact: (_worktree: CreatedWorktree, artifact: string): string => artifact,
     remove: async (worktree: CreatedWorktree): Promise<void> => {
       ops.push(`remove ${worktree.branch}`);
+      await options.onRemove?.(worktree);
       if (options.removeThrows?.includes(worktree.branch) === true) {
         throw new Error(`remove exploded for ${worktree.branch}`);
       }
@@ -1908,5 +1926,216 @@ describe("cleanup failures", () => {
       fakeRunner(),
     );
     expect(harness.report.cleanupFailures).toEqual([]);
+  });
+});
+
+/* --------------------------- scaffold removal ---------------------------- */
+
+/**
+ * The two directories a run's worktree paths are built under.
+ *
+ * `allocateAttemptSlots` composes `<repo>-brigadier/<slug>/slice-N`, so every
+ * run creates two directories above the worktrees themselves. The engine
+ * removes each worktree and nothing removed those two, which left an empty
+ * `<repo>-brigadier/<slug>/` beside the user's repository after every run —
+ * successful, failed, and interrupted alike.
+ *
+ * THESE TESTS TOUCH A REAL FILESYSTEM ON PURPOSE. The claim is about what is on
+ * disk when the run returns, and every other test in this file runs against
+ * `/repo/demo`, a path that has never existed. A fake that recorded an intent to
+ * remove would prove the orchestrator meant to, which is exactly what the
+ * previous version of this file already proved about worktrees while the
+ * scaffold sat there.
+ */
+const scaffoldTemporaries: string[] = [];
+
+afterAll(async () => {
+  for (const directory of scaffoldTemporaries) {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+interface Scaffold {
+  /** The `mkdtemp` root. Nothing this suite writes lives outside it. */
+  readonly root: string;
+  readonly repositoryPath: string;
+  /** `<repo>-brigadier`, the directory shared by every slug. */
+  readonly parent: string;
+  /** `<repo>-brigadier/<slug>`, this run's own. */
+  readonly slugDirectory: string;
+  /** The worktree path the orchestrator will allocate for slice index 0. */
+  readonly firstWorktree: string;
+}
+
+async function makeScaffold(): Promise<Scaffold> {
+  const root = await mkdtemp(join(tmpdir(), "brigadier-scaffold-"));
+  scaffoldTemporaries.push(root);
+  const repositoryPath = join(root, "demo");
+  await mkdir(repositoryPath, { recursive: true });
+  const parent = join(root, "demo-brigadier");
+  const slugDirectory = join(parent, SLUG);
+  return {
+    root,
+    repositoryPath,
+    parent,
+    slugDirectory,
+    firstWorktree: join(slugDirectory, "slice-1"),
+  };
+}
+
+function scaffoldRequest(
+  scaffold: Scaffold,
+  slices: readonly Slice[],
+): RunRequest {
+  return {
+    document: planDocument(slices),
+    repositoryPath: scaffold.repositoryPath,
+    slug: SLUG,
+    maxWorkers: 1,
+  };
+}
+
+/** An engine whose `remove` really deletes the worktree, as the real one does. */
+function diskEngine(): FakeEngine {
+  return fakeEngine({
+    onRemove: async (worktree: CreatedWorktree): Promise<void> => {
+      await rm(worktree.path, { recursive: true, force: true });
+    },
+  });
+}
+
+describe("scaffold removal", () => {
+  test("an empty scaffold is gone from disk when the run returns", async () => {
+    const scaffold = await makeScaffold();
+    await mkdir(scaffold.firstWorktree, { recursive: true });
+
+    const harness = await execute(
+      scaffoldRequest(scaffold, [slice("a")]),
+      diskEngine(),
+      fakeRunner(),
+    );
+
+    expect(harness.report.ok).toBe(true);
+    expect(harness.report.cleanupFailures).toEqual([]);
+    expect(existsSync(scaffold.firstWorktree)).toBe(false);
+    expect(existsSync(scaffold.slugDirectory)).toBe(false);
+    expect(existsSync(scaffold.parent)).toBe(false);
+    // The exact remaining listing, not merely "the scaffold is absent": a
+    // removal that walked one directory too far would take `demo` with it.
+    expect((await readdir(scaffold.root)).sort()).toEqual(["demo"]);
+    expect((await readdir(scaffold.repositoryPath)).sort()).toEqual([]);
+  });
+
+  /**
+   * THE LOAD-BEARING HALF, AND THE REASON THE REMOVAL IS `rmdir` AND NEVER `rm
+   * -r`. `rmdir` fails with ENOTEMPTY when anything remains, and that failure IS
+   * the safety property: it is what guarantees brigadier cannot delete a user's
+   * files by walking a path it computed. A recursive delete would pass the test
+   * above and destroy the file below.
+   */
+  test("a scaffold directory holding anything else survives untouched", async () => {
+    const scaffold = await makeScaffold();
+    await mkdir(scaffold.firstWorktree, { recursive: true });
+    const bystander = join(scaffold.slugDirectory, "notes.txt");
+    await writeFile(bystander, "DO NOT DELETE ME\n");
+
+    const harness = await execute(
+      scaffoldRequest(scaffold, [slice("a")]),
+      diskEngine(),
+      fakeRunner(),
+    );
+
+    // Asserted first because it is the whole point: the file is there, byte for
+    // byte, and its directory is still standing.
+    expect(await readFile(bystander, "utf8")).toBe("DO NOT DELETE ME\n");
+    expect((await readdir(scaffold.slugDirectory)).sort()).toEqual([
+      "notes.txt",
+    ]);
+    expect((await readdir(scaffold.parent)).sort()).toEqual([SLUG]);
+    expect((await readdir(scaffold.root)).sort()).toEqual([
+      "demo",
+      "demo-brigadier",
+    ]);
+    // ENOTEMPTY is the expected answer here, not a failure to report.
+    expect(harness.report.cleanupFailures).toEqual([]);
+    expect(harness.report.ok).toBe(true);
+  });
+
+  test("the shared parent survives while another slug still owns a directory", async () => {
+    const scaffold = await makeScaffold();
+    await mkdir(scaffold.firstWorktree, { recursive: true });
+    const otherRun = join(scaffold.parent, "other-run");
+    await mkdir(join(otherRun, "slice-1"), { recursive: true });
+
+    const harness = await execute(
+      scaffoldRequest(scaffold, [slice("a")]),
+      diskEngine(),
+      fakeRunner(),
+    );
+
+    expect(existsSync(scaffold.slugDirectory)).toBe(false);
+    expect((await readdir(scaffold.parent)).sort()).toEqual(["other-run"]);
+    expect((await readdir(otherRun)).sort()).toEqual(["slice-1"]);
+    expect(harness.report.cleanupFailures).toEqual([]);
+  });
+
+  test("a failed run leaves no scaffold behind either", async () => {
+    const scaffold = await makeScaffold();
+    // A failing slice returns no worktree handle, so its own runner removed the
+    // directory; only the scaffold above it is left to deal with.
+    await mkdir(scaffold.slugDirectory, { recursive: true });
+
+    const harness = await execute(
+      scaffoldRequest(scaffold, [slice("a")]),
+      diskEngine(),
+      fakeRunner({ failing: ["a"] }),
+    );
+
+    expect(harness.report.ok).toBe(false);
+    expect(existsSync(scaffold.slugDirectory)).toBe(false);
+    expect(existsSync(scaffold.parent)).toBe(false);
+    expect((await readdir(scaffold.root)).sort()).toEqual(["demo"]);
+    expect(harness.report.cleanupFailures).toEqual([]);
+  });
+
+  test("an interrupted run leaves no scaffold behind either", async () => {
+    const scaffold = await makeScaffold();
+    await mkdir(scaffold.firstWorktree, { recursive: true });
+    const controller = new AbortController();
+
+    const harness = await execute(
+      {
+        ...scaffoldRequest(scaffold, [slice("a")]),
+        signal: controller.signal,
+      },
+      diskEngine(),
+      fakeRunner({
+        onStart: () => {
+          controller.abort(new Error("SIGINT"));
+        },
+      }),
+    );
+
+    expect(harness.report.interrupted).toBe(true);
+    expect(existsSync(scaffold.slugDirectory)).toBe(false);
+    expect(existsSync(scaffold.parent)).toBe(false);
+    expect((await readdir(scaffold.root)).sort()).toEqual(["demo"]);
+    expect(harness.report.cleanupFailures).toEqual([]);
+  });
+
+  /** `--unsafe-in-place` creates no scaffold at all; there is nothing to remove. */
+  test("a run that never created a scaffold reports nothing to clean up", async () => {
+    const scaffold = await makeScaffold();
+
+    const harness = await execute(
+      { ...scaffoldRequest(scaffold, [slice("a")]), unsafeInPlace: true },
+      diskEngine(),
+      fakeRunner(),
+    );
+
+    expect(harness.report.ok).toBe(true);
+    expect(harness.report.cleanupFailures).toEqual([]);
+    expect(existsSync(scaffold.parent)).toBe(false);
+    expect((await readdir(scaffold.root)).sort()).toEqual(["demo"]);
   });
 });
