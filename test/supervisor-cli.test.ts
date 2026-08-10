@@ -940,7 +940,7 @@ describe("brigadier run: the task positional", () => {
 
       expect(result.code).toBe(4);
       expect(result.stdout).toContain(
-        "\nbrigadier run: this task is ambiguous enough that planning it would mean guessing, so nothing was planned, nothing was created, and no worker was spawned.\n\nAnswer these and run it again:\n  1. Which parser?\n  2. Should the fix change the wire format?\n",
+        "\nbrigadier run: the planner model ran, but this task is ambiguous enough that producing a plan would mean guessing. No slice worker, worktree, ref, or commit was created.\n\nAnswer these and run it again:\n  1. Which parser?\n  2. Should the fix change the wire format?\n",
       );
       // The machine-readable last line the host-side skill re-invokes from.
       expect(result.stdout).toContain(
@@ -1002,6 +1002,74 @@ describe("brigadier run: the task positional", () => {
       expect(result.engine.created).toEqual([]);
       expect(result.runner?.inputs).toEqual([]);
       expect(await readdir(cwd)).toEqual(["plan.json"]);
+    });
+  });
+
+  test("redacts inventoried secrets from planner input and printed output", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const plannerSecret = "planner-path-secret-9c2f";
+      await writeFile(join(cwd, ".env"), `API_TOKEN=${plannerSecret}\n`);
+      const planWithSecret = {
+        id: "secret-plan",
+        goal: `keep ${plannerSecret} out of artifacts`,
+        slices: [
+          {
+            id: "s1",
+            title: "protect the planner path",
+            prompt: `remove ${plannerSecret} from planner output`,
+            ownedPaths: ["src/planner-path.ts"],
+            difficulty: "hard",
+          },
+        ],
+      };
+      const planner = new RecordingPlanner({
+        kind: "planned",
+        document: parsePlanDocument(planWithSecret),
+        json: JSON.stringify(planWithSecret, null, 2),
+        planner: {
+          vendor: "claude",
+          model: "claude-opus-5",
+          effort: "high",
+        },
+      });
+      const result = await invoke({
+        argv: ["run", "--dry-run", `fix ${plannerSecret}`],
+        cwd,
+        scratchHome,
+        planner,
+        config: { ...CONFIG, linkedSecretPaths: [".env"] },
+      });
+
+      expect(result.code).toBe(0);
+      expect(planner.requests[0]?.task).toBe("fix [REDACTED]");
+      expect(result.stdout.indexOf(plannerSecret)).toBe(-1);
+
+      const plannedPrefix =
+        "\nplanned by claude/claude-opus-5 at high effort:\n";
+      const plannedStart = result.stdout.indexOf(plannedPrefix);
+      const plannedEnd = result.stdout.indexOf("\nrun secret-plan:");
+      expect(plannedStart).toBeGreaterThanOrEqual(0);
+      expect(plannedEnd).toBeGreaterThan(plannedStart);
+      expect(result.stdout.slice(plannedStart, plannedEnd + 1)).toBe(
+        `${plannedPrefix}${JSON.stringify(
+          {
+            ...planWithSecret,
+            goal: "keep [REDACTED] out of artifacts",
+            slices: [
+              {
+                ...planWithSecret.slices[0],
+                prompt: "remove [REDACTED] from planner output",
+              },
+            ],
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      expect(result.engine.prepared).toEqual([]);
+      expect(result.engine.created).toEqual([]);
+      expect(result.runner?.inputs).toEqual([]);
+      expect((await readdir(cwd)).sort()).toEqual([".env", "plan.json"]);
     });
   });
 
@@ -1189,7 +1257,7 @@ describe("brigadier: the install and mcp subcommands", () => {
         '  brigadier run "<task description>"   plan the task, then run the plan\n  brigadier run --plan <file>          run a plan that already exists\n',
       );
       expect(result.stdout).toContain(
-        "  4  the task was too ambiguous to plan, so brigadier refused to guess. It\n     spawned nothing and created nothing, and printed the questions it needs\n     answered. This is not a failed run: answer them and run it again\n",
+        "  4  the planner model ran but found the task too ambiguous to plan, so\n     brigadier refused to guess and printed the questions it needs answered.\n     No slice worker, worktree, ref, or commit was created. This is not a\n     failed slice run: answer the questions and run it again\n",
       );
     });
   });

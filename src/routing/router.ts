@@ -17,10 +17,11 @@
  * - Difficulty sets a *floor*, and the winner is the **lowest** scorer above
  *   it. Ranking without that inversion would route every slice to the best
  *   model on the machine and make the "cost" stage decorative.
- * - `xhigh` is unreachable unless the slice already failed a gate (decisions
- *   #9/#20). Effort is clamped downward only, from a base that can be `xhigh`
- *   solely on an escalated request, and `assertEffortEarned` re-checks the
- *   result rather than trusting the arithmetic.
+ * - `xhigh` is unreachable unless a routed model already ran this slice and
+ *   failed (decisions #9/#20). Effort is clamped downward only, from a base
+ *   that can be `xhigh` solely on an escalated request, and
+ *   `assertEffortEarned` re-checks the result rather than trusting the
+ *   arithmetic. A routing failure, where no model ran, does not escalate.
  * - Quota is resolved **per model, not per vendor** (WO-010B). A CLI account
  *   meters some limits account-wide and others per model tier — a drained
  *   `seven_day_opus` bucket says nothing about Sonnet — so each pooled model
@@ -430,7 +431,7 @@ function excludeModels(
       vendor: entry.vendor,
       model: entry.model,
       stage: "excluded",
-      reason: `${describe(entry)} already ran this slice and failed its gate`,
+      reason: `${describe(entry)} already ran this slice and failed`,
     });
   }
   return survivors;
@@ -985,8 +986,9 @@ function validateRequirements(requires: SliceRequirements | undefined): void {
 
 /**
  * Decisions #9/#20 in one function. `xhigh` is reachable only through
- * `escalated`, which the supervisor sets after a slice has failed its gate —
- * never from difficulty, however hard the planner judged the work.
+ * `escalated`, which the supervisor sets after a routed model runs the slice
+ * and fails — never after a routing failure and never from difficulty, however
+ * hard the planner judged the work.
  */
 function baseEffort(request: RoutingRequest): Effort {
   if (request.escalated === true) {
@@ -1046,7 +1048,7 @@ function resolveEffort(
 function assertEffortEarned(effort: Effort, request: RoutingRequest): void {
   if (effort === "xhigh" && request.escalated !== true) {
     throw new Error(
-      `routing invariant violated: xhigh was selected for slice ${JSON.stringify(request.slice.id)}, which has not failed a gate`,
+      `routing invariant violated: xhigh was selected for slice ${JSON.stringify(request.slice.id)} without evidence that a routed model already ran it and failed`,
     );
   }
 }
@@ -1123,7 +1125,7 @@ function describeEffortLine(
   const base = baseEffort(request);
   const origin =
     request.escalated === true
-      ? "escalation after a failed gate"
+      ? "escalation after a routed model ran the slice and failed"
       : `${request.difficulty} difficulty`;
   const clamped =
     clamps.length === 0

@@ -152,6 +152,43 @@ interface WorktreeState {
   readonly indexKey: string | null;
 }
 
+/** Read-only inputs for building a redactor before a worktree session exists. */
+export interface SecretRedactorSpec {
+  readonly repositoryPath: string;
+  readonly linkedSecretPaths: readonly string[];
+  readonly redactionValues?: readonly string[];
+  /** Test seam for proving that every search advances and work stays counted. */
+  readonly onScan?: () => void;
+}
+
+/** Redacts inventoried exact values from one artifact. */
+export type SecretRedactor = (artifact: string) => string;
+
+/**
+ * Builds the inventory-backed redactor without preparing a session.
+ *
+ * This performs reads only: it runs no Git command and creates no ref, commit,
+ * worktree, or directory. It deliberately covers verbatim values only. A value
+ * transformed, summarized, truncated, derived, or re-encoded by a model is not
+ * the same byte sequence and remains outside this guarantee.
+ */
+export async function createSecretRedactor(
+  spec: SecretRedactorSpec,
+): Promise<SecretRedactor> {
+  const repositoryPath = await realpath(resolve(spec.repositoryPath));
+  const linkedSecretPaths = normalizeUniquePaths(
+    spec.linkedSecretPaths,
+    "linked secret",
+  );
+  const redactionValues = await collectRedactionValues(
+    repositoryPath,
+    linkedSecretPaths,
+    spec.redactionValues ?? [],
+  );
+  return (artifact: string): string =>
+    redactText(artifact, redactionValues, spec.onScan);
+}
+
 export class LinkedSecretCommitError extends Error {
   readonly paths: readonly string[];
 
