@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import type { BrigadierConfig } from "../src/config/index.ts";
 import type { AnyWorker, TokenUsage } from "../src/contracts.ts";
+import { validatePlan } from "../src/plan/index.ts";
 import type { PlannerOutcome } from "../src/planner/index.ts";
 import { createModelPlanner } from "../src/planner/index.ts";
 import { planPrompt } from "../src/planner/planner.ts";
 import { parsePlannerReply } from "../src/planner/reply.ts";
-import type { OneShotRequest, OneShotResult } from "../src/supervisor/index.ts";
+import {
+  type OneShotRequest,
+  type OneShotResult,
+  parsePlanDocument,
+} from "../src/supervisor/index.ts";
 
 /**
  * A worker adapter that fails the test if anything tries to launch it.
@@ -127,6 +132,41 @@ const TWO_SLICE_PLAN = {
     ],
   },
 };
+
+const DEPENDENT_PLAN = {
+  status: "plan",
+  plan: {
+    id: "dependent-demo",
+    goal: "prove dependency output survives every plan boundary",
+    slices: [
+      {
+        id: "producer",
+        title: "produce the helper",
+        prompt: "write the helper",
+        ownedPaths: ["src/helper.ts"],
+        difficulty: "standard",
+      },
+      {
+        id: "consumer",
+        title: "consume the helper",
+        prompt: "use the helper output",
+        ownedPaths: ["src/consumer.ts"],
+        dependsOn: ["producer"],
+        difficulty: "standard",
+      },
+    ],
+  },
+};
+
+const DEPENDENCY_GUIDANCE = [
+  "- Use `dependsOn` only when a slice genuinely needs another slice's committed",
+  "  output. List the prerequisite slice ids; that slice will start only after all",
+  "  of them commit and their output has been accumulated.",
+  "- Prefer independent slices whenever possible because they run concurrently.",
+  "  Every dependency serializes work. Dependencies do not permit overlapping",
+  "  `ownedPaths`; every dependency id must name another slice, and dependencies",
+  "  must not form a cycle.",
+].join("\n");
 
 async function planWith(
   prompt: ScriptedPrompt,
@@ -349,6 +389,36 @@ describe("createModelPlanner", () => {
     expect(outcome.document.plan.slices).toHaveLength(2);
   });
 
+  test("preserves a prompted dependency through parsing, plan-file round trip, and validation", async () => {
+    const prompt = new ScriptedPrompt(replied(JSON.stringify(DEPENDENT_PLAN)));
+    const outcome = await planWith(prompt, 2);
+
+    expect(prompt.requests[0]?.prompt).toContain(DEPENDENCY_GUIDANCE);
+    if (outcome.kind !== "planned") {
+      throw new Error(`expected planned, got ${outcome.kind}`);
+    }
+    expect(
+      outcome.document.plan.slices.map((slice) => ({
+        id: slice.id,
+        dependsOn: [...slice.dependsOn],
+      })),
+    ).toEqual([
+      { id: "producer", dependsOn: [] },
+      { id: "consumer", dependsOn: ["producer"] },
+    ]);
+
+    const reparsed = parsePlanDocument(JSON.parse(outcome.json));
+    expect(reparsed.plan.slices[1]?.dependsOn).toEqual(["producer"]);
+    expect(validatePlan(reparsed.plan)).toEqual({
+      ok: true,
+      waves: [["producer"], ["consumer"]],
+      normalizedPaths: new Map([
+        ["producer", ["src/helper.ts"]],
+        ["consumer", ["src/consumer.ts"]],
+      ]),
+    });
+  });
+
   test("passes a needs_human reply through as the first-class outcome", async () => {
     const prompt = new ScriptedPrompt(
       replied('{"status":"needs_human","questions":["Which parser?"]}'),
@@ -500,6 +570,11 @@ describe("planPrompt", () => {
     expect(prompt).toContain("return ONE unless the work genuinely splits");
   });
 
+  test("states the exact dependency contract and its concurrency cost", () => {
+    const prompt = planPrompt({ task: "t", cwd: "/repo", maxSlices: 4 });
+    expect(prompt).toContain(DEPENDENCY_GUIDANCE);
+  });
+
   /**
    * Every rule below is one `validatePlan` or `parsePlanDocument` enforces. A
    * rule the model is never told is a rule it breaks, and a broken rule costs a
@@ -511,7 +586,8 @@ describe("planPrompt", () => {
       "Paths must be literal. No `*`, `?`, or `[`",
       "No absolute paths, no `..` segments, no backslashes",
       "No two slices may claim the same path",
-      "Do NOT use `dependsOn`",
+      "every dependency id must name another slice",
+      "must not form a cycle",
       "`routine`, `standard`, or `hard`",
     ]) {
       expect(prompt).toContain(rule);

@@ -334,10 +334,11 @@ function cappedEffort(ceiling: Effort | undefined): Effort {
  * is stated as a hard cap AND as a default of one, because a model told only
  * "at most 4" reliably returns 4.
  *
- * IT FORBIDS `dependsOn` OUTRIGHT, because `validatePlan` rejects any plan that
- * uses it — a dependent slice would not see its prerequisite's output, so the
- * feature does not exist. A planner that emits it produces a plan that cannot
- * run, and the failure would look like brigadier's rather than the planner's.
+ * IT RESERVES `dependsOn` FOR REAL CONTENT DEPENDENCIES. A dependent slice
+ * starts only after its prerequisites commit and their output is accumulated,
+ * which makes the relationship real but serializes work that could otherwise
+ * run concurrently. The prompt also teaches the graph rules `validatePlan`
+ * enforces and makes clear that dependencies never relax exclusive ownership.
  *
  * IT ASKS FOR ONE JSON OBJECT LAST, for the reason the review gate does: parsing
  * prose to decide whether a paragraph was a plan or a question is worse than
@@ -388,9 +389,13 @@ export function planPrompt(request: PlannerRequest): string {
     "  characters `(`, `)`, `,`, `\"`, or `'`.",
     "- No two slices may claim the same path, and no slice's path may be inside",
     "  a directory another slice claims. Overlapping ownership is rejected.",
-    "- Do NOT use `dependsOn`. Slices run independently and a slice cannot see",
-    "  another slice's output, so any plan using it is rejected. If the work has",
-    "  a real ordering dependency, return one slice that does the whole thing.",
+    "- Use `dependsOn` only when a slice genuinely needs another slice's committed",
+    "  output. List the prerequisite slice ids; that slice will start only after all",
+    "  of them commit and their output has been accumulated.",
+    "- Prefer independent slices whenever possible because they run concurrently.",
+    "  Every dependency serializes work. Dependencies do not permit overlapping",
+    "  `ownedPaths`; every dependency id must name another slice, and dependencies",
+    "  must not form a cycle.",
     "- `difficulty` is required on every slice and is exactly one of",
     "  `routine`, `standard`, or `hard`. It decides how capable a model must be",
     "  to be allowed to run the slice, so answer honestly.",
