@@ -197,10 +197,14 @@ export interface UncommittedDiff {
  * Git-backed isolation and integration. Implementations never push and only
  * write commits to the `brigadier/<slug>/**` refs they create.
  *
- * Redaction replaces inventoried exact, verbatim secret values. Inventory is
- * best-effort; it cannot detect encoded, transformed, truncated, derived, or
- * values hidden in unsupported file syntax. Supply explicit redactionValues
- * for values that cannot be inventoried reliably.
+ * Redaction replaces inventoried exact, verbatim secret values. It also catches
+ * the same complete multiline value when a unified diff has inserted its
+ * one-character content prefix after each internal newline. It does not redact
+ * component lines independently, or detect encoded, transformed, truncated,
+ * derived, or values hidden in unsupported file syntax. Values made only of
+ * line breaks are ignored because they are indistinguishable from artifact
+ * structure. Supply explicit redactionValues for values that cannot be
+ * inventoried reliably.
  */
 export interface WorktreeEngine {
   prepare(spec: WorktreeSessionSpec): Promise<WorktreeSession>;

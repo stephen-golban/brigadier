@@ -11,6 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { redactText } from "../src/worktree/engine.ts";
 import {
   type CreatedWorktree,
   GitWorktreeEngine,
@@ -23,6 +24,11 @@ const SECRET = "literal-super-secret-value";
 const ROTATED_JSON_SECRET = "rotated-json-secret-value";
 const ROTATED_YAML_SECRET = "rotated-yaml-secret-value";
 const MULTILINE_SECRET = "multiline-secret-first\nmultiline-secret-second";
+const PEM_SECRET = [
+  "-----BEGIN PRIVATE KEY-----",
+  "c2VjcmV0LWJ5dGVz",
+  "-----END PRIVATE KEY-----",
+].join("\n");
 const scratchParent = resolve(import.meta.dir, "../src/worktree");
 
 interface Fixture {
@@ -450,6 +456,105 @@ describe("GitWorktreeEngine", () => {
     },
     TEST_TIMEOUT_MS,
   );
+
+  test(
+    "redacts a rotated multiline dotenv secret split across deleted diff lines",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "multiline-diff-redaction",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+
+        // The first slice commit predates the secret inventory. This creates
+        // the real historical shape under review: the later deletion reads the
+        // old bytes from its parent, after the linked file identifies them.
+        await writeFile(join(worktree.path, "pem.txt"), `${PEM_SECRET}\n`);
+        const containingCommit = await fixture.engine.commit({
+          worktree,
+          message: "fixture commit containing the future secret",
+        });
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            `${containingCommit.commit}:pem.txt`,
+          ]),
+        ).toBe(`${PEM_SECRET}\n`);
+
+        const linkedSecretFile = `PEM_PRIVATE_KEY="${PEM_SECRET}"\n`;
+        await writeFile(join(fixture.repository, ".env"), linkedSecretFile);
+        expect(await readFile(join(fixture.repository, ".env"), "utf8")).toBe(
+          linkedSecretFile,
+        );
+        await rm(join(worktree.path, "pem.txt"));
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+        const expectedPatch = [
+          "diff --git a/pem.txt b/pem.txt",
+          "deleted file mode 100644",
+          "--- a/pem.txt",
+          "+++ /dev/null",
+          "@@ -1,3 +0,0 @@",
+          "-[REDACTED]",
+          "",
+        ].join("\n");
+        expect(diff.patch.indexOf(PEM_SECRET)).toBe(-1);
+        expect(diff.patch).toBe(expectedPatch);
+
+        const stdout = fixture.engine.redact(
+          worktree,
+          `stdout=${PEM_SECRET}\n`,
+        );
+        expect(stdout.indexOf(PEM_SECRET)).toBe(-1);
+        expect(stdout).toBe("stdout=[REDACTED]\n");
+
+        const deletion = await fixture.engine.commit({
+          worktree,
+          message: `deleted ${PEM_SECRET}`,
+        });
+        expect(deletion.message).toBe("deleted [REDACTED]");
+        expect(
+          await gitText(fixture.repository, [
+            "show",
+            "-s",
+            "--format=%s",
+            deletion.commit,
+          ]),
+        ).toBe("deleted [REDACTED]\n");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test("bounds multiline redaction work by counted scan operations", () => {
+    let operations = 0;
+    const countOperation = () => {
+      operations += 1;
+      if (operations > 16) {
+        throw new Error("redaction exceeded 16 scan operations");
+      }
+    };
+
+    expect(
+      redactText("unchanged", ["", "\n", "\n\n", "missing"], countOperation),
+    ).toBe("unchanged");
+    expect(operations).toBe(1);
+
+    operations = 0;
+    expect(
+      redactText(
+        ["before", "-unique-line", "+", " -----END", "after"].join("\n"),
+        ["unique-line\n\n-----END"],
+        countOperation,
+      ),
+    ).toBe(["before", "-[REDACTED]", "after"].join("\n"));
+    expect(operations).toBe(5);
+  });
 
   test(
     "captures an advanced submodule pointer in the scratch base commit",
