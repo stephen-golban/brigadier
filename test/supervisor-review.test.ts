@@ -38,6 +38,10 @@ import {
 import type { LaunchEnv } from "../src/supervisor/slice.js";
 import { buildClaudeCommand } from "../src/worker/claude.js";
 import { buildCodexCommand } from "../src/worker/codex.js";
+import type {
+  UncommittedDiff,
+  UncommittedDiffSpec,
+} from "../src/worktree/contracts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -246,6 +250,52 @@ function fakeAdapter<V extends Vendor>(
   };
 }
 
+/**
+ * A `WorktreeEngine` that answers `diffUncommitted` and nothing else.
+ *
+ * `diff` is what the engine returns; a thrown value is what it rejects with;
+ * `null` models an engine that does not implement the method at all, which is
+ * the shape of every other fake `WorktreeEngine` in this suite and of any
+ * consumer-supplied one.
+ */
+interface FakeEngine {
+  readonly engine: SupervisorPorts["engine"];
+  readonly specs: readonly UncommittedDiffSpec[];
+}
+
+function fakeEngine(answer: UncommittedDiff | Error | null): FakeEngine {
+  const specs: UncommittedDiffSpec[] = [];
+  if (answer === null) {
+    return { engine: {} as SupervisorPorts["engine"], specs };
+  }
+  return {
+    specs,
+    engine: {
+      diffUncommitted: async (spec: UncommittedDiffSpec) => {
+        specs.push(spec);
+        if (answer instanceof Error) {
+          throw answer;
+        }
+        return answer;
+      },
+    } as unknown as SupervisorPorts["engine"],
+  };
+}
+
+function plainDiff(patch: string): UncommittedDiff {
+  return { patch, truncated: false, totalCharacters: patch.length };
+}
+
+const DEFAULT_PATCH = [
+  "diff --git a/src/auth.ts b/src/auth.ts",
+  "--- a/src/auth.ts",
+  "+++ b/src/auth.ts",
+  "@@ -1 +1 @@",
+  "-export const verified = false;",
+  "+export const verified = true;",
+  "",
+].join("\n");
+
 interface Harness {
   readonly ports: SupervisorPorts;
   readonly logs: readonly string[];
@@ -253,6 +303,9 @@ interface Harness {
 
 function makeHarness(
   workers: Partial<Record<Vendor, FakeAdapter>>,
+  engine: SupervisorPorts["engine"] = fakeEngine(
+    plainDiff(DEFAULT_PATCH),
+  ).engine,
   clockStep = 5,
 ): Harness {
   const logs: string[] = [];
@@ -260,7 +313,7 @@ function makeHarness(
   return {
     logs,
     ports: {
-      engine: {} as SupervisorPorts["engine"],
+      engine,
       workerFor: (vendor) => workers[vendor]?.worker ?? null,
       oracles: [],
       now: () => {
@@ -687,8 +740,9 @@ describe("createCrossVendorReviewer", () => {
     config: BrigadierConfig,
     builder: RoutedWorker,
     workers: Partial<Record<Vendor, FakeAdapter>>,
+    engine?: SupervisorPorts["engine"],
   ): Promise<{ readonly review: SliceReview; readonly harness: Harness }> {
-    const harness = makeHarness(workers);
+    const harness = makeHarness(workers, engine);
     const reviewer = createCrossVendorReviewer({
       ports: harness.ports,
       env: ENV,
@@ -904,5 +958,205 @@ describe("createCrossVendorReviewer", () => {
 
     expect(codex.specs[0]?.cwd).toBe("/tmp/brigadier/slice-7");
     expect(codex.specs[0]?.sandbox.filesystem.editablePaths).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // The change, and the scope of the verdict on it
+  // -------------------------------------------------------------------------
+
+  test("the prompt carries the diff of the change and asks for the diff of this worktree", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+
+    await review(BOTH_VENDORS, CLAUDE_BUILDER, { codex }, engine.engine);
+
+    // The diff is asked for by the path the gate was handed, under the gate's
+    // own bound — not the engine's, and not an unbounded read.
+    expect(engine.specs).toEqual([
+      { worktreePath: "/tmp/brigadier/slice-7", maxCharacters: 98304 },
+    ]);
+    const prompt = codex.specs[0]?.prompt ?? "";
+    expect(prompt).toContain(
+      [
+        "# The change they made",
+        "",
+        "The unified diff below is exactly what will be committed if you approve",
+        "it. Nothing outside it is part of this change.",
+        "",
+        "```diff",
+        DEFAULT_PATCH,
+        "```",
+      ].join("\n"),
+    );
+  });
+
+  test("the prompt states the scope rule: depended-on code counts, everything else is a concern", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+
+    await review(BOTH_VENDORS, CLAUDE_BUILDER, { codex });
+
+    // THE POLICY IS BRIGADIER'S, NOT THE REVIEWER'S. Left unstated, the two
+    // vendors invented different answers to "may I report a defect in code this
+    // task did not write" — which is how three planted defects passed a gate
+    // that had correctly rejected a defect the builder itself authored.
+    const prompt = codex.specs[0]?.prompt ?? "";
+    expect(prompt).toContain(
+      [
+        "Code this diff does not touch is in scope only when the changed code",
+        "depends on it — calls it, reads its result, or extends it — so that this",
+        "change itself misbehaves when it runs. Grade that like any other defect.",
+      ].join("\n"),
+    );
+    expect(prompt).toContain(
+      [
+        "Anything else you notice in code this task did not change is outside this",
+        'verdict, however wrong it looks. Report it with severity "concern" so a',
+        'human sees it, and never with severity "blocking": this task was not asked',
+        "to fix it, those lines may belong to another task, and re-running this",
+        "task would produce the same diff and meet the same objection.",
+      ].join("\n"),
+    );
+  });
+
+  test("a diff containing a code fence is fenced with a longer one", async () => {
+    // A slice that edits markdown produces a patch full of ``` lines. Wrapped
+    // in three backticks, the block ends at the first of them and the rest of
+    // the change reads as prose — with the reviewer's instructions inside it.
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const patch = ["+```ts", "+const a = 1;", "+```", ""].join("\n");
+
+    await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine(plainDiff(patch)).engine,
+    );
+
+    expect(codex.specs[0]?.prompt ?? "").toContain(
+      ["````diff", patch, "````"].join("\n"),
+    );
+  });
+
+  test("an empty change is named as one rather than shown as an empty diff", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+
+    await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine(plainDiff("")).engine,
+    );
+
+    expect(codex.specs[0]?.prompt ?? "").toContain(
+      [
+        "This task changed no file at all: the diff of its work is empty, so",
+        "there is nothing here that would be committed.",
+      ].join("\n"),
+    );
+  });
+
+  test("a truncated diff is announced to the reviewer and on the run log", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    // The notice the engine puts inside the patch, reproduced here as the
+    // engine produces it: a truncated diff must arrive already self-describing.
+    const patch = `${DEFAULT_PATCH}[brigadier: this diff was truncated; 176 of 900 characters shown]\n`;
+
+    const { harness } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine({ patch, truncated: true, totalCharacters: 900 }).engine,
+    );
+
+    expect(codex.specs[0]?.prompt ?? "").toContain(
+      "[brigadier: this diff was truncated; 176 of 900 characters shown]",
+    );
+    expect(harness.logs).toContain(
+      "slice slice-auth attempt 1: the diff shown to the reviewer was truncated to 98304 of 900 characters",
+    );
+  });
+
+  test("an engine that cannot diff degrades visibly rather than silently", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+
+    const { review: verdict, harness } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine(null).engine,
+    );
+
+    // FAIL-OPEN, BUT NEVER SILENTLY. The gate still runs — a missing diff must
+    // not turn every `--unsafe-in-place` run into an unreviewed commit — and
+    // both the reviewer and the operator are told the review is the weaker one.
+    expect(verdict.verdict).toBe("approved");
+    expect(harness.logs).toContain(
+      "slice slice-auth attempt 1: no diff of the change is available (this run's worktree engine cannot produce one), so the reviewer is reading whole files instead",
+    );
+    const prompt = codex.specs[0]?.prompt ?? "";
+    expect(prompt).toContain(
+      [
+        "No diff of this change could be produced (this run's worktree engine cannot produce one), so it is not",
+        "shown here. Read the files listed above in the current directory and judge",
+        "their current contents instead.",
+      ].join("\n"),
+    );
+    expect(prompt).toContain(
+      [
+        'You cannot see which lines this task wrote, so use severity "blocking"',
+        "only for code the task above asked for. Anything that looks pre-existing",
+        'belongs under severity "concern".',
+      ].join("\n"),
+    );
+  });
+
+  test("an engine that refuses to diff reports its own reason", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+
+    const { harness } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine(
+        new Error(
+          "no isolated worktree created by this engine is registered at /tmp/brigadier/slice-7",
+        ),
+      ).engine,
+    );
+
+    expect(harness.logs).toContain(
+      "slice slice-auth attempt 1: no diff of the change is available (no isolated worktree created by this engine is registered at /tmp/brigadier/slice-7), so the reviewer is reading whole files instead",
+    );
+  });
+
+  test("no diff is computed for a slice the gate is going to skip", async () => {
+    // A single-vendor install spawns no reviewer, and computing a diff for a
+    // review that cannot happen would charge every slice of that install for a
+    // git staging pass nobody reads.
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+
+    const { review: verdict } = await review(
+      CLAUDE_ONLY,
+      CLAUDE_BUILDER,
+      {},
+      engine.engine,
+    );
+
+    expect(verdict.verdict).toBe("skipped");
+    expect(engine.specs).toEqual([]);
   });
 });

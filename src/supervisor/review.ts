@@ -30,21 +30,81 @@
  *      `escalated: true`. Pre-commit rejection reaches all of that for free;
  *      post-commit rejection would need a parallel unwind of each step.
  *
- * WHAT IT COSTS, STATED PLAINLY. Before the commit there is no diff and the
- * engine offers no way to compute one: `commit` is what turns the working tree
- * into an object a `git diff` could name. So the reviewer is pointed at the
- * slice's OWNED PATHS in the live worktree and reads their post-state. That is
- * not the same artifact as a diff — it cannot see what a line USED to say — and
- * for a slice that edits a large existing file the reviewer reads the whole
- * file rather than the changed hunk. It is accepted because the alternative was
- * spawning `git` from the slice runner, whose one filesystem access is a
- * read-only `realpath` and whose isolation story depends on staying that way.
+ * THE REVIEWER IS SHOWN THE CHANGE, NOT THE FILES. This is the thing the first
+ * shipped version of the gate got wrong, and the failure was measured rather
+ * than theorised: driven against the compiled binary, the gate correctly
+ * rejected a defect a builder had just written, and let through three separate
+ * defects planted in pre-existing code — one of them an inverted condition
+ * contradicting a doc comment one line above it. The Claude reviewer that did
+ * notice one graded it a non-blocking concern and said exactly why: "this is
+ * pre-existing code unrelated to the task". The reviewers were not failing.
+ * They were scoping their review to the deliverable, and they could not see
+ * what the deliverable was, because they were handed the post-state of the
+ * slice's owned paths and had to guess which parts were new.
  *
- * A SECOND COST: this runs before `engine.commit` can discover that the worker
+ * `WorktreeEngine.diffUncommitted` closed that gap. It produces the uncommitted
+ * change in the worker's worktree as a unified diff, through the identical
+ * sanitizing pipeline `commit` runs, so what the reviewer reads is what the
+ * commit will record rather than an approximation of it — and its objects are
+ * written to a temporary store, so a rejected slice leaves nothing behind.
+ *
+ * THE SCOPE POLICY, DECIDED HERE RATHER THAN LEFT TO THE REVIEWER. With no diff
+ * each vendor invented its own answer to "may I report a defect in code this
+ * task did not write", and the two invented different ones. The prompt below
+ * now states it: judge the lines the diff adds or changes, treat a pre-existing
+ * defect the change DEPENDS ON as in scope, and grade everything else in those
+ * files as a `concern` at most, never as blocking.
+ *
+ * The middle rung is there because "the new code calls a broken helper" is a
+ * defect IN the change: it will misbehave when it runs, and the builder could
+ * have fixed it. The outer rung is capped at `concern` for a reason that is
+ * mechanical rather than philosophical: a rejection costs the slice its single
+ * escalation and re-runs the SAME slice prompt on another model, which will
+ * produce the same diff and meet the same objection — and the offending code
+ * may not even be inside the slice's owned paths, so no attempt of this slice
+ * is permitted to fix it. Blocking there converts a correct slice into a failed
+ * one and buys nothing. Reported as a concern it still reaches the run report,
+ * where a human can act on it.
+ *
+ * THE MIDDLE RUNG HAS A MEASURED COST, AND IT IS NOT THE OUTER RUNG'S. Driven
+ * against the compiled binary on a slice whose new function was asked to call
+ * an existing helper with an inverted condition — and forbidden to modify that
+ * helper — BOTH vendors blocked, in both directions: claude/claude-opus-5
+ * rejected codex/gpt-5.6-terra's attempt ("the fix must land in billableTotal,
+ * which this task was forbidden to modify"), the retry re-routed to
+ * claude/claude-sonnet-5, and codex/gpt-5.6-sol rejected that one too. The
+ * slice spent both attempts and failed.
+ *
+ * That is the intended outcome rather than a regression: the code really would
+ * return a wrong total, and committing it because no attempt was permitted to
+ * fix it would be brigadier shipping known-wrong behaviour to keep a slice
+ * green. But it means a plan can contain a slice that cannot pass this gate at
+ * any effort, and the report has to be read as "re-slice this" rather than as
+ * "the models failed". The outer rung is capped at `concern` precisely so that
+ * this failure mode is reachable ONLY when the change itself misbehaves.
+ *
+ * WHAT THE GATE THEREFORE DOES NOT CATCH, stated so the README can say it: a
+ * pre-existing defect in a file a slice touches is not blocked, and at best
+ * appears as a non-blocking concern. Nothing outside the diff and its
+ * surrounding files is looked at at all. This gate reviews the change; it does
+ * not audit the codebase, and it does not run the tests, the linter or the
+ * build.
+ *
+ * WHEN THERE IS NO DIFF, THE DEGRADATION IS VISIBLE. `diffUncommitted` is
+ * optional on `WorktreeEngine` and refuses outright for an `unsafeInPlace`
+ * worktree, whose uncommitted content belongs to the user and to every
+ * concurrent slice as much as to this one. Either way the prompt says so, the
+ * run log says so, and the reviewer falls back to reading the owned paths — the
+ * pre-diff behaviour, now named rather than assumed.
+ *
+ * A COST THAT REMAINS: this runs before `engine.commit` can discover that the worker
  * changed nothing, so a slice heading for `NO_CHANGES` still pays for one
- * reviewer run. There is no cheap way to know in advance without inventing a
- * second opinion about "did anything change" that could disagree with the
- * engine's, which would be worse than the wasted launch.
+ * reviewer run. That is now knowable in advance rather than unknowable — an
+ * empty patch and `NoChangesToCommitError` compare the same two trees, so they
+ * are one fact rather than two opinions that could disagree — but acting on it
+ * would need a skip reason `ReviewSkipReason` does not have, and inventing a
+ * verdict for it here would be worse than the wasted launch. The reviewer is
+ * told the change is empty instead.
  *
  * IT FAILS OPEN, AND THAT IS A PRODUCT DECISION RATHER THAN AN OVERSIGHT. A
  * reviewer that cannot be chosen, cannot be launched, or answers unreadably
@@ -58,6 +118,7 @@
 
 import type { VendorConfig } from "../config/contracts.js";
 import type { Effort, Vendor } from "../contracts.js";
+import type { UncommittedDiff } from "../worktree/contracts.js";
 import type {
   ReviewerIdentity,
   ReviewFinding,
@@ -69,6 +130,7 @@ import type {
 } from "./contracts.js";
 import type { OneShotEnv } from "./one-shot.js";
 import { runOneShotPrompt } from "./one-shot.js";
+import { describeError } from "./support.js";
 
 /**
  * A review is a bounded read, not a coding session. Fifteen minutes is far more
@@ -111,6 +173,37 @@ const SEVERITIES: ReadonlyMap<string, ReviewSeverity> = new Map([
  */
 const MAX_SCAN_CHARS = 64 * 1024;
 const MAX_CANDIDATES = 200;
+
+/**
+ * How much of the change the reviewer is shown, in characters.
+ *
+ * 96 KiB is roughly 24k tokens — an eighth of the smallest context window any
+ * configured reviewer has, and already more diff than a careful reading
+ * survives. The bound is not really about the context window: it is about
+ * attention and about cost. A reviewer handed a 400 KiB patch does not read it
+ * more slowly, it reads it less carefully, and the run pays input tokens for
+ * every byte either way.
+ *
+ * A slice that produces more than this has outgrown the review rather than the
+ * limit — the playbook sizes a slice at fifteen to twenty files — so the honest
+ * response is to show the first 96 KiB and SAY that it was cut, which
+ * `UncommittedDiff` guarantees by putting the notice inside the text. Both the
+ * reviewer and the run log learn about it; nothing is quietly dropped.
+ */
+const MAX_DIFF_CHARACTERS = 96 * 1024;
+
+/**
+ * What the reviewer is shown as "the change".
+ *
+ * Three arms rather than a nullable patch, for the same reason `SliceReview`
+ * has three: an empty change and an unavailable diff are different facts, and a
+ * prompt that rendered them alike would tell a reviewer that a worker wrote
+ * nothing when the truth is that brigadier could not look.
+ */
+type ReviewedChange =
+  | { readonly kind: "diff"; readonly patch: string }
+  | { readonly kind: "empty" }
+  | { readonly kind: "unavailable"; readonly reason: string };
 
 /**
  * No config is taken here on purpose. Which vendors exist is a property of the
@@ -175,12 +268,17 @@ async function reviewSlice(
     `slice ${sliceId} attempt ${request.attempt}: reviewing ${request.builder.vendor}/${request.builder.model}'s work with ${reviewer.vendor}/${reviewer.model} at ${reviewer.effort} effort`,
   );
 
+  // Taken AFTER the two skip checks above: a run with one vendor configured
+  // spawns no reviewer, and computing a diff nobody will read would charge
+  // every slice of a single-vendor install for a gate that cannot happen.
+  const change = await readChange(options, request);
+
   const answer = await runOneShotPrompt(worker, {
     id: `${sliceId}-review-${request.attempt}`,
     vendor: reviewer.vendor,
     model: reviewer.model,
     effort: reviewer.effort,
-    prompt: reviewPrompt(request),
+    prompt: reviewPrompt(request, change),
     cwd: request.worktreePath,
     env: options.env,
     purpose: `cross-vendor review of slice ${sliceId}`,
@@ -316,6 +414,79 @@ function cappedEffort(ceiling: Effort | undefined): Effort {
 }
 
 /**
+ * The change this attempt made, or the reason there is no diff of it.
+ *
+ * IT NEVER THROWS AND IT NEVER SKIPS THE REVIEW. A diff is what makes the
+ * review good, not what makes it possible: a gate that refused to run without
+ * one would turn every `--unsafe-in-place` run, and every consumer supplying
+ * its own engine, into a slice that commits unreviewed. So a failure here
+ * degrades to the pre-diff behaviour and says so twice — on the run log, which
+ * the CLI prints and the MCP surface captures, and inside the reviewer's own
+ * prompt, which is the only place that can stop the reviewer believing it saw
+ * a change it was never shown.
+ */
+async function readChange(
+  options: CrossVendorReviewerOptions,
+  request: SliceReviewRequest,
+): Promise<ReviewedChange> {
+  const where = `slice ${request.slice.id} attempt ${request.attempt}`;
+  const { engine } = options.ports;
+  if (engine.diffUncommitted === undefined) {
+    const reason = "this run's worktree engine cannot produce one";
+    options.ports.log(
+      `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
+    );
+    return { kind: "unavailable", reason };
+  }
+
+  let diff: UncommittedDiff;
+  try {
+    diff = await engine.diffUncommitted({
+      worktreePath: request.worktreePath,
+      maxCharacters: MAX_DIFF_CHARACTERS,
+    });
+  } catch (error) {
+    const reason = describeError(error);
+    options.ports.log(
+      `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
+    );
+    return { kind: "unavailable", reason };
+  }
+
+  if (diff.truncated) {
+    // On the log as well as inside the patch, because the two reach different
+    // people: the notice inside the patch is for the reviewer, and this line is
+    // for the operator reading why a large slice was approved thinly.
+    options.ports.log(
+      `${where}: the diff shown to the reviewer was truncated to ${MAX_DIFF_CHARACTERS} of ${diff.totalCharacters} characters`,
+    );
+  }
+  return diff.patch === ""
+    ? { kind: "empty" }
+    : { kind: "diff", patch: diff.patch };
+}
+
+/**
+ * A fenced block that the patch cannot escape from.
+ *
+ * A diff of a markdown file contains fences of its own, and a three-backtick
+ * wrapper around one ends at the patch's first ``` — after which the rest of
+ * the change reads as prose and the reviewer's instructions read as part of the
+ * diff. The fence is therefore one backtick longer than the longest run in the
+ * content, which is the rule CommonMark itself uses.
+ */
+function fenced(language: string, content: string): string {
+  let longest = 0;
+  let run = 0;
+  for (const character of content) {
+    run = character === "`" ? run + 1 : 0;
+    longest = Math.max(longest, run);
+  }
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}${language}\n${content}\n${fence}`;
+}
+
+/**
  * THE PROMPT, AND WHY IT IS WORDED THIS WAY.
  *
  * IT IS A CORRECTNESS REVIEW, NOT AN ATTACK, AND THE DIFFERENCE IS OPERATIONAL
@@ -326,17 +497,24 @@ function cappedEffort(ceiling: Effort | undefined): Effort {
  * Claude-built slice. The framing below is the product's, not merely this
  * repository's tooling, so it has to hold for every user's slice.
  *
- * IT NAMES THE OWNED PATHS BECAUSE THERE IS NO DIFF. See the module header: the
- * gate runs before the commit, so the reviewer is told which files this task
- * was allowed to change and asked to read them. It is also told what the task
- * WAS, because "is this code correct" is unanswerable without "correct for
- * what".
+ * IT SHOWS THE DIFF AND NAMES THE OWNED PATHS, and the two do different jobs.
+ * The diff is what the review is ABOUT; the owned paths are what the reviewer
+ * may read to judge it, because three lines of context rarely settle whether a
+ * change is correct. It is also told what the task WAS, because "is this code
+ * correct" is unanswerable without "correct for what".
+ *
+ * IT STATES THE SCOPE RULE RATHER THAN LEAVING IT TO THE MODEL. See the module
+ * header for the measured failure that made this necessary and for why the
+ * outer rung is capped at `concern`.
  *
  * IT ASKS FOR THE VERDICT AS JSON ON THE LAST LINE because the alternative is
  * parsing prose, and a gate that guesses at whether a paragraph was an approval
  * is worse than one that says it could not read the answer.
  */
-function reviewPrompt(request: SliceReviewRequest): string {
+function reviewPrompt(
+  request: SliceReviewRequest,
+  change: ReviewedChange,
+): string {
   const ownedPaths =
     request.slice.ownedPaths.length === 0
       ? "(this task declared no owned paths)"
@@ -354,12 +532,17 @@ function reviewPrompt(request: SliceReviewRequest): string {
     "",
     ownedPaths,
     "",
-    "# What to do",
+    "# The change they made",
     "",
-    "Read those files in the current directory and judge whether the code is",
-    "correct for the task above. Look for logic errors, off-by-one errors,",
-    "inverted conditions, mishandled or swallowed errors, unhandled cases,",
-    "resource leaks, and code that does not do what the task asked.",
+    ...describeChange(change),
+    "",
+    "# What to review, and what to leave alone",
+    "",
+    ...scopeRule(change),
+    "",
+    "Look for logic errors, off-by-one errors, inverted conditions, mishandled",
+    "or swallowed errors, unhandled cases, resource leaks, and code that does",
+    "not do what the task asked.",
     "",
     "Do not report style, naming, formatting, comment wording, or preference",
     "issues. They are out of scope for this review.",
@@ -377,6 +560,64 @@ function reviewPrompt(request: SliceReviewRequest): string {
     "",
     'If you find nothing wrong, end with exactly: {"findings":[]}',
   ].join("\n");
+}
+
+/** The "# The change they made" section, one line per array element. */
+function describeChange(change: ReviewedChange): readonly string[] {
+  if (change.kind === "diff") {
+    return [
+      "The unified diff below is exactly what will be committed if you approve",
+      "it. Nothing outside it is part of this change.",
+      "",
+      fenced("diff", change.patch),
+    ];
+  }
+  if (change.kind === "empty") {
+    return [
+      "This task changed no file at all: the diff of its work is empty, so",
+      "there is nothing here that would be committed.",
+    ];
+  }
+  return [
+    `No diff of this change could be produced (${change.reason}), so it is not`,
+    "shown here. Read the files listed above in the current directory and judge",
+    "their current contents instead.",
+  ];
+}
+
+/**
+ * The scope rule, in the reviewer's own words.
+ *
+ * WITHOUT A DIFF IT IS A WEAKER RULE, AND IT SAYS SO. A reviewer looking at
+ * whole files cannot tell what this task wrote, so the best instruction
+ * available is "block only on what the task asked for" — which is a judgement
+ * rather than an observation, and it is exactly the ambiguity the diff removes.
+ */
+function scopeRule(change: ReviewedChange): readonly string[] {
+  if (change.kind === "unavailable") {
+    return [
+      "Judge whether the code in those files is correct for the task above.",
+      "",
+      'You cannot see which lines this task wrote, so use severity "blocking"',
+      "only for code the task above asked for. Anything that looks pre-existing",
+      'belongs under severity "concern".',
+    ];
+  }
+  return [
+    "Judge the lines this diff adds or changes, in the context of the files",
+    "they land in. Read those files in the current directory as well: three",
+    "lines of context is rarely enough to tell whether a change is correct.",
+    "",
+    "Code this diff does not touch is in scope only when the changed code",
+    "depends on it — calls it, reads its result, or extends it — so that this",
+    "change itself misbehaves when it runs. Grade that like any other defect.",
+    "",
+    "Anything else you notice in code this task did not change is outside this",
+    'verdict, however wrong it looks. Report it with severity "concern" so a',
+    'human sees it, and never with severity "blocking": this task was not asked',
+    "to fix it, those lines may belong to another task, and re-running this",
+    "task would produce the same diff and meet the same objection.",
+  ];
 }
 
 /**
