@@ -84,6 +84,7 @@ const BOTH_VENDORS: BrigadierConfig = {
     },
   ],
   secretsConsent: true,
+  linkedSecretPaths: [],
   allowDegradedRouting: false,
 };
 
