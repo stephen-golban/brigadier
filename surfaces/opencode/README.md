@@ -14,8 +14,8 @@ brigadier install codex         # writes ~/.agents/skills/brigadier/
 
 `brigadier install opencode` adds the one thing a skill cannot be: a plugin that
 watches the session and reports automatic or manual compaction. It writes
-`plugin/brigadier.js` to `~/.config/opencode/plugin/brigadier.js` and nothing
-else.
+`plugin/brigadier.js` to `~/.config/opencode/plugin/brigadier.js` and
+`README.md` to `~/.config/opencode/brigadier.README.md`.
 
 ## The verified line, stated precisely
 

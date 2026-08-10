@@ -19,8 +19,9 @@ reason Desktop is the one host where the tiny doctrine file is not the answer.
 
 Design decision #10's transcript-watching handoff works on Claude Code. On
 opencode, its event names were verified only on 1.18.16, without triggering live
-compaction, and remain version-dependent. On Codex, brigadier registers it but
-Codex trust-gates it. On Desktop it is **impossible**, not merely unimplemented:
+compaction, and remain version-dependent. On Codex, brigadier registers it and
+Codex trust-gates the registration; approval remains valid if the script at that
+path changes. On Desktop it is **impossible**, not merely unimplemented:
 Desktop exposes no hook surface of any kind, and an MCP server is invoked by the
 model when the model chooses to invoke it — never by the transcript, and never at
 the moment the context fills. There is no workaround and none is offered.

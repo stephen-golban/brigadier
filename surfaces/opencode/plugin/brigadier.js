@@ -12,15 +12,9 @@
  */
 
 /**
- * The bus events emitted when session compaction begins and ends.
- *
- * READ THIS BEFORE FILING A BUG ABOUT THE HOOK NOT FIRING. Both names below
- * were verified on 2026-08-10 against a running opencode 1.18.16 darwin-arm64
- * by fetching GET /doc and enumerating its 89-event OpenAPI union. No live
- * compaction was triggered, so their emission during a real compaction was not
- * observed. Only 1.18.16 was tested, and opencode's event vocabulary is
- * version-dependent. If a future build renames either event, this array remains
- * the one line to change.
+ * The event names opencode 1.18.16 declares for compaction start and completion.
+ * They were read from its OpenAPI union; emission during a real compaction was
+ * not observed.
  */
 export const HANDOFF_EVENT_TYPES = [
   "session.compacted",

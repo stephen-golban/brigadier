@@ -40,6 +40,7 @@ import { SURFACE_TEMPLATES } from "../src/surfaces/templates.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const surfacesRoot = join(repositoryRoot, "surfaces");
+const MAX_HOOK_STDOUT_BYTES = 64_000;
 
 /**
  * Every installable template, pinned by content.
@@ -71,8 +72,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 236,
   },
   "claude-desktop/README.md": {
-    sha256: "ff7304ce5432a64a9ea0b4fd4112209341c9b2ea162d1d088304ea7913f77ba3",
-    bytes: 2968,
+    sha256: "32b0330ccf477c5e48b45271b8a43188a19a6ea1852ffc85f3d11dd711807d25",
+    bytes: 3041,
   },
   "claude-desktop/manifest.json": {
     sha256: "3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f",
@@ -83,8 +84,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3127,
   },
   "codex/hooks/README.md": {
-    sha256: "a48674e591b9d0aca1413f1faf65ce01ee22b26afe2bbcd6a8924ee412308036",
-    bytes: 2755,
+    sha256: "dd26bd349600df8baca4642406e6ce3a75a4a2ccc48f303a383d8b65fe6473fa",
+    bytes: 3185,
   },
   "codex/hooks/handoff.mjs": {
     sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
@@ -95,12 +96,12 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3993,
   },
   "opencode/README.md": {
-    sha256: "ff104b1c8a612881244d802caf0b2f67b66ffb4e21330e5690d7f464899d946d",
-    bytes: 2142,
+    sha256: "53feacbb72b7f667b7e280d815058e2753bf72f48e6f849fce54aa2604f1ed92",
+    bytes: 2185,
   },
   "opencode/plugin/brigadier.js": {
-    sha256: "904cd29d686fa1113b352862144e66d0345ed35ca5f43f0efcb527ef9843e4b1",
-    bytes: 3358,
+    sha256: "574297c2697dd65f246bcc739309168e24c9224c5420cc1f17b6b8ae067b00d1",
+    bytes: 2974,
   },
 };
 
@@ -432,19 +433,47 @@ describe("the surface templates", () => {
       "- **opencode — event binding verified, with limits.** The plugin's event names\n  were verified against opencode 1.18.16, but no live compaction was triggered,\n  only that version was tested, and its event vocabulary is version-dependent.\n  See `opencode/plugin/brigadier.js` and `opencode/README.md`.",
     );
     expect(textBetween(index, "- **Codex", "\n- **Claude Desktop")).toBe(
-      "- **Codex — registered, then trust-gated.** `brigadier install codex` merges a\n  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only\n  after you approve the hook definition. The definition is hashed, so approval\n  is required again after every edit to `handoff.mjs`. See `codex/hooks/`.",
+      "- **Codex — registered, then trust-gated.** `brigadier install codex` merges a\n  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only\n  after you approve the registration. Approval is bound to the registration, not\n  to the contents of `handoff.mjs`, so editing the script does not prompt again.\n  See `codex/hooks/`.",
     );
+  });
 
+  test("the opencode README names both installed files", () => {
     const opencode = SURFACE_TEMPLATES["opencode/README.md"] ?? "";
     expect(paragraphContaining(opencode, "**Status:")).toBe(
       "**Status: plugin and event names verified on opencode 1.18.16; no live\ncompaction was triggered.**",
+    );
+    expect(paragraphContaining(opencode, "It writes")).toBe(
+      "`brigadier install opencode` adds the one thing a skill cannot be: a plugin that\nwatches the session and reports automatic or manual compaction. It writes\n`plugin/brigadier.js` to `~/.config/opencode/plugin/brigadier.js` and\n`README.md` to `~/.config/opencode/brigadier.README.md`.",
+    );
+  });
+
+  test("the Codex README states exactly what approval identifies", () => {
+    const codex = SURFACE_TEMPLATES["codex/hooks/README.md"] ?? "";
+    expect(paragraphContaining(codex, "Approval is bound")).toBe(
+      "`brigadier install codex` registers the hook, but registration is not approval.\nCodex will not run a hook it has not been told to trust. Approving one is a\nmanual, interactive click in Codex. Approval is bound to the registration — the\nevent, matcher, and command configuration — not to the contents of\n`handoff.mjs`. The script at that approved path can later change without Codex\nasking again. To re-review an edited script, deliberately change the registration\nand approve the new registration.",
+    );
+    expect(paragraphContaining(codex, "persisted approval")).toBe(
+      "Start an interactive Codex session and approve the hook when Codex presents its\nhook-trust prompt. Until that approval is persisted, the hook is a silent no-op:\nCodex still exits 0, with no warning and no hook output. That persisted approval\nremains valid when `handoff.mjs` changes. Only changing the registration itself —\nthe command string, event, or matcher — re-arms the prompt. To re-review an\nedited script, deliberately change the registration and approve it again.",
+    );
+  });
+
+  test("the opencode plugin comment claims only declared event names", () => {
+    const plugin = SURFACE_TEMPLATES["opencode/plugin/brigadier.js"] ?? "";
+    expect(
+      textBetween(
+        plugin,
+        "/**\n * The event names opencode",
+        "\nexport const HANDOFF_EVENT_TYPES",
+      ),
+    ).toBe(
+      "/**\n * The event names opencode 1.18.16 declares for compaction start and completion.\n * They were read from its OpenAPI union; emission during a real compaction was\n * not observed.\n */",
     );
   });
 
   test("Desktop doctrine keeps verified hook and staged-build limits explicit", () => {
     const desktop = SURFACE_TEMPLATES["claude-desktop/README.md"] ?? "";
     expect(paragraphContaining(desktop, "Design decision #10's")).toBe(
-      "Design decision #10's transcript-watching handoff works on Claude Code. On\nopencode, its event names were verified only on 1.18.16, without triggering live\ncompaction, and remain version-dependent. On Codex, brigadier registers it but\nCodex trust-gates it. On Desktop it is **impossible**, not merely unimplemented:\nDesktop exposes no hook surface of any kind, and an MCP server is invoked by the\nmodel when the model chooses to invoke it — never by the transcript, and never at\nthe moment the context fills. There is no workaround and none is offered.",
+      "Design decision #10's transcript-watching handoff works on Claude Code. On\nopencode, its event names were verified only on 1.18.16, without triggering live\ncompaction, and remain version-dependent. On Codex, brigadier registers it and\nCodex trust-gates the registration; approval remains valid if the script at that\npath changes. On Desktop it is **impossible**, not merely unimplemented:\nDesktop exposes no hook surface of any kind, and an MCP server is invoked by the\nmodel when the model chooses to invoke it — never by the transcript, and never at\nthe moment the context fills. There is no workaround and none is offered.",
     );
     expect(
       textBetween(
@@ -553,9 +582,9 @@ describe("brigadier install", () => {
           ),
         ),
       ).toBe(true);
-      // Codex: registered, but not live until approved; edits invalidate trust.
+      // Codex: registered, but not live until the registration is approved.
       expect(notes).toContain(
-        `  note: THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${home}/.codex/hooks.json, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to a hash of the hook definition, so it is required again after any edit to handoff.mjs. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
+        `  note: THE HANDOFF HOOK IS REGISTERED AGAINST PreCompact IN ${home}/.codex/hooks.json, BUT IT WILL NOT RUN UNTIL YOU APPROVE IT IN CODEX. Approval is bound to the registration (event, matcher, and command), not to the contents of handoff.mjs, so editing the script leaves approval intact. To re-review an edited script, deliberately change the registration and approve it again. Claude Code needs no approval for the same hook; that asymmetry is deliberate on Codex's part, and brigadier neither works around it nor hides it.`,
       );
       // opencode: event names are verified, with the residual limits explicit.
       expect(
@@ -1186,7 +1215,29 @@ describe("the handoff hook", () => {
       stdout: "pipe",
       stderr: "pipe",
     });
-    const stdout = new Response(proc.stdout).text();
+    const stdout = (async (): Promise<string> => {
+      const reader = proc.stdout.getReader();
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) {
+            return Buffer.concat(chunks, bytes).toString("utf8");
+          }
+          bytes += next.value.byteLength;
+          if (bytes > MAX_HOOK_STDOUT_BYTES) {
+            proc.kill(9);
+            throw new Error(
+              `hook stdout exceeded ${MAX_HOOK_STDOUT_BYTES} bytes`,
+            );
+          }
+          chunks.push(next.value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    })();
     proc.stdin.write(payload);
     if (closeStdin) {
       await proc.stdin.end();

@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
@@ -65,6 +74,10 @@ async function makeHarness(homeName = "home"): Promise<Harness> {
       beforeWrite(path);
       await nodeSurfaceIo.writeFile(path, contents, mode, expected);
     },
+    async writeFileAtomic(path, contents, mode, expected) {
+      beforeWrite(path);
+      await nodeSurfaceIo.writeFileAtomic(path, contents, mode, expected);
+    },
     async realpath(path) {
       tick();
       return nodeSurfaceIo.realpath(path);
@@ -94,12 +107,13 @@ async function makeHarness(homeName = "home"): Promise<Harness> {
 async function installCodex(
   harness: Harness,
   argv: readonly string[] = ["codex"],
+  fs: SurfaceIo = harness.fs,
 ): Promise<Collected> {
   let stdout = "";
   let stderr = "";
   const io: InstallIo = {
     env: { HOME: harness.home },
-    fs: harness.fs,
+    fs,
     stdout: { write: (chunk) => (stdout += chunk) },
     stderr: { write: (chunk) => (stderr += chunk) },
   };
@@ -146,6 +160,21 @@ function expectedFreshHooks(home: string): string {
   }
 }
 `;
+}
+
+function expectedBrigadierEntry(home: string): {
+  readonly hooks: readonly [
+    { readonly type: "command"; readonly command: string },
+  ];
+} {
+  return {
+    hooks: [
+      {
+        type: "command",
+        command: `'${home}/.agents/skills/brigadier/hooks/handoff.mjs' # brigadier-managed-hook`,
+      },
+    ],
+  };
 }
 
 const SUPACODE_FIXTURE = {
@@ -201,6 +230,11 @@ describe("Codex handoff-hook registration", () => {
       expect(await readFile(harness.hooksPath, "utf8")).toBe(
         expectedFreshHooks(harness.home),
       );
+      expect(
+        (await readdir(join(harness.home, ".codex"))).filter((name) =>
+          name.includes(".brigadier-tmp-"),
+        ),
+      ).toEqual([]);
       expect(
         result.stdout
           .split("\n")
@@ -316,6 +350,125 @@ describe("Codex handoff-hook registration", () => {
     }
   });
 
+  test("a marked hook beside a foreign sibling stays byte-for-byte intact and brigadier appends", async () => {
+    const harness = await makeHarness();
+    try {
+      const foreignEntry = `{"matcher":"foreign","hooks":[
+      {"type":"command","command":"awk '{ print $1 }' # brigadier-managed-hook"},
+      {"type":"command","command":"other-tool --keep-me"}]}`;
+      const original = `{"hooks":{"PreCompact":[${foreignEntry}]}}\n`;
+      const expected = `{"hooks":{"PreCompact":[${foreignEntry},
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'${harness.home}/.agents/skills/brigadier/hooks/handoff.mjs' # brigadier-managed-hook"
+          }
+        ]
+      }
+    ]}}\n`;
+      await mkdir(join(harness.home, ".codex"), { recursive: true });
+      await writeFile(harness.hooksPath, original, "utf8");
+
+      const result = await installCodex(harness);
+      const afterBytes = await readFile(harness.hooksPath, "utf8");
+      const after = JSON.parse(afterBytes) as {
+        hooks: { PreCompact: unknown[] };
+      };
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(afterBytes).toBe(expected);
+      expect(afterBytes.includes(foreignEntry)).toBe(true);
+      expect(after.hooks.PreCompact).toEqual([
+        {
+          matcher: "foreign",
+          hooks: [
+            {
+              type: "command",
+              command: "awk '{ print $1 }' # brigadier-managed-hook",
+            },
+            { type: "command", command: "other-tool --keep-me" },
+          ],
+        },
+        expectedBrigadierEntry(harness.home),
+      ]);
+      await assertHarnessSafe(harness);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a marked single hook with a matcher is foreign and stays byte-for-byte intact", async () => {
+    const harness = await makeHarness();
+    try {
+      const foreignEntry =
+        '{ "matcher" : "foreign", "hooks" : [{"type":"command","command":"foreign-tool # brigadier-managed-hook"}] }';
+      const original = `{"hooks":{"PreCompact":[${foreignEntry}]}}\n`;
+      const expected = `{"hooks":{"PreCompact":[${foreignEntry},
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'${harness.home}/.agents/skills/brigadier/hooks/handoff.mjs' # brigadier-managed-hook"
+          }
+        ]
+      }
+    ]}}\n`;
+      await mkdir(join(harness.home, ".codex"), { recursive: true });
+      await writeFile(harness.hooksPath, original, "utf8");
+
+      const result = await installCodex(harness);
+      const afterBytes = await readFile(harness.hooksPath, "utf8");
+      const after = JSON.parse(afterBytes) as {
+        hooks: { PreCompact: unknown[] };
+      };
+      expect(result.code).toBe(0);
+      expect(afterBytes).toBe(expected);
+      expect(afterBytes.includes(foreignEntry)).toBe(true);
+      expect(after.hooks.PreCompact).toEqual([
+        {
+          matcher: "foreign",
+          hooks: [
+            {
+              type: "command",
+              command: "foreign-tool # brigadier-managed-hook",
+            },
+          ],
+        },
+        expectedBrigadierEntry(harness.home),
+      ]);
+      await assertHarnessSafe(harness);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("replacing brigadier's own entry preserves every retained foreign entry byte", async () => {
+    const harness = await makeHarness();
+    try {
+      const foreignEntry = `{
+\t"matcher" : "foreign-format",
+\t"hooks" : [ { "type" : "command", "command" : "keep-format" } ]
+}`;
+      const oldBrigadier =
+        '{"hooks":[{"type":"command","command":"old/path # brigadier-managed-hook"}]}';
+      const original = `{"hooks":{"PreCompact":[${foreignEntry},${oldBrigadier}]}}\n`;
+      const desired = JSON.stringify(expectedBrigadierEntry(harness.home));
+      const expected = `{"hooks":{"PreCompact":[${foreignEntry},${desired}]}}\n`;
+      await mkdir(join(harness.home, ".codex"), { recursive: true });
+      await writeFile(harness.hooksPath, original, "utf8");
+
+      const result = await installCodex(harness);
+      const afterBytes = await readFile(harness.hooksPath, "utf8");
+      expect(result.code).toBe(0);
+      expect(afterBytes).toBe(expected);
+      expect(afterBytes.includes(foreignEntry)).toBe(true);
+      await assertHarnessSafe(harness);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
   test("installing twice leaves exactly one marked brigadier entry", async () => {
     const harness = await makeHarness();
     try {
@@ -331,12 +484,134 @@ describe("Codex handoff-hook registration", () => {
         1,
       );
       expect(
+        (
+          JSON.parse(secondBytes) as {
+            hooks: { PreCompact: unknown[] };
+          }
+        ).hooks.PreCompact,
+      ).toEqual([expectedBrigadierEntry(harness.home)]);
+      expect(
         second.stdout
           .split("\n")
           .filter((line) => /^ {2}(created|updated|unchanged) /.test(line))
           .filter((line) => line.endsWith("hooks.json")),
       ).toEqual([`  unchanged  ${harness.hooksPath}`]);
       await assertHarnessSafe(harness);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("an existing hooks.json keeps mode 0600 and a new one is created as 0644", async () => {
+    const existing = await makeHarness("existing-home");
+    const fresh = await makeHarness("fresh-home");
+    try {
+      await mkdir(join(existing.home, ".codex"), { recursive: true });
+      await writeFile(
+        existing.hooksPath,
+        '{"hooks":{"PreCompact":[]}}\n',
+        "utf8",
+      );
+      await chmod(existing.hooksPath, 0o600);
+
+      const updated = await installCodex(existing);
+      const created = await installCodex(fresh);
+      expect(updated.code).toBe(0);
+      expect(created.code).toBe(0);
+      expect((await stat(existing.hooksPath)).mode & 0o777).toBe(0o600);
+      expect((await stat(fresh.hooksPath)).mode & 0o777).toBe(0o644);
+      await assertHarnessSafe(existing);
+      await assertHarnessSafe(fresh);
+    } finally {
+      await rm(existing.scratch, { recursive: true, force: true });
+      await rm(fresh.scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed shared-file write leaves the original bytes and no atomic temporary file", async () => {
+    const harness = await makeHarness();
+    try {
+      const original = '{"hooks":{"PreCompact":[]},"owner":"foreign"}\n';
+      await mkdir(join(harness.home, ".codex"), { recursive: true });
+      await writeFile(harness.hooksPath, original, "utf8");
+      const failingIo = {
+        ...harness.fs,
+        async writeFile(
+          path: string,
+          contents: string,
+          mode: number,
+          expected: Parameters<SurfaceIo["writeFile"]>[3],
+        ) {
+          if (path === harness.hooksPath) {
+            await nodeSurfaceIo.writeFile(path, "", mode, expected);
+            throw new Error("injected interruption after truncation");
+          }
+          await harness.fs.writeFile(path, contents, mode, expected);
+        },
+        async writeFileAtomic(
+          path: string,
+          _contents: string,
+          _mode: number,
+          _expected: Parameters<SurfaceIo["writeFile"]>[3],
+        ) {
+          if (path === harness.hooksPath) {
+            throw new Error("injected atomic write failure");
+          }
+          throw new Error(`unexpected atomic write to ${path}`);
+        },
+      } as SurfaceIo;
+
+      const result = await installCodex(harness, ["codex"], failingIo);
+      expect(result.code).toBe(1);
+      expect(await readFile(harness.hooksPath, "utf8")).toBe(original);
+      expect(
+        (await readdir(join(harness.home, ".codex"))).filter((name) =>
+          name.includes(".brigadier-tmp-"),
+        ),
+      ).toEqual([]);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
+  test("the atomic writer removes its temporary file when pre-rename verification fails", async () => {
+    const harness = await makeHarness();
+    try {
+      const codexHome = join(harness.home, ".codex");
+      const original = '{"hooks":{"PreCompact":[]},"owner":"foreign"}\n';
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(harness.hooksPath, original, "utf8");
+      await chmod(harness.hooksPath, 0o600);
+      const snapshot = await nodeSurfaceIo.readFile(harness.hooksPath);
+
+      const tamperAfterTemporaryCreation = (async (): Promise<void> => {
+        for (let attempt = 0; attempt < 5_000; attempt += 1) {
+          const names = await readdir(codexHome);
+          if (names.some((name) => name.includes(".brigadier-tmp-"))) {
+            await chmod(harness.hooksPath, 0o640);
+            return;
+          }
+          await Bun.sleep(1);
+        }
+        throw new Error("atomic temporary file did not appear");
+      })();
+      const writing = nodeSurfaceIo.writeFileAtomic(
+        harness.hooksPath,
+        "replacement bytes\n".repeat(1_000_000),
+        0o644,
+        snapshot,
+      );
+
+      await tamperAfterTemporaryCreation;
+      await expect(writing).rejects.toThrow(
+        `refusing to replace ${harness.hooksPath}: it changed after brigadier inspected it`,
+      );
+      expect(await readFile(harness.hooksPath, "utf8")).toBe(original);
+      expect(
+        (await readdir(codexHome)).filter((name) =>
+          name.includes(".brigadier-tmp-"),
+        ),
+      ).toEqual([]);
     } finally {
       await rm(harness.scratch, { recursive: true, force: true });
     }
