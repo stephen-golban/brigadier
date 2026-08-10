@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrigadierConfig } from "../src/config/index.ts";
 import { resolveConfigPath, writeConfig } from "../src/config/index.ts";
-import type { AnyWorker } from "../src/contracts.ts";
+import type {
+  AnyWorker,
+  ClaudeWorkerSpec,
+  SpawnedWorker,
+  Worker,
+} from "../src/contracts.ts";
 import type {
   InputStream,
   OutputStream,
@@ -351,6 +356,8 @@ interface InvokeOptions {
   readonly runner?: RecordingSliceRunner | null;
   /** Replaces the model that turns a task description into a plan. */
   readonly planner?: Planner;
+  /** Replaces only the adapter below the production model planner. */
+  readonly plannerWorkerFor?: RunHarness["plannerWorkerFor"];
   /** Replaces the stdio MCP server, which would otherwise block on stdin. */
   readonly mcpServer?: (control?: McpRunControl) => Promise<number>;
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -387,6 +394,9 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
     now: () => 1_700_000_000_000,
     ...(runner === null ? {} : { sliceRunner: runner }),
     ...(options.planner === undefined ? {} : { planner: options.planner }),
+    ...(options.plannerWorkerFor === undefined
+      ? {}
+      : { plannerWorkerFor: options.plannerWorkerFor }),
   };
   const stdout = collector();
   const stderr = collector();
@@ -415,6 +425,56 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
       : { onCancellable: options.onCancellable }),
   });
   return { code, stdout: stdout.text(), stderr: stderr.text(), engine, runner };
+}
+
+async function settleWithin<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const raced = await Promise.race([
+    work.then((value) => ({ kind: "settled" as const, value })),
+    new Promise<{ readonly kind: "timed-out" }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "timed-out" }), 20_000);
+    }),
+  ]);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+  }
+  expect(raced.kind).toBe("settled");
+  if (raced.kind === "timed-out") {
+    throw new Error(`${label} did not settle within 20000 ms`);
+  }
+  return raced.value;
+}
+
+function fakePlanningWorker(specs: ClaudeWorkerSpec[]): Worker<"claude"> {
+  const oneSlicePlan = { ...PLAN, slices: [PLAN.slices[0]] };
+  return {
+    vendor: "claude",
+    processCompletion: "signals-then-must-be-killed",
+    spawn: (spec: ClaudeWorkerSpec): Promise<SpawnedWorker> => {
+      specs.push(spec);
+      return Promise.resolve({
+        pid: 4242,
+        events: {
+          [Symbol.asyncIterator]: () => ({
+            next: () =>
+              Promise.resolve({ done: true as const, value: undefined }),
+          }),
+        },
+        completion: Promise.resolve({
+          ok: true,
+          output: JSON.stringify({ status: "plan", plan: oneSlicePlan }),
+          usage: {
+            input: { total: 0, uncached: 0, cacheRead: 0, cacheWrite: 0 },
+            output: { total: 0, reasoning: null },
+          },
+          durationMs: 0,
+          exitCode: 0,
+          signal: null,
+        }),
+        cancel: () => Promise.resolve(),
+      });
+    },
+  };
 }
 
 async function withScratchHome(
@@ -765,6 +825,51 @@ describe("brigadier run: options", () => {
 });
 
 describe("brigadier run: the task positional", () => {
+  test("the default CLI planner bridge resolves a configured worker adapter", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const specs: ClaudeWorkerSpec[] = [];
+      const worker = fakePlanningWorker(specs);
+      const result = await settleWithin(
+        invoke({
+          argv: ["run", "fix the parser"],
+          cwd,
+          scratchHome,
+          plannerWorkerFor: (vendor) => (vendor === "claude" ? worker : null),
+        }),
+        "production planner bridge",
+      );
+
+      expect(result.code).toBe(0);
+      expect(
+        specs.map((spec) => ({
+          id: spec.id,
+          vendor: spec.vendor,
+          model: spec.model,
+          effort: spec.effort,
+          cwd: spec.cwd,
+          timeoutMs: spec.timeoutMs,
+          maxTurns: spec.maxTurns,
+          editablePaths: spec.sandbox.filesystem.editablePaths,
+        })),
+      ).toEqual([
+        {
+          id: "brigadier-plan",
+          vendor: "claude",
+          model: "claude-opus-5",
+          effort: "high",
+          cwd,
+          timeoutMs: 900_000,
+          maxTurns: 40,
+          editablePaths: [],
+        },
+      ]);
+      expect(result.runner?.inputs.map((input) => input.slice.id)).toEqual([
+        "s1",
+      ]);
+      expect(result.engine.prepared.length).toBe(1);
+    });
+  });
+
   test("a bare task description is planned and then run", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
       const planner = new RecordingPlanner(plannedOutcome());

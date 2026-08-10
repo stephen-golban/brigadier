@@ -942,6 +942,14 @@ export interface RunHarness {
   readonly now?: () => number;
   readonly sliceRunner?: SliceRunner;
   /**
+   * Replaces only the adapter lookup used by the production model planner.
+   *
+   * This is deliberately lower than `planner`: composition tests can exercise
+   * the real `createModelPlanner` bridge without launching a vendor process.
+   * Production passes nothing and resolves adapters from the saved config.
+   */
+  readonly plannerWorkerFor?: (vendor: Vendor) => AnyWorker | null;
+  /**
    * Replaces the model that turns a task description into a plan.
    *
    * Without this seam every test of `brigadier run "<task>"` would spawn a real
@@ -1176,7 +1184,9 @@ async function resolvePlanFromTask(
     options.harness?.planner ??
     createModelPlanner({
       config: environment.config,
-      workerFor: createWorkerFactory(environment.config),
+      workerFor:
+        options.harness?.plannerWorkerFor ??
+        createWorkerFactory(environment.config),
       env: environment.env,
       log: (line: string) => {
         stdout.write(`${line}\n`);

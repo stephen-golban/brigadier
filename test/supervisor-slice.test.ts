@@ -3015,6 +3015,60 @@ describe("DefaultSliceRunner worktree ownership", () => {
 // ---------------------------------------------------------------------------
 
 describe("DefaultSliceRunner review gate", () => {
+  test("the constructor default runs the real cross-vendor reviewer", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const codex = codexAdapter([
+      { outcome: { ...OK_OUTCOME, output: '{"findings":[]}' } },
+    ]);
+    const harness = makeHarness({
+      workers: { claude: claude.worker, codex: codex.worker },
+    });
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      5000,
+      "production-default review",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(claude.specs.length).toBe(1);
+    expect(
+      codex.specs.map((spec) => ({
+        id: spec.id,
+        vendor: spec.vendor,
+        model: spec.model,
+        effort: spec.effort,
+        cwd: spec.cwd,
+        editablePaths: spec.sandbox.filesystem.editablePaths,
+      })),
+    ).toEqual([
+      {
+        id: "slice-auth-review-1",
+        vendor: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        cwd: join(world.root, "wt", "slice-7"),
+        editablePaths: [],
+      },
+    ]);
+    expect(attemptAt(result, 0).review?.verdict).toBe("approved");
+    expect(attemptAt(result, 0).review?.reviewer).toEqual(REVIEWER);
+    expect(harness.engine.commits.length).toBe(1);
+  });
+
   test("a rejected review fails the slice as REVIEW_REJECTED and never commits", async () => {
     const world = await makeWorld();
     const adapter = claudeAdapter([{ outcome: OK_OUTCOME }]);

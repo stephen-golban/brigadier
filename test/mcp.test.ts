@@ -58,9 +58,10 @@ async function drive(
   entry: string,
   lines: readonly string[],
   env: Record<string, string>,
+  argv: readonly string[] = [],
 ): Promise<Session> {
   const proc = Bun.spawn({
-    cmd: ["bun", entry],
+    cmd: ["bun", entry, ...argv],
     cwd: repositoryRoot,
     env,
     stdin: "pipe",
@@ -210,6 +211,24 @@ describe("the MCP server over stdio", () => {
   test("package.json still carries the version pinned into the golden frames", () => {
     expect(packageJson.version).toBe(VERSION);
   });
+
+  test("brigadier mcp uses the real server when no server is injected", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
+    try {
+      const session = await drive(
+        join(repositoryRoot, "src", "cli.ts"),
+        ['{"jsonrpc":"2.0","id":13,"method":"ping"}'],
+        scratchEnv(home),
+        ["mcp"],
+      );
+      const lines = responses(session);
+      expect(lines).toEqual(['{"jsonrpc":"2.0","id":13,"result":{}}']);
+      expect(session.stderr).toBe("");
+      expect(session.exitCode).toBe(0);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 40_000);
 
   test("initialize, ping, and a notification answer with exactly these bytes", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
@@ -809,6 +828,84 @@ describe("the MCP server over stdio", () => {
           },
         }),
       );
+      expect(session.stderr).toBe("");
+      expect(session.exitCode).toBe(0);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("the real configured execute dependency completes a dry run", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
+    const entry = join(home, "entry.ts");
+    await writeFile(entry, REAL_ENTRY, "utf8");
+    await writeFile(
+      join(home, "config.json"),
+      JSON.stringify({
+        version: 3,
+        vendors: [
+          {
+            vendor: "claude",
+            executable: "/must-not-run/claude",
+            version: "2.1.226",
+            defaultModel: "claude-opus-5",
+            models: [{ id: "claude-opus-5", effortCeiling: "high" }],
+          },
+        ],
+        secretsConsent: false,
+        linkedSecretPaths: [],
+        allowDegradedRouting: false,
+      }),
+      "utf8",
+    );
+    try {
+      const session = await drive(
+        entry,
+        [
+          call(12, "brigadier_run", {
+            plan: VALID_PLAN,
+            repositoryPath: repositoryRoot,
+            dryRun: true,
+          }),
+        ],
+        scratchEnv(home),
+      );
+      const lines = responses(session);
+      expect(lines.length).toBe(1);
+      const response = JSON.parse(lines[0] ?? "") as {
+        readonly jsonrpc: string;
+        readonly id: number;
+        readonly result: {
+          readonly content: readonly [
+            { readonly type: string; readonly text: string },
+          ];
+          readonly isError: boolean;
+        };
+      };
+      expect({
+        jsonrpc: response.jsonrpc,
+        id: response.id,
+        type: response.result.content[0].type,
+        isError: response.result.isError,
+        text: response.result.content[0].text.replace(
+          /in \d+ms/,
+          "in <duration>ms",
+        ),
+      }).toEqual({
+        jsonrpc: "2.0",
+        id: 12,
+        type: "text",
+        isError: false,
+        text: [
+          "dry run add-retry: 2 slice(s) in <duration>ms",
+          "  retry-core  would run",
+          "      attempt 1  claude/claude-opus-5 effort=high  routed",
+          "  retry-docs  would run",
+          "      attempt 1  claude/claude-opus-5 effort=medium  routed",
+          "  integration branch: (none)",
+          "  log: run add-retry: 2 slice(s) in 1 wave(s)",
+        ].join("\n"),
+      });
       expect(session.stderr).toBe("");
       expect(session.exitCode).toBe(0);
     } finally {
