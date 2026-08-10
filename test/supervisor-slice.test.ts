@@ -1303,10 +1303,11 @@ describe("DefaultSliceRunner retry policy", () => {
     expect(result.ok).toBe(true);
     expect(result.attempts.length).toBe(2);
     expect(harness.routeRequests.length).toBe(2);
-    // The whole point: attempt 2 is escalated but excludes nothing, because
-    // claude-opus-5 was never actually tried.
+    // The whole point: claude-opus-5 was never actually tried, so attempt 2
+    // neither excludes it nor earns the higher effort reserved for a model
+    // whose work failed.
     expect(harness.routeRequests[1]?.excluded).toBeUndefined();
-    expect(harness.routeRequests[1]?.escalated).toBe(true);
+    expect(harness.routeRequests[1]?.escalated).toBeUndefined();
     expect(attemptAt(result, 1).routed?.model).toBe("claude-opus-5");
   });
 
@@ -1346,6 +1347,7 @@ describe("DefaultSliceRunner retry policy", () => {
     expect(harness.routeRequests[1]?.excluded).toEqual([
       { vendor: "claude", model: "claude-opus-5" },
     ]);
+    expect(harness.routeRequests[1]?.escalated).toBe(true);
   });
 
   /**

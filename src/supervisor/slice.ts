@@ -178,10 +178,10 @@ export interface SliceRunnerOptions {
   /**
    * The routing function. Defaults to the real router and exists as a seam only
    * so a test can assert the exact `RoutingRequest` the runner builds —
-   * specifically that attempt 2 carries attempt 1's `(vendor, model)` in
-   * `excluded` and sets `escalated`. Asserting that through the real router
-   * would only show a different model came back, which is the same observation
-   * a wrong request could produce by accident.
+   * specifically that a retry carries a model that actually ran and failed in
+   * `excluded`, and sets `escalated` only with that evidence. Asserting that
+   * through the real router would only show a different model came back, which
+   * is the same observation a wrong request could produce by accident.
    */
   readonly route?: (
     request: RoutingRequest,
@@ -402,7 +402,7 @@ export class DefaultSliceRunner implements SliceRunner {
       };
     }
 
-    const decision = this.#routeAttempt(input, attempt, excluded);
+    const decision = this.#routeAttempt(input, excluded);
     if (!decision.ok) {
       // On attempt 2 this is the expected "nothing stronger is available"
       // answer, not an error condition. It is recorded and the slice stops.
@@ -555,7 +555,6 @@ export class DefaultSliceRunner implements SliceRunner {
 
   #routeAttempt(
     input: SliceRunInput,
-    attempt: number,
     excluded: readonly ExcludedModel[],
   ): RoutingDecision {
     const request: RoutingRequest = {
@@ -568,7 +567,7 @@ export class DefaultSliceRunner implements SliceRunner {
       ...(excluded.length === 0 ? {} : { excluded: [...excluded] }),
       // `escalated` is the only thing that unlocks `xhigh`, and it is earned by
       // the observed failure that produced `excluded`.
-      ...(attempt > 1 ? { escalated: true } : {}),
+      ...(excluded.length > 0 ? { escalated: true } : {}),
     };
     try {
       return this.#route(request, input.routing);
@@ -1404,12 +1403,12 @@ function launchFailure(message: string): WorktreeOutcome {
  * second attempt is genuinely a different model at a higher rung rather than
  * the same one asked twice.
  *
- * The remaining members stay retryable on purpose, and each for a reason that
- * is specific rather than optimistic. `ROUTING_FAILED` on attempt 1 is re-asked
- * with `escalated: true`, which is the only thing that unlocks `xhigh`, so the
- * second ask genuinely differs from the first. `NO_CHANGES` and `COMMIT_FAILED`
- * describe a worker that did the wrong thing, which is the case escalation
- * exists for.
+ * The remaining members stay retryable under the existing policy.
+ * `ROUTING_FAILED` has no routed worker to blame, so its retry carries neither
+ * an exclusion nor `escalated`; this function does not broaden that routing
+ * failure into evidence that a model deserves `xhigh`. `NO_CHANGES` and
+ * `COMMIT_FAILED` follow a worker run, so they do produce the exclusion that
+ * earns escalation.
  *
  * THE FALL-THROUGH IS DELIBERATE BUT IT IS NOT SELF-CHECKING. A member added to
  * `SliceFailure` becomes retryable here without stopping the build, because
