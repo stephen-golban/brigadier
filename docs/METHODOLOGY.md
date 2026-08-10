@@ -24,20 +24,20 @@ The implementation has two preceding eligibility stages and implements the
 last four stages more tightly together. Its actual procedure is:
 
 1. Build one pool, in configuration order, from every configured model
-   ([`src/routing/router.ts:203`](../src/routing/router.ts#L203) and
+   ([`src/routing/router.ts:201`](../src/routing/router.ts#L201) and
    [`src/routing/router.ts:396`](../src/routing/router.ts#L396)).
 2. Apply quota per model. An exhausted model leaves the pool; a warning or an
    unknown reading does not
    ([`src/routing/router.ts:220`](../src/routing/router.ts#L220) and
    [`src/routing/router.ts:249`](../src/routing/router.ts#L249)).
 3. Exclude an exact `(vendor, model)` pair that already failed this slice
-   ([`src/routing/router.ts:280`](../src/routing/router.ts#L280)). This is retry
+   ([`src/routing/router.ts:285`](../src/routing/router.ts#L285)). This is retry
    history, not a preference.
 4. Filter on required image input, web search, structured output, and minimum
    context window. A missing capability record passes only when the slice asks
    for none of those things
    ([`src/routing/contracts.ts:43`](../src/routing/contracts.ts#L43) and
-   [`src/routing/router.ts:893`](../src/routing/router.ts#L893)).
+   [`src/routing/router.ts:895`](../src/routing/router.ts#L895)).
 5. Match each survivor's model ID against the competence table and split ranked
    from unranked models. Ranked models at or above the difficulty floor can enter
    ordinary eligibility. Ranked models below it and every unranked model are held
@@ -166,8 +166,8 @@ for those comparative claims is shipped with the router.
 
 After a worker actually runs and the attempt fails, the supervisor records that
 exact model as excluded and marks the next request `escalated`
-([`src/supervisor/slice.ts:286`](../src/supervisor/slice.ts#L286) and
-[`src/supervisor/slice.ts:503`](../src/supervisor/slice.ts#L503)). Exclusion
+([`src/supervisor/slice.ts:340`](../src/supervisor/slice.ts#L340) and
+[`src/supervisor/slice.ts:568`](../src/supervisor/slice.ts#L568)). Exclusion
 forces routing to another eligible model; under the ascending table this is
 normally the next model up. It is exact identity-based history, so capability,
 quota, and the floor can make the actual next choice differ from a simple
@@ -180,24 +180,19 @@ does the model's reported support. A `high` ceiling clamps an escalated request
 back to `high`; only a model permitted and reported to support `xhigh` can run at
 `xhigh` ([`src/routing/router.ts:1010`](../src/routing/router.ts#L1010)). The
 router also asserts before returning that `xhigh` was earned by an escalated
-request ([`src/routing/router.ts:1039`](../src/routing/router.ts#L1039)).
+request ([`src/routing/router.ts:1046`](../src/routing/router.ts#L1046)).
 
-That assertion checks the request flag, not the history behind it. The routing
-contract says `escalated` should mean the slice already ran and failed its gate,
-but the supervisor sets it on every attempt after the first
-([`src/supervisor/slice.ts:516`](../src/supervisor/slice.ts#L516)). It explicitly
-retries a first-attempt routing failure with `escalated: true`, and it can also
-retry a worktree-creation failure where no worker ran
-([`src/supervisor/slice.ts:1312`](../src/supervisor/slice.ts#L1312)). In those
-cases `xhigh` is reachable without an observed model-gate failure. The strict
-“only after a slice fails its gate” rule is therefore documented in the types
-but not enforced end to end.
+The supervisor now earns that flag from evidence rather than the attempt number.
+It adds a model to `excluded` only when a worker process actually ran, and sets
+`escalated` only when that list is non-empty. A routing failure, worktree-creation
+failure, or pre-spawn cancellation may consume or stop an attempt, but cannot by
+itself unlock `xhigh`.
 
 ## Degraded routing
 
 `allowDegradedRouting` defaults to `false`
-([`src/config/contracts.ts:92`](../src/config/contracts.ts#L92) and
-[`src/config/contracts.ts:230`](../src/config/contracts.ts#L230)). Ordinary
+([`src/config/contracts.ts:95`](../src/config/contracts.ts#L95) and
+[`src/init/propose.ts:175`](../src/init/propose.ts#L175)). Ordinary
 routing admits only ranked models that establish the requested difficulty floor.
 
 With consent, the salvage pool contains both kinds of model that brigadier

@@ -2,26 +2,25 @@
 
 `brigadier` is a command-line supervisor for AI coding work. You give it a task
 or a plan; it decomposes the work into slices, routes each slice to a model,
-gives each one its own git worktree, spawns the vendor CLI you already have
-installed, has the work reviewed by a model from **the other vendor**, commits
-what passes, merges the lot onto one branch, and hands you a single report.
+gives each one its own git worktree, and spawns the vendor CLI you already have
+installed. When a cross-vendor review can run it happens before the commit; the
+resulting slice commits are merged onto one branch and reported together.
 
-It is not a proxy and not a hosted service. It never sees your API credentials
-and never talks to a model API. It spawns `claude` and `codex` as ordinary
-subprocesses on your machine, under your own logins.
+It is not a proxy and not a hosted service. It does not ask for or store model
+API credentials, and never talks to a model API. It spawns `claude` and `codex`
+as ordinary subprocesses on your machine, under your own logins.
 
 ## Why another one
 
-Every cross-vendor orchestrator on the market lets you pick a vendor *per task*.
-None of them **composes** vendors *within* one task — building with one and
+Brigadier **composes** vendors within one task — building with one and
 adversarially reviewing with the other before the work is allowed to commit.
-
-That composition is the entire point. A model asked to judge its own output
-prefers it; Anthropic's own guidance names this directly, describing "Claude's
-tendency to prefer its own results… when asked to verify or judge them." A
-second opinion from the same vendor is worth less than one from a different one,
-so brigadier's review gate always crosses the vendor line: a slice built by
-Claude is reviewed by Codex, and a slice built by Codex is reviewed by Claude.
+That composition is the entire point. Anthropic's
+[system card](https://www-cdn.anthropic.com/8b8380204f74670be75e81c820ca8dda846ab289.pdf)
+reports measurable favoritism in previous Claude models toward transcripts they
+were told came from Claude. Brigadier therefore does not ask a builder's vendor
+to supply its adversarial review: every review it runs crosses the vendor line.
+A slice built by Claude is reviewed by Codex, and a slice built by Codex is
+reviewed by Claude.
 
 The routing table that decides who builds what is published as auditable data in
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md), for one specific reason: a
@@ -77,12 +76,14 @@ Then, from inside a git repository:
 brigadier run "add a --json flag to the report command"
 ```
 
-A model reads your repository and writes a plan. The plan is printed before
-anything runs. Then every slice is routed, given a worktree, built, reviewed by
-the other vendor, committed, and merged onto `brigadier/<slug>`.
+A model reads your repository and writes a plan. The plan is printed before any
+slice runs. Then every slice is routed, given a worktree, and built. When a
+reviewer is available its review runs before the slice commit; successful slice
+commits are merged onto `brigadier/<slug>`.
 
-If the task is genuinely ambiguous, brigadier does not guess. It prints the
-questions it needs answered, spawns nothing, creates nothing, and exits `4`:
+If the task is genuinely ambiguous, brigadier does not guess. After the planner
+returns its questions, brigadier spawns no slice worker, creates no ref or
+worktree, and exits `4`:
 
 ```text
 brigadier run: this task is ambiguous enough that planning it would mean guessing, so nothing was planned, nothing was created, and no worker was spawned.
@@ -99,7 +100,9 @@ with the answers folded in.
 ### Before you spend a worker
 
 `--dry-run` routes every slice and reports it, creating no worktree, spawning no
-worker, and writing no commit. This is real output from a two-slice plan:
+slice worker, and writing no commit. With `--plan` it launches no model at all;
+with a task description it still launches the planner. This is real output from
+a two-slice plan:
 
 ```text
 run csv-export: 2 slice(s) in 2 wave(s)
@@ -131,8 +134,9 @@ Probe, propose, confirm, write.
 It asks four things: the default model per vendor, the effort ceiling per model
 (default `high`), whether a slice may run on a model below its difficulty floor
 rather than failing, and whether brigadier may link secret files into worker
-worktrees (default **no**). Re-running it is safe: an existing config supplies
-the defaults, so pressing enter through it changes nothing.
+worktrees (default **no**). An existing config supplies the defaults on a
+re-run; when discovery has not changed, pressing enter through it changes
+nothing.
 
 ### `brigadier run`
 
@@ -152,7 +156,7 @@ wrong.
 | `--plan <file>` | the plan JSON to run; `-` reads it from stdin |
 | `--max-workers <n>` | slices to run at once (default `1`). For a task description this is also the largest number of slices the planner may propose |
 | `--slug <name>` | names this run's branches (default: derived from the plan id) |
-| `--dry-run` | route every slice and report it; create no worktree, spawn no worker, write no commit |
+| `--dry-run` | route every slice and report it; create no worktree, spawn no slice worker, write no commit. A task description still launches the planner |
 | `--unsafe-in-place` | run workers in this checkout instead of isolated worktrees |
 | `-h`, `--help` | print usage |
 
@@ -166,9 +170,9 @@ isolated worktrees are the only thing that makes concurrent slices safe.
 
 ### `brigadier install <host>...`
 
-Writes brigadier's host-side doctrine into each host, so the host hands work
-*to* brigadier instead of doing it itself. The artifact is deliberately tiny;
-its whole message is *you are not the worker*.
+Writes brigadier's host-side doctrine into each CLI host, or stages Desktop's MCP
+bundle for manual installation, so the host hands work *to* brigadier instead of
+doing it itself. The doctrine's whole message is *you are not the worker*.
 
 | Host | What lands | Where |
 | --- | --- | --- |
@@ -178,21 +182,26 @@ its whole message is *you are not the worker*.
 | `claude-desktop` | an MCP bundle, **staged** for manual install | `~/.brigadier/surfaces/claude-desktop/` |
 
 `--all` installs every host, `--dry-run` reports what would be written, and
-`--force` replaces a file brigadier did not write. It is idempotent and it never
-silently overwrites your edits: a manifest at `~/.brigadier/surfaces.json`
-records the SHA-256 of everything brigadier wrote, so a file that no longer
-matches its recorded hash is refused, named, and left alone.
+`--force` replaces a regular file brigadier did not write. It is idempotent and
+it never silently overwrites your edits: a manifest at
+`~/.brigadier/surfaces.json` records the SHA-256 of everything brigadier wrote.
+Without `--force`, a file that no longer matches its recorded hash is refused,
+named, and left alone. A destination symlink is always refused, even with
+`--force`; writes use `O_NOFOLLOW` and may not escape the resolved install
+directory.
 
 Full detail, including the honest limits of each host, is in
 [docs/HOSTS.md](docs/HOSTS.md). The headline is that **the handoff hook is not
-uniform**: it works on Claude Code and opencode, is trust-gated on Codex — a
-click, required again after every edit because the definition is hashed — and is
-**impossible on Claude Desktop**, which exposes no hook surface at all.
+uniform**: it works on Claude Code; opencode's event binding is unverified; Codex
+is trust-gated — a click, required again after every edit because the definition
+is hashed — and it is **impossible on Claude Desktop**, which exposes no hook
+surface at all.
 
 ### `brigadier mcp`
 
-Serves brigadier's tools over stdio MCP. It takes no options; anything after the
-command word is a usage error rather than an ignored argument.
+Serves brigadier's tools over stdio MCP. It takes no runtime options;
+`-h`/`--help` prints usage, and any other argument is a usage error rather than
+an ignored argument.
 
 | Tool | What it does |
 | --- | --- |
@@ -239,7 +248,10 @@ default** — it sets the competence floor a model must clear, so a plan that do
 not say how hard a slice is has not been planned. `dependsOn` and `requires` are
 optional.
 
-A slice's prompt is the only thing its worker sees. Write it self-contained.
+A slice's prompt is its only task-specific brief. The supervisor prepends the
+write-lane boundary, and repository project instructions may still load, so
+write the prompt self-contained rather than assuming plan or conversation
+context.
 
 Two slices may not claim the same path, and no slice's path may sit inside a
 directory another claims. Paths must be literal — no globs — because a glob
@@ -304,8 +316,9 @@ Things to notice, because each is a deliberate design decision:
   the *slice* is wrong, not the model, and no third model fixes that.
 - **Concerns are printed under approvals.** They did not stop the commit, and
   they are the half of a review a human can still act on.
-- **The reviewer's model and elapsed time are always shown.** They are the only
-  evidence you have about how much reading actually happened.
+- **When a reviewer runs, its model and elapsed time are shown.** They are the
+  only evidence you have about how much reading actually happened. A
+  `NO_OTHER_VENDOR` skip has no reviewer identity to show.
 - **A skipped review says so, with its reason**, and never renders as a pass.
 
 ## The cross-vendor gate
@@ -335,18 +348,19 @@ model. Style, naming and formatting are explicitly out of scope.
 ### It fails open
 
 If no second vendor is installed, if the adapter is missing, if the reviewer
-fails, if its reply cannot be parsed, or if the run is cancelled mid-review, the
-review is **skipped and the slice commits anyway**.
+fails, or if its reply cannot be parsed, the review is **skipped and the slice
+commits anyway**. Cancellation is the exception: cancelling mid-review fails the
+attempt without committing it.
 
 This is deliberate. `brigadier init` produces a single-vendor config whenever it
 finds one CLI, and failing closed would fail every slice of every such run for
 reasons that have nothing to do with the user's code. The price is stated
 plainly rather than hidden:
 
-**On a single-vendor install, nothing adversarially reviews anything.** Every
-slice commits unreviewed, with `review: not run (NO_OTHER_VENDOR)` on its line.
-That is the most important caveat on this page for a new user. If you want the
-gate, install both CLIs.
+**On a single-vendor install, nothing adversarially reviews anything.** A slice
+that otherwise succeeds commits unreviewed, with
+`review: not run (NO_OTHER_VENDOR)` on its line. That is the most important
+caveat on this page for a new user. If you want the gate, install both CLIs.
 
 ### Nothing proves a reviewer looked
 
@@ -365,18 +379,20 @@ shown — is in [docs/REVIEW-GATE.md](docs/REVIEW-GATE.md).
 
 - **It commits only on branches it creates.** Never your branch, never `main`.
   Slice work lands on `brigadier/<slug>/slice-N`, is combined onto
-  `brigadier/<slug>`, and the intermediate refs are retired when the run ends.
+  `brigadier/<slug>`, and cleanup attempts to retire the intermediate refs when
+  the run ends.
 - **It never pushes.** Nothing leaves your machine. The approval gate is your
   own merge of `brigadier/<slug>`, which is the point: you review a branch, as
   you would any contributor's.
 - **Each slice runs in its own git worktree**, created as a sibling of your
   repository at `<repo>-brigadier/<slug>/slice-N`, and removed when the run
-  ends. Your checkout is never the worker's working directory unless you pass
-  `--unsafe-in-place`.
-- **Interrupting is safe.** Ctrl-C cancels every running worker along with its
-  whole process group, removes the worktrees, and retires the refs the run
-  created; the run exits `130`. A second Ctrl-C skips the cleanup and exits at
-  once. Slices that already committed keep their commits and are still merged —
+  ends when cleanup succeeds. Your checkout is never the worker's working
+  directory unless you pass `--unsafe-in-place`.
+- **Interrupting is controlled.** Ctrl-C cancels every running worker along with
+  its whole process group, attempts to remove worktrees and retire the refs the
+  run created, and exits `130`. This same cancellation path reaches a run started
+  through MCP. A second Ctrl-C skips the remaining cleanup and exits at once.
+  Slices that already committed keep their commits and are still merged —
   stopping a run is not a request to throw away finished work.
 - **Cleanup it could not finish is reported**, not assumed. If a worker will not
   die or a worktree will not go, the report says so under `cleanup failures:`
@@ -384,37 +400,42 @@ shown — is in [docs/REVIEW-GATE.md](docs/REVIEW-GATE.md).
 
 ## Secrets
 
-Redaction is **mandatory and not optional**. Every artifact brigadier
-produces — commit messages, diffs shown to reviewers, git output in error
-messages — has inventoried secret values replaced with `[REDACTED]`, whether or
-not you consented to anything.
+Redaction is **mandatory and not optional** once the worktree session has built
+its inventory. Commit messages, diffs shown to reviewers, git output in error
+messages, the reviewer's prompt, and paths and summaries returned by the
+reviewer have inventoried secret values replaced with `[REDACTED]`, whether or
+not you consented to anything. Planning happens before that inventory exists, so
+a task description and the printed model-authored plan are not covered by this
+redaction pass.
 
 **It defeats verbatim leaks only.** The inventory is a best-effort read of raw,
-dotenv, JSON, and common YAML files, and it matches exact byte sequences. A
-value a model transformed, summarised, base64-encoded, split, or truncated is
-**not** caught. Do not treat redaction as a guarantee that a secret cannot
-escape a worktree.
+dotenv, JSON, and common YAML files, and it matches exact byte sequences. The
+exact multiline value is still caught when git prefixes each diff line, but a
+value a model transforms, summarises, base64-encodes, separates arbitrarily, or
+truncates is **not** caught. Do not treat redaction as a guarantee that a secret
+cannot escape a worktree.
 
 Making secret files *visible* to workers at all is a separate, explicit consent
 recorded at `init`, defaulting to **No**. With consent off, no `.env` is linked
 into any worktree. Linked secret paths are additionally refused at commit time,
 so a worker cannot commit one back.
 
-`--unsafe-in-place` bypasses all of this: the worker runs in your checkout,
-where every file you can see is a file it can see, whatever the consent policy
-says.
+`--unsafe-in-place` bypasses worktree isolation and the linked-file visibility
+boundary: the worker runs in your checkout, where every file you can see is a
+file it can see, whatever the consent policy says. It does not disable artifact
+redaction or the configured linked-secret commit refusal.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | the command succeeded |
-| `1` | brigadier could not start the run — no config, an unreadable or invalid plan, an environment missing `HOME`, `PATH` or `USER`, or a planner that could not produce a plan. Nothing was created |
+| `1` | brigadier could not enter the supervisor — no config, an unreadable plan document, an environment missing `HOME`, `PATH` or `USER`, or a planner that could not produce a plan. No ref or worktree was created |
 | `2` | usage error |
-| `3` | the run started and did not succeed. The `run failed:` line names the stage that stopped it, and each slice's line names what happened to it |
-| `4` | the task was too ambiguous to plan. Nothing was spawned and nothing created; the questions are printed. Not a failed run — answer them and run it again |
-| `130` | interrupted with SIGINT (Ctrl-C); workers terminated, worktrees removed, refs retired |
-| `143` | interrupted with SIGTERM; identical to `130` but for the signal |
+| `3` | the supervisor returned an unsuccessful report, including a syntactically valid plan that cannot be scheduled. The `run failed:` line names the stage that stopped it, and cleanup failures are printed |
+| `4` | the task was too ambiguous to plan. The planner ran, but no slice worker, ref, or worktree was created; the questions are printed. Not a failed run — answer them and run it again |
+| `130` | interrupted with SIGINT (Ctrl-C); running workers are terminated and cleanup is attempted. Any cleanup failure is printed; a second interrupt skips the rest |
+| `143` | interrupted with SIGTERM; the same handling as `130`, for the other signal |
 
 `brigadier install` has its own smaller scheme: `0` every file is in place, `1`
 at least one file was refused or could not be written, `2` usage error.
@@ -465,17 +486,16 @@ at least one file was refused or could not be written, `2` usage error.
 
 ```sh
 bun install
-bun test          # 711 tests
+bun test          # 736 tests
 bun run typecheck
 bun run check     # biome
 bun run build
 ```
 
 `bun run build` emits an ad-hoc-signed native `./brigadier` executable plus
-Node-compatible modules under `dist/`. `bun run build:mcp` bundles the MCP server
-for the Claude Desktop bundle, but does not honour its `--outfile`: it writes
-`src/mcp/server.js` beside the entry point instead, and `bun run check` fails on
-that minified output until it is moved or deleted. See
+Node-compatible modules under `dist/`, including the MCP server at
+`dist/mcp/server.js`. `bun run build:mcp` builds that MCP bundle directly and
+leaves no generated JavaScript under `src/`. See
 [docs/RELEASING.md](docs/RELEASING.md).
 
 Worker and quota subprocesses run in detached POSIX process groups under both

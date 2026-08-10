@@ -1,17 +1,20 @@
 # The cross-vendor review gate
 
-One model builds a slice; a model from the **other** vendor reads what it built
-and says whether it is correct, before the work is allowed to commit.
+One model builds a slice; when the other vendor is available, one of its models
+reads what was built and says whether it is correct before the work is allowed
+to commit. If that review cannot run, the explicit fail-open policy below
+applies.
 
-That composition is brigadier's differentiator. Every comparable tool lets you
-pick a vendor per task; none of them builds with one vendor and adversarially
-reviews with the other inside a single task. The reason to bother is documented
-self-preferential bias — a model asked to judge its own output prefers it — so
-the second opinion has to come from a different vendor to be worth its cost.
+That composition is brigadier's differentiator: it builds with one vendor and
+adversarially reviews with the other inside a single task. Anthropic's
+[system card](https://www-cdn.anthropic.com/8b8380204f74670be75e81c820ca8dda846ab289.pdf)
+reports measurable favoritism in previous Claude models toward transcripts they
+were told came from Claude. Brigadier therefore crosses the vendor line for the
+adversarial review instead of asking the builder's vendor to judge its own work.
 
 This document is the honest version. If you read only one section, read
 [What it does not catch](#what-it-does-not-catch) and
-[It fails open](#it-fails-open).
+[It fails open, except on cancellation](#it-fails-open-except-on-cancellation).
 
 ## Where it runs
 
@@ -34,6 +37,10 @@ identical sanitizing pipeline the commit runs, with the same parent, the same
 staging, the same linked-secret refusal, and the same byte-level redaction of
 every blob and every path. Its objects are written to a temporary store, so a
 rejected slice leaves nothing behind in your object database.
+
+The task text, allowed paths, and the rest of the reviewer prompt pass through
+the same redactor before launch. Returned finding paths and summaries are
+redacted before they enter the review artifact or run report.
 
 Alongside the diff, the reviewer is given the slice's task text ("is this
 correct" is unanswerable without "correct for what") and the list of paths the
@@ -179,11 +186,11 @@ Routing ranks models against a *slice's* difficulty, and a review is not the
 slice; "who should read this" is a different question.
 
 Reviewer effort is capped at `high` whatever the configured ceiling says.
-`xhigh` is an escalation earned by an observed gate failure, and the reviewer is
-the thing that observes it, so it can never itself have earned the rung. A model
-whose ceiling is `medium` reviews at `medium`.
+`xhigh` is an escalation earned by a model that actually ran and failed, and the
+reviewer is not a slice attempt, so it can never itself have earned the rung. A
+model whose ceiling is `medium` reviews at `medium`.
 
-## It fails open
+## It fails open, except on cancellation
 
 If the review cannot happen, the slice **commits anyway** and the skip is
 reported with its reason.
@@ -194,7 +201,10 @@ reported with its reason.
 | `NO_ADAPTER` | the other vendor is configured but no adapter resolved for it |
 | `REVIEWER_FAILED` | the reviewer's own worker failed — quota, auth, a crash. It says nothing about the slice |
 | `UNREADABLE_RESPONSE` | the reviewer answered, but with no findings block this build could parse |
-| `CANCELLED` | the run was interrupted while the reviewer was running |
+
+Cancellation is different. The review record carries `CANCELLED`, but the slice
+runner treats it as a cancelled, non-retryable attempt, removes the worktree, and
+does not commit the unreviewed change.
 
 Failing closed was the alternative and it was refused: `brigadier init` produces
 a single-vendor config whenever it finds one CLI, and one vendor's outage — or
@@ -202,8 +212,8 @@ one missing install — would then fail every slice of every run for reasons tha
 have nothing to do with the user's code.
 
 **The price, stated plainly: on a single-vendor install, nothing adversarially
-reviews anything.** Every slice commits with `review: not run (NO_OTHER_VENDOR)`
-on its line.
+reviews anything.** A slice that otherwise succeeds commits with
+`review: not run (NO_OTHER_VENDOR)` on its line.
 
 The obligation that comes with failing open is that a skipped gate must be
 impossible to mistake for a passing one. That is why the verdict has three arms

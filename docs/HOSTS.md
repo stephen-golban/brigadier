@@ -1,9 +1,9 @@
 # Host surfaces
 
 brigadier is one engine. `brigadier install <host>` writes a small doctrine
-artifact into each host's own configuration slot, so the host hands work *to*
-brigadier instead of doing it itself. The artifact is deliberately tiny; its
-whole message is *you are not the worker*.
+artifact into a host's configuration slot, or stages Desktop's MCP bundle for
+manual installation, so the host hands work *to* brigadier instead of doing it
+itself. The doctrine's whole message is *you are not the worker*.
 
 It is not a package manager, it installs no plugin runtime, and it depends on
 none. The shipped product spawns `claude` and `codex` as plain subprocesses.
@@ -19,7 +19,7 @@ brigadier install --all --dry-run
 | --- | --- |
 | `--all` | install every host |
 | `--dry-run` | report what would be written and write nothing |
-| `--force` | replace a file brigadier did not write, or that was edited after it did |
+| `--force` | replace a regular file brigadier did not write, or that was edited after it did |
 | `-h`, `--help` | print usage |
 
 Exit codes: `0` every file is in place, `1` at least one file was refused or
@@ -43,6 +43,10 @@ brigadier last wrote to each path:
   safe: with no record, every pre-existing file is refused rather than replaced.
 
 Running `brigadier install` twice does nothing the second time.
+
+A destination symlink is always refused, even with `--force`. The installer
+resolves the install root, refuses writes that escape it, and opens destination
+files with `O_NOFOLLOW` so a symlink swap cannot redirect the write.
 
 ## Where each host's files land
 
@@ -114,15 +118,11 @@ to do next.
 | bundle manifest | `~/.brigadier/surfaces/claude-desktop/manifest.json` |
 | instructions | `~/.brigadier/surfaces/claude-desktop/README.md` |
 
-To finish, from a source checkout: run `bun run build:mcp`, place the emitted
-bundle at `server/brigadier-mcp.js` inside the staged directory — the path the
-manifest's `entry_point` names — zip that directory with `manifest.json` at the
-archive root, rename it `brigadier.mcpb`, and open it with Desktop.
-
-Note that `build:mcp` does not honour its `--outfile`: it writes the bundle
-beside the entry point, as `src/mcp/server.js`, together with a source map.
-Take the file from there, and delete both artifacts afterwards — `bun run check`
-fails on the minified output while it is present. See
+To finish, from a source checkout: run `bun run build:mcp`, copy
+`dist/mcp/server.js` to `server/brigadier-mcp.js` inside the staged directory —
+the path the manifest's `entry_point` names — zip that directory with
+`manifest.json` at the archive root, rename it `brigadier.mcpb`, and open it with
+Desktop. The build leaves no generated JavaScript under `src/`. See
 [RELEASING.md](RELEASING.md).
 
 Desktop gets an MCP server rather than a skill because Desktop **Skills execute
@@ -142,14 +142,14 @@ tempted to keep grinding rather than delegate. **It does not exist uniformly.**
 | Host | Status |
 | --- | --- |
 | Claude Code | **Works.** `PreCompact` receives the transcript path and the hook can write a message back into the session |
-| opencode | **Works.** The plugin subscribes to the session event bus, against event names not verified on a running opencode |
+| opencode | **Event binding unverified.** The plugin subscribes to the session event bus, but its event names have not been verified on a running opencode |
 | Codex | **Trust-gated.** Hooks run only after you click to trust the hook definition, and the definition is hashed — so the click is required again after every edit to the script. This is not seamless and is not presented as such |
 | Claude Desktop | **Impossible.** Desktop exposes no hook surface at all, and an MCP server is called by the model, never by the transcript. There is no workaround |
 
 ## Using brigadier over MCP directly
 
 `brigadier mcp` serves the same three tools over stdio to any MCP client, with no
-bundle involved. It takes no options.
+bundle involved. It takes no runtime options; `-h`/`--help` prints usage.
 
 | Tool | Effect |
 | --- | --- |
@@ -157,8 +157,11 @@ bundle involved. It takes no options.
 | `brigadier_route_plan` | Reads this machine's config. Reports the vendor, model and effort each slice would get, or why nothing can take it. Creates no worktree, spawns no worker |
 | `brigadier_run` | The real thing: worktrees, workers, commits, one integration branch |
 
-`brigadier_run` requires an absolute `repositoryPath`, and takes the same
-`slug`, `maxWorkers`, `dryRun` and `unsafeInPlace` options the CLI does.
+`brigadier_run` takes a non-empty `repositoryPath` plus the same `slug`,
+`maxWorkers`, `dryRun` and `unsafeInPlace` options the CLI does. Its schema calls
+the path absolute, but the current implementation enforces only that it is a
+non-empty string. Clients should pass an absolute path to avoid making the MCP
+server's working directory part of the request.
 
 `brigadier_route_plan` routes against an empty quota snapshot, which the routing
 pipeline reads as "unknown" and therefore as available — so a drained model is

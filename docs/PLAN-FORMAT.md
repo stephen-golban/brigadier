@@ -1,8 +1,9 @@
 # The plan document
 
-A plan is the one thing you hand brigadier that decides what gets spawned, where
-it may write, and how capable the model running it has to be. It arrives as
-bytes with no schema behind it, so it is checked twice before anything happens:
+A plan decides what gets spawned, where it may write, and how capable the model
+running it has to be. Whether it came from a file or the planner, it arrives at
+the parser as bytes with no schema behind it and is checked twice before the
+supervisor creates a ref or worktree:
 
 1. **Shape**, by the parser that reads every plan — whether you wrote the file
    or `brigadier run "<task>"` had a model write it. Wrong types, missing
@@ -15,8 +16,9 @@ bytes with no schema behind it, so it is checked twice before anything happens:
 Both collect **every** issue and report them together, so a plan is repaired in
 one pass rather than one defect per invocation.
 
-A plan rejected by either check costs zero worktrees, zero refs, and zero
-spawned workers.
+A plan rejected by either check costs zero worktrees, zero refs, and zero slice
+workers. With a task description, the planner has already run before its plan
+reaches these checks.
 
 ## Shape
 
@@ -56,7 +58,7 @@ No other key is permitted at the top level.
 | --- | --- | --- | --- |
 | `id` | string | yes | non-empty, unique across the plan |
 | `title` | string | yes | non-empty, short |
-| `prompt` | string | yes | non-empty. The **only** thing the worker sees |
+| `prompt` | string | yes | non-empty. The worker's only task-specific brief |
 | `ownedPaths` | string[] | yes | non-empty. Exclusive ownership; see below |
 | `difficulty` | enum | yes | `routine`, `standard`, or `hard`. **No default** |
 | `dependsOn` | string[] | no | defaults to `[]` |
@@ -78,9 +80,9 @@ slice asks for none of these.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `imageInput` | boolean | the worker must accept image input |
-| `webSearch` | boolean | the worker must be able to search the web |
-| `structuredOutput` | boolean | the worker must support structured output |
+| `imageInput` | boolean | when `true`, the worker must accept image input |
+| `webSearch` | boolean | when `true`, the worker must be able to search the web |
+| `structuredOutput` | boolean | when `true`, the worker must support structured output |
 | `minContextWindowTokens` | integer | non-negative; minimum context window |
 
 ## Owned paths
@@ -137,8 +139,10 @@ exclusive ownership: two slices in a dependency relationship still may not claim
 overlapping paths.
 
 The validator computes topological **waves** at their full structural width.
-`--max-workers` is the only concurrency throttle; the waves themselves impose no
-extra barrier beyond the dependency order.
+`--max-workers` throttles concurrency within a wave. The supervisor waits for and
+accumulates the whole non-final wave before it creates any worktree in the next,
+so wave boundaries are real barriers and can delay slices that do not directly
+depend on every member of the preceding wave.
 
 If a slice fails, or a wave's accumulation conflicts, every later wave is
 skipped. Slices already in flight are left to finish — they are independent of
@@ -194,9 +198,11 @@ directories above them if they are empty.
 
 ## Writing a good slice prompt
 
-The worker sees the prompt and nothing else. No plan, no sibling slices, no
-conversation. A prompt that assumes context the worker does not have produces a
-slice that fails its gate for reasons that are not the model's fault.
+The worker receives no plan, sibling slices, or host conversation. The
+supervisor prepends the write-lane boundary to the prompt, and repository project
+instructions may still load. A prompt that assumes task context the worker does
+not have produces a slice that fails its gate for reasons that are not the
+model's fault.
 
 Name the files, the interfaces, the constraints, and the definition of done.
 State what the slice may **not** touch — the worker cannot write outside its
