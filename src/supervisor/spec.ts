@@ -260,7 +260,22 @@ function assertLaneSafeOwnedPaths(slice: Slice): void {
   }
 }
 
+/**
+ * Names the refusal boundary before the task, so a worker does not spend turns
+ * attempting edits the lane will reject.
+ *
+ * THE EMPTY LANE GETS ITS OWN SENTENCE. A slice with no owned paths is not a
+ * degenerate coding slice; it is a READ-ONLY task — the shape `runOneShotPrompt`
+ * builds for the review gate and for a planner. Rendering it through the
+ * list-shaped wording would produce "You may edit only these owned paths:"
+ * followed by nothing at all, which reads as a truncated instruction rather
+ * than a complete one, and a worker that reads it as truncation is a worker
+ * that starts guessing at what was meant to follow.
+ */
 function workerPrompt(slice: Slice): string {
+  if (slice.ownedPaths.length === 0) {
+    return `You may edit no files. This is a read-only task.\n\n${slice.prompt}`;
+  }
   const ownedPaths = slice.ownedPaths.map((path) => `- ${path}`).join("\n");
   return `You may edit only these owned paths:\n${ownedPaths}\n\n${slice.prompt}`;
 }

@@ -27,6 +27,26 @@
  * `status`, and re-documents `QuotaSnapshot.status` as account-derived. Nothing
  * else in this file changed: not the worker contract, not the event union, not
  * the effort ladder, not `Capability`. The freeze is spent, not eroded.
+ *
+ * AMENDED A SECOND TIME, IN WO-019, AND ONLY IN A COMMENT.
+ *
+ * `SpawnedWorker.cancel` was documented as terminating "the entire process
+ * group, including descendants". That claim was measured false: a descendant
+ * that calls `setsid` creates its own process group and survives `kill(-pid)`,
+ * reproduced with real pids. No adapter can satisfy the promise, because group
+ * signalling has no mechanism that would, so the comment described behaviour
+ * that does not exist and cannot be built — and this repository treats a
+ * comment that contradicts its code as a defect rather than a nit, because a
+ * caller trusting that sentence would skip exactly the "a worker may still be
+ * running" reporting the supervisor now does. The comment states what is really
+ * guaranteed instead.
+ *
+ * NO TYPE CHANGED IN THIS AMENDMENT. The cross-vendor review gate WO-019 built
+ * needed nothing from this file: its verdict vocabulary, its reviewer seam, and
+ * its failure kind all live in `src/supervisor/contracts.ts`, and the one-shot
+ * prompt primitive it introduced is expressed entirely in the worker contract
+ * that was already here. Amendment was pre-authorized for that work and was
+ * spent only on the false sentence.
  */
 
 /**
@@ -381,7 +401,28 @@ export type CancelReason =
 interface SpawnedWorkerBase {
   /** Session/thread identity, if any, arrives through this stream. */
   readonly events: AsyncIterable<WorkerEvent>;
-  /** Must terminate the entire process group, including descendants. */
+  /**
+   * Signals the worker's process group and resolves once the adapter has
+   * settled `completion`.
+   *
+   * WHAT IS ACTUALLY GUARANTEED: the signal is delivered to the process group
+   * the adapter created, so the direct child and every descendant that stayed
+   * in that group is terminated.
+   *
+   * WHAT IS NOT, AND THE PREVIOUS WORDING HERE CLAIMED IT WAS. This method used
+   * to be documented as terminating "the entire process group, including
+   * descendants", which reads as a promise that no descendant survives. It
+   * cannot be one. A descendant that calls `setsid` leaves the group and
+   * becomes the leader of its own, and `kill(-pid)` reaches only the original
+   * group — reproduced against real pids, where the re-parented process was
+   * still alive after the signal. Group signalling has no mechanism that could
+   * deliver the stronger claim, so no adapter can be written to satisfy it and
+   * a caller must not rely on it. `cancel` resolving is evidence that the group
+   * was signalled and the outcome recorded, never proof that nothing the worker
+   * started is still running; that is exactly why the supervisor reports
+   * unconfirmed termination as a cleanup failure rather than asserting the
+   * worker is dead.
+   */
   cancel(reason: CancelReason): Promise<void>;
 }
 

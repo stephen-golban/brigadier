@@ -38,6 +38,7 @@ const PUBLIC_API: readonly string[] = [
   "LinkedSecretCommitError",
   "NoChangesToCommitError",
   "PlanDocumentError",
+  "REVIEW_SKIP_REASONS",
   "RUN_FAILURE_REASONS",
   "SLICE_FAILURE_KINDS",
   "VendorDiscoverer",
@@ -51,6 +52,7 @@ const PUBLIC_API: readonly string[] = [
   "createClaudeWorker",
   "createCodexQuotaOracle",
   "createCodexWorker",
+  "createCrossVendorReviewer",
   "createDiscoverer",
   "createIdleTimeoutMs",
   "createRunner",
@@ -70,6 +72,7 @@ const PUBLIC_API: readonly string[] = [
   "resolveConfigPath",
   "route",
   "runInit",
+  "runOneShotPrompt",
   "serializeConfig",
   "validatePlan",
   "withDefaultModel",
@@ -84,7 +87,7 @@ test("root barrel exposes exactly the curated public surface", () => {
   const exports = Object.keys(packageApi).sort();
 
   expect(exports).toEqual([...PUBLIC_API]);
-  expect(exports).toHaveLength(62);
+  expect(exports).toHaveLength(65);
 });
 
 test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {
@@ -122,6 +125,12 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     "DefaultSliceRunner",
     "CAPABILITY_TABLE",
     "matchCapabilityRule",
+    // Review-gate internals. `spawnWorker` is the vendor-correlation guard the
+    // slice runner and the one-shot primitive share; `parseFindings` is this
+    // build's tolerance of a reviewer's reply format, which has to stay free to
+    // change as the vendors' output does.
+    "spawnWorker",
+    "parseFindings",
     // Discovery wiring and low-level readers.
     "VENDOR_CATALOG_SOURCES",
     "CLAUDE_CATALOG_SOURCE",
@@ -152,7 +161,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
   for (const name of mustNotLeak) {
     expect(exports).not.toContain(name);
   }
-  expect(mustNotLeak).toHaveLength(42);
+  expect(mustNotLeak).toHaveLength(44);
 });
 
 test("built dist output executes the Codex quota oracle under Node", () => {

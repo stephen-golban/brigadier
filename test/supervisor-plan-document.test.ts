@@ -683,6 +683,7 @@ describe("supervisor contracts", () => {
       "ROUTING_FAILED",
       "WORKTREE_FAILED",
       "WORKER_FAILED",
+      "REVIEW_REJECTED",
       "NO_CHANGES",
       "COMMIT_FAILED",
     ]);
@@ -693,7 +694,7 @@ describe("supervisor contracts", () => {
       "SLICE_FAILED",
       "MERGE_CONFLICT",
     ]);
-    expect(new Set(SLICE_FAILURE_KINDS).size).toBe(5);
+    expect(new Set(SLICE_FAILURE_KINDS).size).toBe(6);
     expect(new Set(RUN_FAILURE_REASONS).size).toBe(5);
   });
 
