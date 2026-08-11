@@ -117,13 +117,12 @@ non-interactively from `$CODEX_HOME/config.toml` under a `[hooks.state]` table:
 an entry keyed as `<hooks file>:<snake_case event>:<group index>:<hook index>`
 carries a `trusted_hash`. This directly answers whether approval was persisted,
 and verifies the existing claim that approval binds to the registration rather
-than to the script's contents: the recorded hash matches neither the hook script
-nor the hooks file. The narrower observation remains true on codex-cli 0.147.0:
-there is no dedicated hook diagnostic command—`codex doctor` output contains
-the string `hook` zero times, and `codex --help` lists no `hooks` subcommand.
-`codex --help` does
-list `--dangerously-bypass-hook-trust`, which `surfaces/codex/hooks/README.md`
-documents.
+than to the script's contents: the recorded hash matches neither the hook
+script nor the hooks file. The narrower observation remains true on codex-cli
+0.147.0: there is no dedicated hook diagnostic command — `codex doctor` output
+contains the string `hook` zero times, and `codex --help` lists no `hooks`
+subcommand. `codex --help` does list `--dangerously-bypass-hook-trust`,
+which `surfaces/codex/hooks/README.md` documents.
 
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
 including brigadier's own workers, and no flag suppresses it. Keep it doctrine.
