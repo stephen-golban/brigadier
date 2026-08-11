@@ -196,9 +196,10 @@ export function parseConfig(value: unknown): BrigadierConfig {
   // Every other rule below assumes the file is shaped the way this build
   // expects. An older file is not, and letting it fall through would report
   // shape differences instead of their cause. One sentence saying which
-  // version was found and what to do about it is the whole diagnosis. The
-  // package is unpublished at 0.1.0, so re-running `init` is a complete remedy
-  // and no migration path is owed.
+  // version was found and what to do about it is the whole diagnosis. `init`
+  // catches this error, ignores the existing file, and rebuilds a complete
+  // config by collecting the user's choices again instead of migrating the
+  // prior values.
   if (root.version !== CONFIG_VERSION) {
     throw new ConfigValidationError([
       `config version must be ${CONFIG_VERSION}, received ${JSON.stringify(root.version)}; this file was written by a different version of brigadier — run \`brigadier init\` again to rewrite it`,

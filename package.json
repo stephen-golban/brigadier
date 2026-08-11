@@ -1,6 +1,6 @@
 {
   "name": "@stephen-golban/brigadier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Orchestrate AI coding work from the command line",
   "license": "MIT",
   "type": "module",
@@ -41,10 +41,10 @@
     "typecheck": "tsc --noEmit"
   },
   "optionalDependencies": {
-    "@stephen-golban/brigadier-darwin-arm64": "0.1.0",
-    "@stephen-golban/brigadier-darwin-x64": "0.1.0",
-    "@stephen-golban/brigadier-linux-arm64": "0.1.0",
-    "@stephen-golban/brigadier-linux-x64": "0.1.0"
+    "@stephen-golban/brigadier-darwin-arm64": "0.1.1",
+    "@stephen-golban/brigadier-darwin-x64": "0.1.1",
+    "@stephen-golban/brigadier-linux-arm64": "0.1.1",
+    "@stephen-golban/brigadier-linux-x64": "0.1.1"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

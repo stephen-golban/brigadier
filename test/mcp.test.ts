@@ -64,7 +64,7 @@ const MAX_STREAM_CHUNKS = 256;
  * legible line, instead of failing inside a 165-character golden string where
  * the diff is unreadable.
  */
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 interface Session {
   readonly stdout: string;
@@ -338,7 +338,7 @@ describe("the MCP server over stdio", () => {
       // over.
       expect(lines.length).toBe(2);
       expect(lines[0]).toBe(
-        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.0"}}}',
+        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );
       expect(lines[1]).toBe('{"jsonrpc":"2.0","id":2,"result":{}}');
       expect(session.stderr).toBe("");
@@ -364,12 +364,12 @@ describe("the MCP server over stdio", () => {
       const lines = responses(session);
       expect(lines.length).toBe(2);
       expect(lines[0]).toBe(
-        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.0"}}}',
+        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );
       // An older revision this server does speak is echoed back rather than
       // silently upgraded.
       expect(lines[1]).toBe(
-        '{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.0"}}}',
+        '{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -877,7 +877,7 @@ describe("the MCP server over stdio", () => {
       // The entry point `bin/brigadier-mcp.js` will call, with no injection at
       // all, reporting the version out of package.json.
       expect(lines[0]).toBe(
-        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.0"}}}',
+        '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );
       // The pure tool is fully real here: no fake touched it.
       expect(lines[1]).toBe(

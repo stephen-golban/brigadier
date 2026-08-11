@@ -43,9 +43,13 @@ with every score in that document without taking anybody's word for it.
 
 ## Install
 
-**The package is not published.** Version is `0.1.0`, it is not on npm, and it
-is not on Homebrew. Both of those paths exist in the repository and neither is
-available yet. Build it from source:
+Install the published npm package globally:
+
+```sh
+npm install --global @stephen-golban/brigadier
+```
+
+Homebrew is not available. To build from source instead:
 
 ```sh
 git clone https://github.com/stephen-golban/brigadier
@@ -486,7 +490,9 @@ at least one file was refused or could not be written, `2` usage error.
   which suppresses only `$CODEX_HOME/config.toml`. Codex CLI 0.145.0 still loads
   `$CODEX_HOME/AGENTS.md` and exposes no flag to disable it, so a Codex worker
   can never be fully isolated from ambient user instructions.
-- **Not published.** `0.1.0`, no npm, no Homebrew.
+- **No Homebrew tap.** `Formula/brigadier.rb` carries placeholder digests, and
+  no tap is published, so npm is the only published package-manager install
+  path.
 
 ## Documentation
 

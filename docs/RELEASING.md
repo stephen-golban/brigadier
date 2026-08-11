@@ -1,12 +1,10 @@
 # Releasing Brigadier
 
-Nothing has ever been published. `package.json` says `0.1.0`, no version exists
-on npm, no GitHub release exists, no Homebrew tap exists, and
-`.github/workflows/release.yml` has never run because no `v*` tag has ever been
-pushed. Everything below describes a path that has been exercised locally, step
-by mechanical step, but never end to end against a real registry. The section
-[What has never been proven](#what-has-never-been-proven) says exactly where the
-proof stops.
+`package.json` says `0.1.1`. This release publishes all five packages to npm and
+creates a GitHub release. Homebrew remains unavailable. Before this release,
+the workflow had completed one secret-less tag run without publishing. The
+section [What had never been proven before 0.1.1](#what-had-never-been-proven-before-011)
+records what remained unproven when the `0.1.1` release began.
 
 A release ships five npm packages and four archives:
 
@@ -22,11 +20,13 @@ A release ships five npm packages and four archives:
 
 ## The safety design, in one paragraph
 
-The workflow triggers on any `v*` tag, but **every outward-facing step is gated
-on a secret that does not exist yet**. Push a tag today and the workflow builds
-everything and publishes nothing. That is deliberate: the missing secret *is* the
-safety catch. Adding a secret is therefore the irreversible act, not pushing the
-tag. Add them only when you intend to ship.
+The workflow triggers on any `v*` tag. Before tagging, run `gh secret list` to
+check whether `NPM_TOKEN` and `RELEASE_PUBLISH_ENABLED` are present. With both
+absent, the tag builds everything and publishes nothing — run `31513095322`
+measured exactly that state. With `NPM_TOKEN` present or
+`RELEASE_PUBLISH_ENABLED` set to `true`, pushing the tag is the irreversible
+publishing act for that path. Treat a listed publication secret as armed, and
+add one only when you intend to ship.
 
 ---
 
@@ -225,9 +225,17 @@ executable, and the notarized DMG rides along as evidence.
 ## Moving the version, everywhere it lives
 
 The current version appears in more places than `package.json`, and several are
-enforced by `bun test` — deliberately. Move every version reference below from
-the current version to the next version. This list was verified by the past
-`0.0.0` → `0.1.0` bump and a full-suite run.
+enforced by `bun test` — deliberately. Move every version reference in items
+1–8 from the current version to the next version. Items 9 and 10 are status
+passages: review them during each release and update them only when the state
+they describe has changed.
+
+This list was first verified by the `0.0.0` → `0.1.0` bump and a full-suite run.
+The `0.1.0` → `0.1.1` bump then ran the full list and all four gates: `bun test`
+(817 pass, 2 skip, 0 fail), `bun run typecheck`, `bun run check`, and
+`bun run build`, all with rc 0. That second pass exposed the item 9 defect: the
+deferred-reword rule would have published a README saying the package was not on
+npm.
 
 **Enforced — the release or the test suite fails if you skip these:**
 
@@ -262,14 +270,14 @@ the current version to the next version. This list was verified by the past
    string. Move its version from the current version to the next version.
 8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same
    value. Move it from the current version to the next version too.
-9. `README.md` → the two passages stating the package is unpublished at the
-   current version. Move their version references to the next version. Once the
-   release lands, reword their release status: they stop being true then.
-10. `src/config/contracts.ts` → the comment explaining that the package is
-    unpublished at the current version, so re-running `init` is a complete
-    remedy and no migration path is owed. Move its version reference to the next
-    version. Once the release lands, reword it: re-running `init` remains
-    correct, but that premise does not.
+9. `README.md` → the two publication-status passages. Review them during each
+   release and update them in the release commit only when the publication state
+   they describe will change. The tagged commit is the published npm artifact,
+   and npm serves that README for that version; correcting it after the release
+   requires publishing another version.
+10. `src/config/contracts.ts` → the comment describing what `init` does when
+    config validation fails. Review it during each release and update it only if
+    that behaviour has changed.
 
 > **Items 7 and 8 are unenforced only if you skip them. Doing them turns
 > `bun test` red until you also move a pin.**
@@ -327,7 +335,8 @@ npm pkg set "version=${VERSION}" \
 bun install
 ```
 
-Then edit items 3, 4, 5, 7, 8, 9, and 10 from the list above by hand.
+Then edit items 3, 4, 5, 7, and 8 from the list above by hand. Review items 9
+and 10, and update them only when the state they describe has changed.
 
 Items 7 and 8 change a pinned file, so recompute the pin before you run the gate:
 
@@ -472,31 +481,51 @@ ls "${scratch}/node_modules/@stephen-golban/"
 
 ---
 
-## What has never been proven
+## What has been exercised
 
-Be honest with yourself about which of these you are doing for the first time.
+These release-path steps have executed:
 
-- **Notarization has never run.** `scripts/notarize.sh` has only ever been
-  executed with its credentials absent, where it exits `1` naming the first
+- **The tag guard has been exercised in both directions.** Against the bumped
+  `0.1.1` tree, the guard returned rc `0` for
+  `GITHUB_REF_NAME="v0.1.1" bash scripts/verify-tag-version.sh` and rc `1` for
+  `GITHUB_REF_NAME="v0.1.0" bash scripts/verify-tag-version.sh`.
+- **Owner-reported manual exercise, with no retained repository evidence:** the
+  formula rewrite against real digests was reproduced by hand on a developer
+  Mac.
+- **The secret-less tag path has executed.** Run `31513095322`, triggered by
+  pushing `v0.1.0` with `gh secret list` empty, completed all seven jobs green
+  and produced five artifacts: `release-darwin-arm64` (48 MB),
+  `release-darwin-x64` (54 MB), `release-linux-arm64` (74 MB),
+  `release-linux-x64` (74 MB), and `release-root-npm` (1 MB). Both publication
+  jobs went green by skipping: `Create GitHub release: skipped` →
+  `Publication disabled`, and `Publish platform packages: skipped` →
+  `Publication disabled`. Afterwards, `gh release list` returned zero releases
+  and `npm view @stephen-golban/brigadier` returned `E404`. This measures the
+  secret-less-tag behaviour; it does not prove either publication path.
+
+---
+
+## What had never been proven before 0.1.1
+
+These were unproven when the `0.1.1` release began:
+
+- **Notarization had never run.** `scripts/notarize.sh` had only ever been
+  executed with its credentials absent, where it exited `1` naming the first
   missing variable. Every line past that check — the Developer ID `codesign`,
   `hdiutil create`, `xcrun notarytool submit --wait`, `xcrun stapler staple` —
-  is unexecuted code. Apple's notary service may also reject a bare
-  command-line executable in a DMG for reasons this repository cannot anticipate.
-- **The certificate import on a runner has never run.** The
-  `security import ... -t cert -f pkcs12` sequence in the workflow is untested
-  against a real `.p12`.
-- **Nothing has ever been published to npm**, so the scope permissions, the
+  was unexecuted code. Apple's notary service could also reject a bare
+  command-line executable in a DMG for reasons this repository could not
+  anticipate.
+- **The certificate import on a runner had never run.** The
+  `security import ... -t cert -f pkcs12` sequence in the workflow had not been
+  tested against a real `.p12`.
+- **Nothing had ever been published to npm**, so the scope permissions, the
   first-publish `--access public` behaviour, and the platform-before-root
-  ordering are all reasoned about rather than observed.
-- **No GitHub release has ever been created** by this workflow.
-- **The Homebrew tap does not exist.** No `brew audit`, `brew install`, or
-  `brew test` has ever run against this formula, and the formula still carries
+  ordering had all been reasoned about rather than observed.
+- **No GitHub release had ever been created** by this workflow.
+- **The Homebrew tap did not exist.** No `brew audit`, `brew install`, or
+  `brew test` had ever run against this formula, and the formula still carried
   placeholder digests.
-- **The workflow itself has never executed**, on any runner, for any tag. Only
-  its individual steps have been reproduced by hand on a developer Mac: the
-  cross-compile for all four targets, the tar and `shasum`, the platform package
-  assembly, `npm pack`, the tag guard in both directions, and the formula
-  rewrite against real digests.
 
 The accountable release owner reviews the workflow run, the npm package file
 lists, the notarization result, the release-asset checksums, and the Homebrew
