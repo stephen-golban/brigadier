@@ -445,6 +445,7 @@ async function executeRun(
 
   ports.log(
     `run ${request.slug}: ${plan.slices.length} slice(s) in ${validation.waves.length} wave(s)`,
+    "normal",
   );
 
   /* --------------------------- 6. dry run -------------------------------- */
@@ -625,7 +626,7 @@ async function executeRun(
         } else {
           sliceFailed = true;
         }
-        ports.log(sliceLogLine(result));
+        ports.log(sliceLogLine(result), "normal");
       }
 
       // Every non-final wave must become the base BEFORE the next wave creates
@@ -645,7 +646,10 @@ async function executeRun(
               worktree: result.worktree,
               finalize: false,
             });
-            ports.log(`accumulate ${result.sliceId}: ${accumulated.status}`);
+            ports.log(
+              `accumulate ${result.sliceId}: ${accumulated.status}`,
+              "normal",
+            );
             if (accumulated.status === "conflicted") {
               // Finish accumulating independent siblings in this wave because
               // the engine leaves every ref unchanged on conflict. Do not start
@@ -654,7 +658,7 @@ async function executeRun(
             }
           } catch (error) {
             const message = `accumulate ${result.sliceId}: error ${errorMessage(error)}`;
-            ports.log(message);
+            ports.log(message, "normal");
             mergeFailure ??= message;
           }
         }
@@ -663,6 +667,7 @@ async function executeRun(
     if (skipped.length > 0) {
       ports.log(
         `wave stopped: skipping ${skipped.length} slice(s) ${skipped.join(", ")}`,
+        "normal",
       );
     }
 
@@ -688,7 +693,7 @@ async function executeRun(
         // Recorded as a run failure and skipped rather than propagated, so the
         // remaining slices still get their chance and cleanup still runs.
         const message = `merge ${result.sliceId}: error ${errorMessage(error)}`;
-        ports.log(message);
+        ports.log(message, "normal");
         mergeFailure ??= message;
       }
       if (merged === null) {
@@ -696,7 +701,7 @@ async function executeRun(
       }
       merges.push(merged);
       integrationBranch ??= merged.result.integrationBranch;
-      ports.log(`merge ${result.sliceId}: ${merged.result.status}`);
+      ports.log(`merge ${result.sliceId}: ${merged.result.status}`, "normal");
       if (merged.result.status === "conflicted") {
         // KEEP MERGING. Stopping at the first conflict hides how much of the run
         // was salvageable, and it is safe to continue: the engine returns
@@ -733,7 +738,7 @@ async function executeRun(
       } catch (error) {
         const message = `cleanup ${result.sliceId}: ${errorMessage(error)}`;
         cleanupFailures.push(message);
-        ports.log(message);
+        ports.log(message, "normal");
       }
     }
 
@@ -760,7 +765,7 @@ async function executeRun(
     } catch (error) {
       const message = `release ${request.slug}: ${errorMessage(error)}`;
       cleanupFailures.push(message);
-      ports.log(message);
+      ports.log(message, "normal");
     }
 
     /* ------------------- 9. remove the empty scaffold --------------------- */
@@ -778,7 +783,7 @@ async function executeRun(
       request.slug,
     )) {
       cleanupFailures.push(message);
-      ports.log(message);
+      ports.log(message, "normal");
     }
   }
 
@@ -897,6 +902,7 @@ async function readQuota(
       const vendor = ports.oracles[index]?.vendor ?? "unknown";
       ports.log(
         `quota ${vendor}: unavailable (${errorMessage(outcome.reason)})`,
+        "normal",
       );
     }
   }

@@ -252,7 +252,7 @@ export interface SupervisorPorts {
   readonly oracles: readonly AnyQuotaOracle[];
   /** Injected so reports are reproducible in tests. */
   readonly now: () => number;
-  readonly log: (line: string) => void;
+  readonly log: (line: string, level?: "normal" | "verbose") => void;
 }
 
 /**

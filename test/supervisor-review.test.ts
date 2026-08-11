@@ -328,7 +328,12 @@ function fakeEngine(
 }
 
 function plainDiff(patch: string): UncommittedDiff {
-  return { patch, truncated: false, totalCharacters: patch.length };
+  return {
+    paths: patch === "" ? [] : ["src/auth.ts"],
+    patch,
+    truncated: false,
+    totalCharacters: patch.length,
+  };
 }
 
 const DEFAULT_PATCH = [
@@ -344,6 +349,10 @@ const DEFAULT_PATCH = [
 interface Harness {
   readonly ports: SupervisorPorts;
   readonly logs: readonly string[];
+  readonly logCalls: readonly {
+    readonly line: string;
+    readonly level: "normal" | "verbose" | undefined;
+  }[];
 }
 
 function makeHarness(
@@ -354,9 +363,14 @@ function makeHarness(
   clockStep = 5,
 ): Harness {
   const logs: string[] = [];
+  const logCalls: {
+    line: string;
+    level: "normal" | "verbose" | undefined;
+  }[] = [];
   let clock = 1_000_000;
   return {
     logs,
+    logCalls,
     ports: {
       engine,
       workerFor: (vendor) => workers[vendor]?.worker ?? null,
@@ -365,8 +379,9 @@ function makeHarness(
         clock += clockStep;
         return clock;
       },
-      log: (line) => {
+      log: (line, level) => {
         logs.push(line);
+        logCalls.push({ line, level });
       },
     },
   };
@@ -1212,7 +1227,12 @@ describe("createCrossVendorReviewer", () => {
       BOTH_VENDORS,
       CLAUDE_BUILDER,
       { codex },
-      fakeEngine({ patch, truncated: true, totalCharacters: 900 }).engine,
+      fakeEngine({
+        paths: ["src/auth.ts"],
+        patch,
+        truncated: true,
+        totalCharacters: 900,
+      }).engine,
     );
 
     expect(codex.specs[0]?.prompt ?? "").toContain(
@@ -1221,6 +1241,33 @@ describe("createCrossVendorReviewer", () => {
     expect(harness.logs).toContain(
       "slice slice-auth attempt 1: the diff shown to the reviewer was truncated to 98304 of 900 characters",
     );
+  });
+
+  test("tags reviewer narration verbose and review degradation normal", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const { harness } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      fakeEngine({
+        paths: ["src/auth.ts"],
+        patch: DEFAULT_PATCH,
+        truncated: true,
+        totalCharacters: 900,
+      }).engine,
+    );
+
+    expect(
+      harness.logCalls.find((call) => call.line.includes(": reviewing "))
+        ?.level,
+    ).toBe("verbose");
+    expect(
+      harness.logCalls.find((call) =>
+        call.line.includes("the diff shown to the reviewer was truncated"),
+      )?.level,
+    ).toBe("normal");
   });
 
   test("an engine that cannot diff degrades visibly rather than silently", async () => {

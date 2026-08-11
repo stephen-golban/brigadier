@@ -275,6 +275,7 @@ async function reviewSlice(
     redact(
       `slice ${sliceId} attempt ${request.attempt}: reviewing ${request.builder.vendor}/${request.builder.model}'s work with ${reviewer.vendor}/${reviewer.model} at ${reviewer.effort} effort`,
     ),
+    "verbose",
   );
 
   // Taken AFTER the two skip checks above: a run with one vendor configured
@@ -462,6 +463,7 @@ async function readChange(
     const reason = "this run's worktree engine cannot produce one";
     options.ports.log(
       `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
+      "normal",
     );
     return { kind: "unavailable", reason };
   }
@@ -476,6 +478,7 @@ async function readChange(
     const reason = redact(describeError(error));
     options.ports.log(
       `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
+      "normal",
     );
     return { kind: "unavailable", reason };
   }
@@ -486,6 +489,7 @@ async function readChange(
     // for the operator reading why a large slice was approved thinly.
     options.ports.log(
       `${where}: the diff shown to the reviewer was truncated to ${MAX_DIFF_CHARACTERS} of ${diff.totalCharacters} characters`,
+      "normal",
     );
   }
   return diff.patch === ""

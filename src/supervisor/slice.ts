@@ -352,6 +352,7 @@ export class DefaultSliceRunner implements SliceRunner {
       if (!isRetryable(attempt.record.failure)) {
         this.#ports.log(
           `slice ${sliceId} attempt ${index + 1}: not retrying a failure a second attempt cannot change`,
+          "normal",
         );
         break;
       }
@@ -408,6 +409,7 @@ export class DefaultSliceRunner implements SliceRunner {
       // answer, not an error condition. It is recorded and the slice stops.
       this.#ports.log(
         `slice ${sliceId} attempt ${attempt}: routing failed (${decision.reason}): ${decision.message}`,
+        "normal",
       );
       return {
         ok: false,
@@ -434,6 +436,7 @@ export class DefaultSliceRunner implements SliceRunner {
     const routed = decision.routed;
     this.#ports.log(
       `slice ${sliceId} attempt ${attempt}: routed to ${routed.vendor}/${routed.model} at ${routed.effort} effort`,
+      "verbose",
     );
 
     let created: CreatedWorktree;
@@ -719,6 +722,7 @@ export class DefaultSliceRunner implements SliceRunner {
         cancelNote === null
           ? `slice ${sliceId} attempt ${attempt}: cancelled ${routed.vendor}/${routed.model} (pid ${spawned.pid ?? "none"})`
           : `slice ${sliceId} attempt ${attempt}: ${terminationDetail}`,
+        "normal",
       );
       return {
         ok: false,
@@ -753,6 +757,7 @@ export class DefaultSliceRunner implements SliceRunner {
     if (drained.error !== null) {
       this.#ports.log(
         `slice ${sliceId} attempt ${attempt}: event stream ended in error after ${drained.consumed} event(s): ${describeError(drained.error)}`,
+        "normal",
       );
     }
 
@@ -815,6 +820,7 @@ export class DefaultSliceRunner implements SliceRunner {
       redact(
         `slice ${sliceId} attempt ${attempt}: review ${describeVerdict(review)}`,
       ),
+      "normal",
     );
     if (review.verdict === "rejected") {
       return {

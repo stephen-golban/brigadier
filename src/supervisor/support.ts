@@ -131,7 +131,7 @@ export function describeError(error: unknown): string {
 export function ingestQuotaEvent(
   oracles: readonly AnyQuotaOracle[],
   event: WorkerEvent,
-  log: (line: string) => void,
+  log: (line: string, level?: "normal" | "verbose") => void,
 ): void {
   if (event.type !== "quota" || !isClaudeQuotaEvent(event)) {
     return;
@@ -145,6 +145,7 @@ export function ingestQuotaEvent(
   } catch (error) {
     log(
       `ignored a failure from the claude quota oracle: ${describeError(error)}`,
+      "normal",
     );
   }
 }

@@ -75,6 +75,9 @@ const DIFF_ARGS = [
   "--submodule=short",
 ] as const;
 
+/** Path-only counterpart to `DIFF_ARGS`; the two tree arguments are shared. */
+const DIFF_PATH_ARGS = [...DIFF_ARGS, "--name-only", "-z"] as const;
+
 /**
  * `core.quotePath=false`, forced the one way a config file cannot outrank.
  *
@@ -502,13 +505,40 @@ export class GitWorktreeEngine implements WorktreeEngine {
       redactionValues,
       linkedSecretPaths,
       "scratch",
-      async (tree, env) => {
-        const result = await this.#git([...DIFF_ARGS, parent, tree, "--"], {
-          cwd: worktree.path,
-          env: { ...env, ...DIFF_CONFIG_ENV },
-          redactionValues,
-        });
-        return result.stdout.toString("utf8");
+      async (tree, env, sourcesByDestination) => {
+        const [patchResult, pathsResult] = await Promise.all([
+          this.#git([...DIFF_ARGS, parent, tree, "--"], {
+            cwd: worktree.path,
+            env: { ...env, ...DIFF_CONFIG_ENV },
+            redactionValues,
+          }),
+          this.#git([...DIFF_PATH_ARGS, parent, tree, "--"], {
+            cwd: worktree.path,
+            env: { ...env, ...DIFF_CONFIG_ENV },
+            redactionValues,
+          }),
+        ]);
+        const paths: string[] = [];
+        const seen = new Set<string>();
+        for (const path of splitNul(pathsResult.stdout)) {
+          // The tree's paths have already passed through the artifact
+          // redactor. Restore every source spelling for the containment fact;
+          // multiple changed sources may intentionally share one redacted
+          // spelling even though the artifact tree itself forbids collisions.
+          const sources = sourcesByDestination.get(path);
+          if (sources === undefined) {
+            throw new Error(
+              "refusing to report changed paths because the sanitized path mapping is incomplete",
+            );
+          }
+          for (const source of sources) {
+            if (!seen.has(source)) {
+              seen.add(source);
+              paths.push(source);
+            }
+          }
+        }
+        return { patch: patchResult.stdout.toString("utf8"), paths };
       },
     );
     // Redacted a second time, over the assembled text, even though every blob
@@ -518,8 +548,9 @@ export class GitWorktreeEngine implements WorktreeEngine {
     // secret that entered the inventory only after the parent commit was
     // written — whose old value is still sitting in the patch's `-` lines.
     return boundPatch(
-      redactText(stripIndexLines(patch), redactionValues),
+      redactText(stripIndexLines(patch.patch), redactionValues),
       spec.maxCharacters,
+      patch.paths,
     );
   }
 
@@ -963,7 +994,11 @@ export class GitWorktreeEngine implements WorktreeEngine {
     // staged at — and two different `destination`s in one function is exactly
     // how a reader (or a mutation test) ends up comparing a path to a store.
     store: "repository" | "scratch",
-    use: (tree: string, env: Readonly<Record<string, string>>) => Promise<T>,
+    use: (
+      tree: string,
+      env: Readonly<Record<string, string>>,
+      sourcesByDestination: ReadonlyMap<string, readonly string[]>,
+    ) => Promise<T>,
   ): Promise<T> {
     return await this.#withTemporaryStagingStore(
       cwd,
@@ -990,6 +1025,22 @@ export class GitWorktreeEngine implements WorktreeEngine {
           redactionValues,
         );
         this.#refuseLinkedSecrets(changedPaths, linkedSecretPaths);
+        const changedSourcesByDestination = new Map<string, string[]>();
+        const recordSource = (
+          emittedPath: string,
+          sourcePath: string,
+        ): void => {
+          const sources = changedSourcesByDestination.get(emittedPath) ?? [];
+          if (!sources.includes(sourcePath)) {
+            sources.push(sourcePath);
+          }
+          changedSourcesByDestination.set(emittedPath, sources);
+        };
+        for (const path of changedPaths) {
+          const destination = redactText(path, redactionValues);
+          recordSource(path, path);
+          recordSource(destination, path);
+        }
 
         const entries = parseStageEntries(
           (
@@ -1003,6 +1054,11 @@ export class GitWorktreeEngine implements WorktreeEngine {
         const destinations = new Map<string, string>();
         for (const path of entries.keys()) {
           const destination = redactText(path, redactionValues);
+          // Sanitization can itself rename an otherwise unchanged entry when
+          // the inventory grows mid-run. Record both spellings so the diff's
+          // synthetic delete/add pair resolves to the real repository path.
+          recordSource(path, path);
+          recordSource(destination, path);
           const existing = destinations.get(destination);
           if (existing !== undefined && existing !== path) {
             throw new Error(
@@ -1055,7 +1111,11 @@ export class GitWorktreeEngine implements WorktreeEngine {
           env: targetEnv,
           redactionValues,
         });
-        return await use(result.stdout.toString("utf8").trim(), targetEnv);
+        return await use(
+          result.stdout.toString("utf8").trim(),
+          targetEnv,
+          changedSourcesByDestination,
+        );
       },
     );
   }
@@ -2068,10 +2128,14 @@ function stripIndexLines(patch: string): string {
  * and steps back off a lone surrogate, because splitting a surrogate pair
  * produces a replacement character rather than a shorter string.
  */
-function boundPatch(patch: string, maxCharacters: number): UncommittedDiff {
+function boundPatch(
+  patch: string,
+  maxCharacters: number,
+  paths: readonly string[],
+): UncommittedDiff {
   const totalCharacters = patch.length;
   if (totalCharacters <= maxCharacters) {
-    return { patch, truncated: false, totalCharacters };
+    return { paths, patch, truncated: false, totalCharacters };
   }
   const lastNewline = patch.lastIndexOf("\n", maxCharacters - 1);
   let cut = maxCharacters;
@@ -2083,6 +2147,7 @@ function boundPatch(patch: string, maxCharacters: number): UncommittedDiff {
   const kept = patch.slice(0, cut);
   const separator = kept.endsWith("\n") ? "" : "\n";
   return {
+    paths,
     patch: `${kept}${separator}[brigadier: this diff was truncated; ${cut} of ${totalCharacters} characters shown]\n`,
     truncated: true,
     totalCharacters,
@@ -2272,10 +2337,27 @@ function parseStageEntries(
 }
 
 function splitNul(value: Buffer): readonly string[] {
-  return value
-    .toString("utf8")
-    .split("\0")
-    .filter((path) => path.length > 0);
+  const paths: string[] = [];
+  let start = 0;
+  for (let end = 0; end <= value.length; end += 1) {
+    if (end !== value.length && value[end] !== 0) {
+      continue;
+    }
+    if (end > start) {
+      const bytes = value.subarray(start, end);
+      const path = bytes.toString("utf8");
+      // Git paths are byte strings. Refuse bytes JavaScript cannot round-trip
+      // so distinct repository paths can never collapse onto one string.
+      if (!Buffer.from(path, "utf8").equals(bytes)) {
+        throw new Error(
+          "refusing to process Git path bytes that cannot be represented faithfully as UTF-8",
+        );
+      }
+      paths.push(path);
+    }
+    start = end + 1;
+  }
+  return paths;
 }
 
 async function seedDependency(

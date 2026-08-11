@@ -168,12 +168,23 @@ export interface UncommittedDiffSpec {
  * a gate that can say no and a gate that litters the user's object database
  * every time it does.
  *
- * `patch` IS EMPTY EXACTLY WHEN `commit()` WOULD REFUSE with
- * `NoChangesToCommitError`. Both compare the same two trees, so "the diff is
- * empty" and "there is nothing to commit" are the same fact rather than two
- * opinions that could disagree.
+ * `patch` AND `paths` ARE EMPTY EXACTLY WHEN `commit()` WOULD REFUSE with
+ * `NoChangesToCommitError`. Both answers compare the same two trees, so "the
+ * diff is empty", "no path changed", and "there is nothing to commit" are the
+ * same fact rather than three opinions that could disagree.
  */
 export interface UncommittedDiff {
+  /**
+   * Every repository path touched by the change, complete and unquoted.
+   *
+   * THIS IS A CONTAINMENT FACT, NOT A DISPLAY ARTIFACT. Git derives it from
+   * the same parent and tree as `patch` with NUL-separated output, so neither
+   * path quoting nor a truncated patch can hide an entry. Every value is the
+   * original, unsanitized repository spelling; if Git emits bytes that cannot
+   * be represented faithfully or a sanitized spelling cannot be mapped back,
+   * the operation refuses. It is never bounded and never redacted.
+   */
+  readonly paths: readonly string[];
   /**
    * The unified diff, already redacted, already bounded, and — when it was
    * bounded — already carrying its own truncation notice as its last line.

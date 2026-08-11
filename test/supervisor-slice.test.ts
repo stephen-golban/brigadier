@@ -2582,6 +2582,52 @@ describe("DefaultSliceRunner worker lifecycle", () => {
     ).toBe(true);
   });
 
+  test("a throwing quota oracle logs its stale-quota warning at normal level", async () => {
+    const world = await makeWorld();
+    const oracle = claudeOracleFake(new Error("oracle exploded"));
+    const adapter = claudeAdapter([{ events: [CLAUDE_QUOTA_EVENT] }]);
+    const harness = makeHarness({
+      workers: { claude: adapter.worker },
+      oracles: [oracle.oracle],
+    });
+    const logs: Array<[line: string, level: "normal" | "verbose" | undefined]> =
+      [];
+    const runner = new DefaultSliceRunner({
+      ports: {
+        ...harness.ports,
+        log: (line, level) => {
+          logs.push([line, level]);
+        },
+      },
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+    });
+
+    await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "run",
+    );
+
+    expect(
+      logs.find(
+        ([line]) =>
+          line ===
+          "ignored a failure from the claude quota oracle: oracle exploded",
+      ),
+    ).toEqual([
+      "ignored a failure from the claude quota oracle: oracle exploded",
+      "normal",
+    ]);
+  });
+
   test("a failed worker outcome becomes WORKER_FAILED carrying the WorkerFailure", async () => {
     const world = await makeWorld();
     const adapter = claudeAdapter([{ outcome: FAILED_OUTCOME }]);

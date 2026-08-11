@@ -1644,6 +1644,11 @@ describe("GitWorktreeEngine", () => {
         // that lost a hunk, and against one whose renames or context width the
         // operator's own git config had quietly changed.
         expect(diff.patch).toBe(EXPECTED_PATCH);
+        expect(diff.paths).toEqual([
+          "src/new.ts",
+          "tracked.txt",
+          "untracked.txt",
+        ]);
         expect(diff.truncated).toBe(false);
         expect(diff.totalCharacters).toBe(EXPECTED_PATCH.length);
 
@@ -1703,6 +1708,43 @@ describe("GitWorktreeEngine", () => {
           ].join("\n"),
         );
         expect(diff.patch.includes(SECRET)).toBe(false);
+        expect(diff.paths).toEqual([`leak-${SECRET}.txt`]);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "restores a path renamed by redaction inventory growth",
+    async () => {
+      await withFixture(async (fixture) => {
+        const futureSecretPath = `future-${ROTATED_JSON_SECRET}.txt`;
+        await writeFile(
+          join(fixture.repository, futureSecretPath),
+          "unchanged after worktree creation\n",
+        );
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "d2-rotated-path",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+
+        // The path was ordinary when the base and worktree were created. A
+        // later inventory refresh makes sanitization rename it even though the
+        // worker never touched its content.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_JSON_SECRET}\n`,
+        );
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        expect(diff.patch).toContain("future-[REDACTED].txt");
+        expect(diff.paths).toEqual([futureSecretPath]);
+        expect(diff.paths).not.toContain("future-[REDACTED].txt");
       });
     },
     TEST_TIMEOUT_MS,
@@ -1791,6 +1833,134 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
+    "reports every changed path even when the patch ends before later files",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "d4p",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        await writeFile(
+          join(worktree.path, "a-large.txt"),
+          "0123456789abcdef\n".repeat(100),
+        );
+        await writeFile(join(worktree.path, "middle.txt"), "middle\n");
+        await writeFile(join(worktree.path, "z-last.txt"), "last\n");
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 120,
+        });
+
+        expect(diff.truncated).toBe(true);
+        expect(diff.patch).not.toContain("middle.txt");
+        expect(diff.patch).not.toContain("z-last.txt");
+        expect(diff.paths).toEqual(["a-large.txt", "middle.txt", "z-last.txt"]);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "reports a C-quotable path unquoted and intact",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "d4q",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        const unusualPath = 'space "quote" café.txt';
+        await writeFile(join(worktree.path, unusualPath), "intact\n");
+
+        const diff = await fixture.engine.diffUncommitted({
+          worktreePath: worktree.path,
+          maxCharacters: 64 * 1024,
+        });
+
+        expect(diff.paths).toEqual(['space "quote" café.txt']);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "refuses a repository path whose bytes are not valid UTF-8",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "d4-invalid-utf8",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        const lane = join(worktree.path, "lane");
+        await mkdir(lane);
+        const invalidPath = Buffer.concat([
+          Buffer.from(`${lane}/`),
+          Buffer.from([0xff]),
+          Buffer.from(".txt"),
+        ]);
+        await writeFile(invalidPath, "cannot be represented faithfully\n");
+
+        try {
+          await expect(
+            fixture.engine.commit({
+              worktree,
+              message: "must refuse invalid path bytes",
+            }),
+          ).rejects.toThrow(
+            "refusing to process Git path bytes that cannot be represented faithfully as UTF-8",
+          );
+        } finally {
+          await rm(invalidPath, { force: true });
+        }
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "refuses rather than merging valid replacement bytes with raw FF",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "d4-colliding-utf8",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        const lane = join(worktree.path, "lane");
+        await mkdir(lane);
+        await writeFile(join(lane, "\uFFFD.txt"), "valid UTF-8 replacement\n");
+        const invalidPath = Buffer.concat([
+          Buffer.from(`${lane}/`),
+          Buffer.from([0xff]),
+          Buffer.from(".txt"),
+        ]);
+        await writeFile(invalidPath, "raw invalid byte\n");
+
+        try {
+          await expect(
+            fixture.engine.diffUncommitted({
+              worktreePath: worktree.path,
+              maxCharacters: 64 * 1024,
+            }),
+          ).rejects.toThrow(
+            "refusing to process Git path bytes that cannot be represented faithfully as UTF-8",
+          );
+        } finally {
+          await rm(invalidPath, { force: true });
+        }
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     "reports an empty patch exactly when the commit would refuse as empty",
     async () => {
       await withFixture(async (fixture) => {
@@ -1803,6 +1973,7 @@ describe("GitWorktreeEngine", () => {
         });
 
         expect(diff.patch).toBe("");
+        expect(diff.paths).toEqual([]);
         expect(diff.truncated).toBe(false);
         expect(diff.totalCharacters).toBe(0);
         // The same two trees, compared by the same code: "the diff is empty"
