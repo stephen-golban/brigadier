@@ -1,6 +1,6 @@
 # Releasing Brigadier
 
-Nothing has ever been published. `package.json` says `0.0.0`, no version exists
+Nothing has ever been published. `package.json` says `0.1.0`, no version exists
 on npm, no GitHub release exists, no Homebrew tap exists, and
 `.github/workflows/release.yml` has never run because no `v*` tag has ever been
 pushed. Everything below describes a path that has been exercised locally, step
@@ -224,54 +224,63 @@ executable, and the notarized DMG rides along as evidence.
 
 ## Moving the version, everywhere it lives
 
-`0.0.0` appears in more places than `package.json`, and several are enforced by
-`bun test` — deliberately. This list reflects HEAD on 2026-08-11, when it was
-checked by actually bumping the version to `0.1.0` in a scratch tree and running
-the full suite.
+The current version appears in more places than `package.json`, and several are
+enforced by `bun test` — deliberately. Move every version reference below from
+the current version to the next version. This list was verified by the past
+`0.0.0` → `0.1.0` bump and a full-suite run.
 
 **Enforced — the release or the test suite fails if you skip these:**
 
-1. `package.json` → `version`. Checked against the tag by
-   `scripts/verify-tag-version.sh`.
+1. `package.json` → `version`. Move it from the current version to the next
+   version. It is checked against the tag by `scripts/verify-tag-version.sh`.
 2. `package.json` → all four `optionalDependencies` entries. Also checked by
-   `scripts/verify-tag-version.sh`: a pin that drifts names a platform package
-   version that will never be published, and `npm install` would then quietly
-   fall back to the slower JavaScript launcher instead of failing.
-3. `test/mcp.test.ts` → `const VERSION` and the four golden JSON-RPC frames that
-   embed `"version":"0.0.0"`. When `package.json` is bumped to `0.1.0` with
-   items 1 and 2 applied and every test file untouched, two tests in this file
-   fail; changing that constant alone does not update the golden frames.
-4. `test/mcp-repository-path.test.ts` → its golden `initialize` response frame,
-   which embeds `"version":"0.0.0"`. This file was added in `4d0dd97` and missed
-   when this list was revised.
+   `scripts/verify-tag-version.sh`: move each pin from the current version to
+   the next version. A pin that drifts names a platform package version that
+   will never be published, and `npm install` would then quietly fall back to
+   the slower JavaScript launcher instead of failing.
+3. `test/mcp.test.ts` → `const VERSION` and the four golden JSON-RPC frames
+   that embed the current version. Move both the constant and every frame to
+   the next version. In the past `0.0.0` → `0.1.0` bump, applying items 1 and 2
+   while leaving this file untouched made two tests fail; changing that constant
+   alone does not update the golden frames.
+4. `test/mcp-repository-path.test.ts` → its golden `initialize` response
+   frame, which embeds the current version. Move it to the next version. This
+   file was added in `4d0dd97` and was missed when this list was revised.
 5. `test/mcp-entry.test.ts` → the golden `initialize` response string, which
-   embeds `"version":"0.0.0"`. One test fails until it matches.
+   embeds the current version. Move it to the next version; one test fails until
+   it matches.
 
 **Not enforced — nothing will tell you, so do them by hand:**
 
 6. `bun.lock` → the four `optionalDependencies` entries. Regenerate with
-   `bun install` after editing `package.json` and commit the result.
+   `bun install` after moving the pins in `package.json` to the next version and
+   commit the result.
    (`bun install --frozen-lockfile` tolerates the mismatch, because the platform
    packages are optional and currently unresolvable, so CI will *not* catch a
    stale lockfile here.)
 7. `src/surfaces/templates.ts` → the `claude-desktop/manifest.json` template
-   string contains `"version": "0.0.0"`.
-8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same value.
-9. `README.md` → the two passages stating the package is unpublished at `0.0.0`.
-   They stop being true the moment the release lands.
+   string. Move its version from the current version to the next version.
+8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same
+   value. Move it from the current version to the next version too.
+9. `README.md` → the two passages stating the package is unpublished at the
+   current version. Move their version references to the next version and
+   reword their release status: they stop being true the moment the release
+   lands.
 10. `src/config/contracts.ts` → the comment explaining that the package is
-    unpublished at `0.0.0`, so re-running `init` is a complete remedy and no
-    migration path is owed. Once the release lands, reword it: re-running `init`
-    remains correct, but that premise does not.
+    unpublished at the current version, so re-running `init` is a complete
+    remedy and no migration path is owed. Move its version reference to the next
+    version. Once the release lands, reword it: re-running `init` remains
+    correct, but that premise does not.
 
 > **Items 7 and 8 are unenforced only if you skip them. Doing them turns
 > `bun test` red until you also move a pin.**
 >
 > `test/surfaces.test.ts` pins every installable surface file by absolute
 > SHA-256 *and* byte length, in the `PINNED` map near the top of that file, and
-> checks the compiled template and the staged file against the same entry. The
-> `"claude-desktop/manifest.json"` entry currently reads
-> `3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f` and
+> checks the compiled template and the staged file against the same entry. Look
+> up the `"claude-desktop/manifest.json"` entry before changing it. For example,
+> after the past `0.0.0` → `0.1.0` bump it contains SHA-256
+> `ca12f56795d0800bdd9e1cc55826e76168ff01a3c92a1a05dbfd1ba0cbb77beb` and
 > `1597` bytes. Changing the version inside the manifest makes both halves wrong
 > and fails two tests — *every compiled template matches its pinned hash and
 > size*, and *every file on disk matches the same pinned hash and size* —
