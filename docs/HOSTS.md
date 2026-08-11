@@ -103,14 +103,13 @@ is how a second install finds its own entry to replace instead of appending a
 duplicate.
 
 **Registration is not approval.** Codex will not run a hook you have not
-trusted. Until you approve it, the hook is a silent no-op: Codex exits 0, with
-no warning and no hook output. Codex documents and expects approval to be bound
-to the registration — the event, matcher, and command — rather than to the
-contents of `handoff.mjs`, so the script at an
-approved path can later change without Codex asking again;
-re-reviewing an edited script means deliberately changing the registration and
-approving it again. The README installed beside `handoff.mjs` explains the
-approval step.
+trusted. Until you approve it, the hook is a silent no-op: Codex exits 0,
+with no warning and no hook output. Codex documents and expects approval to
+be bound to the registration — the event, matcher, and command — rather than
+to the contents of `handoff.mjs`, so the script at an approved path can
+later change without Codex asking again; re-reviewing an edited script
+means deliberately changing the registration and approving it again. The
+README installed beside `handoff.mjs` explains the approval step.
 
 The earlier claim that a user has no way to determine whether hook approval was
 persisted was wrong. Measured on codex-cli 0.147.0, persisted trust is readable
