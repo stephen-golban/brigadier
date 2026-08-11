@@ -64,6 +64,7 @@ import { validatePlan } from "../plan/validate.js";
 import type { RoutingDecision, RoutingInput } from "../routing/contracts.js";
 import { route } from "../routing/router.js";
 import type { WorktreeSession } from "../worktree/contracts.js";
+import { createSecretRedactor } from "../worktree/engine.js";
 import type {
   AttemptSlot,
   RunFailureReason,
@@ -224,6 +225,7 @@ function scaffoldDirectories(
 async function removeEmptyScaffold(
   repositoryPath: string,
   slug: string,
+  redactFailure: (failureClass: string, error: unknown) => Promise<string>,
 ): Promise<readonly string[]> {
   const directories = scaffoldDirectories(repositoryPath, slug);
   const failures: string[] = [];
@@ -235,7 +237,12 @@ async function removeEmptyScaffold(
       if (code === "ENOTEMPTY" || code === "ENOENT") {
         continue;
       }
-      failures.push(`scaffold ${directory}: ${errorMessage(error)}`);
+      failures.push(
+        await redactFailure(
+          "SCAFFOLD_REMOVE_FAILED",
+          `scaffold ${directory}: ${errorMessage(error)}`,
+        ),
+      );
     }
   }
   return failures;
@@ -297,6 +304,16 @@ async function executeRun(
   const startedAt = ports.now();
   const plan = request.document.plan;
   const dryRun = request.dryRun === true;
+  const redactFailure = (
+    failureClass: string,
+    error: unknown,
+  ): Promise<string> =>
+    redactFailureMessage(
+      request.repositoryPath,
+      config.linkedSecretPaths,
+      failureClass,
+      error,
+    );
   /**
    * Read through a function, never captured once into a boolean: the signal can
    * abort at any await in this file, so a snapshot taken at the top would be
@@ -400,7 +417,7 @@ async function executeRun(
   const routingInput: RoutingInput = {
     config,
     capabilities,
-    quota: await readQuota(ports),
+    quota: await readQuota(ports, redactFailure),
   };
   const preflights: Preflight[] = [];
   const routingFailures: string[] = [];
@@ -508,7 +525,10 @@ async function executeRun(
       slices: preflightSlices,
       merges: [],
       planIssues: [],
-      failure: { reason: "PREPARE_FAILED", message: errorMessage(error) },
+      failure: {
+        reason: "PREPARE_FAILED",
+        message: await redactFailure("PREPARE_FAILED", error),
+      },
     });
   }
 
@@ -602,7 +622,7 @@ async function executeRun(
             // this orchestrator could remove.
             return runnerThrewResult(
               sliceId,
-              error,
+              await redactFailure("SLICE_RUNNER_FAILED", error),
               ports.now() - startedSliceAt,
             );
           }
@@ -657,7 +677,8 @@ async function executeRun(
               mergeFailure ??= `slice ${result.sliceId} conflicts while accumulating wave ${waveIndex + 1}`;
             }
           } catch (error) {
-            const message = `accumulate ${result.sliceId}: error ${errorMessage(error)}`;
+            const detail = await redactFailure("ACCUMULATE_FAILED", error);
+            const message = `accumulate ${result.sliceId}: error ${detail}`;
             ports.log(message, "normal");
             mergeFailure ??= message;
           }
@@ -692,7 +713,8 @@ async function executeRun(
         // A merge is not supposed to throw — a conflict is a returned value.
         // Recorded as a run failure and skipped rather than propagated, so the
         // remaining slices still get their chance and cleanup still runs.
-        const message = `merge ${result.sliceId}: error ${errorMessage(error)}`;
+        const detail = await redactFailure("MERGE_FAILED", error);
+        const message = `merge ${result.sliceId}: error ${detail}`;
         ports.log(message, "normal");
         mergeFailure ??= message;
       }
@@ -736,7 +758,8 @@ async function executeRun(
       try {
         await ports.engine.remove(result.worktree);
       } catch (error) {
-        const message = `cleanup ${result.sliceId}: ${errorMessage(error)}`;
+        const detail = await redactFailure("WORKTREE_REMOVE_FAILED", error);
+        const message = `cleanup ${result.sliceId}: ${detail}`;
         cleanupFailures.push(message);
         ports.log(message, "normal");
       }
@@ -763,7 +786,8 @@ async function executeRun(
     try {
       await ports.engine.release(session);
     } catch (error) {
-      const message = `release ${request.slug}: ${errorMessage(error)}`;
+      const detail = await redactFailure("SESSION_RELEASE_FAILED", error);
+      const message = `release ${request.slug}: ${detail}`;
       cleanupFailures.push(message);
       ports.log(message, "normal");
     }
@@ -781,6 +805,7 @@ async function executeRun(
     for (const message of await removeEmptyScaffold(
       request.repositoryPath,
       request.slug,
+      redactFailure,
     )) {
       cleanupFailures.push(message);
       ports.log(message, "normal");
@@ -890,6 +915,7 @@ export async function runBounded<T, R>(
  */
 async function readQuota(
   ports: SupervisorPorts,
+  redactFailure: (failureClass: string, error: unknown) => Promise<string>,
 ): Promise<readonly QuotaSnapshot[]> {
   const settled = await Promise.allSettled(
     ports.oracles.map((oracle) => oracle.snapshot()),
@@ -900,10 +926,8 @@ async function readQuota(
       snapshots.push(outcome.value);
     } else {
       const vendor = ports.oracles[index]?.vendor ?? "unknown";
-      ports.log(
-        `quota ${vendor}: unavailable (${errorMessage(outcome.reason)})`,
-        "normal",
-      );
+      const detail = await redactFailure("QUOTA_READ_FAILED", outcome.reason);
+      ports.log(`quota ${vendor}: unavailable (${detail})`, "normal");
     }
   }
   return snapshots;
@@ -1101,10 +1125,10 @@ function describeStoppage(
 /** The `SliceResult` for a runner that rejected instead of reporting. */
 function runnerThrewResult(
   sliceId: string,
-  error: unknown,
+  detail: string,
   durationMs: number,
 ): SliceResult {
-  const message = `slice runner threw for ${sliceId}: ${errorMessage(error)}`;
+  const message = `slice runner threw for ${sliceId}: ${detail}`;
   return {
     sliceId,
     ok: false,
@@ -1177,4 +1201,38 @@ function logVerdict(review: SliceReview | null): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Formats an exception only after rebuilding the linked-secret inventory.
+ *
+ * `prepare()` can fail while reading the very files that establish redaction,
+ * which used to put its raw exception directly into `RunReport`. The same raw
+ * formatter also fed later report and log paths. Rebuilding the read-only
+ * redactor lets useful diagnostics survive when the inventory is available.
+ * The inventory covers linked-secret values. Paths are passed through that
+ * inventory rather than treated as secret in themselves.
+ * If either inventory construction or redaction itself throws, THE RAW ERROR
+ * MUST NOT BE THE FALLBACK: that is precisely the state in which no code can
+ * prove the diagnostic is safe. The fixed class-only sentence deliberately
+ * loses detail so a future "more helpful" fallback cannot reopen the leak.
+ */
+async function redactFailureMessage(
+  repositoryPath: string,
+  linkedSecretPaths: readonly string[],
+  failureClass: string,
+  error: unknown,
+): Promise<string> {
+  try {
+    // This rebuild sees only current file contents, so a value rotated away
+    // mid-run is not covered. The session's cumulative inventory is stronger;
+    // using it here needs a session-scoped redactor seam on the engine.
+    const redact = await createSecretRedactor({
+      repositoryPath,
+      linkedSecretPaths,
+    });
+    return redact(errorMessage(error));
+  } catch {
+    return `${failureClass}: diagnostic detail omitted because linked-secret redaction is unavailable`;
+  }
 }

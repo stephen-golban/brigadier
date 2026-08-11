@@ -55,10 +55,10 @@ async function resultFor(
 }
 
 describe("gate inventory", () => {
-  test("ships exactly the four named blocking gates", () => {
+  test("ships the four named gates with paths_touched as a concern", () => {
     expect(GATES.map(({ name, severity }) => ({ name, severity }))).toEqual([
       { name: "paths_owned", severity: "blocking" },
-      { name: "paths_touched", severity: "blocking" },
+      { name: "paths_touched", severity: "concern" },
       { name: "diff_non_empty", severity: "blocking" },
       { name: "tests_pass", severity: "blocking" },
     ]);
@@ -95,6 +95,8 @@ describe("paths_owned", () => {
       status: "failed",
       findings: [
         {
+          source: "gate",
+          gate: "paths_owned",
           severity: "blocking",
           path: "src/auth.ts",
           line: null,
@@ -129,6 +131,8 @@ describe("paths_owned", () => {
       status: "failed",
       findings: [
         {
+          source: "gate",
+          gate: "paths_owned",
           severity: "blocking",
           path: "outside.ts",
           line: null,
@@ -149,13 +153,13 @@ describe("paths_touched", () => {
 
     expect(result).toEqual({
       name: "paths_touched",
-      severity: "blocking",
+      severity: "concern",
       status: "passed",
       findings: [],
     });
   });
 
-  test("reports every untouched owned path with exact blocking findings", async () => {
+  test("reports every untouched owned path with exact concern findings", async () => {
     const result = await resultFor(
       "paths_touched",
       harness({
@@ -165,23 +169,38 @@ describe("paths_touched", () => {
 
     expect(result).toEqual({
       name: "paths_touched",
-      severity: "blocking",
+      severity: "concern",
       status: "failed",
       findings: [
         {
-          severity: "blocking",
+          source: "gate",
+          gate: "paths_touched",
+          severity: "concern",
           path: "test/auth.test.ts",
           line: null,
           summary: 'Owned path "test/auth.test.ts" was not changed.',
         },
         {
-          severity: "blocking",
+          source: "gate",
+          gate: "paths_touched",
+          severity: "concern",
           path: "docs/auth.md",
           line: null,
           summary: 'Owned path "docs/auth.md" was not changed.',
         },
       ],
     });
+  });
+
+  test("a finding's severity is derived from the declaring gate", async () => {
+    const result = await resultFor(
+      "paths_touched",
+      harness({ ownedPaths: ["src/auth.ts", "test/auth.test.ts"] }).input,
+    );
+
+    // This assertion failed under the original helper, which hardcoded every
+    // finding to blocking even when the gate itself declared concern.
+    expect(result.findings[0]?.severity).toBe("concern");
   });
 
   test("the finding identifies the unchanged owned path", async () => {
@@ -218,6 +237,8 @@ describe("diff_non_empty", () => {
       status: "failed",
       findings: [
         {
+          source: "gate",
+          gate: "diff_non_empty",
           severity: "blocking",
           path: "src/auth.ts",
           line: null,
@@ -268,6 +289,8 @@ describe("tests_pass", () => {
       status: "failed",
       findings: [
         {
+          source: "gate",
+          gate: "tests_pass",
           severity: "blocking",
           path: "src/auth.ts",
           line: null,
@@ -313,6 +336,8 @@ describe("gate report", () => {
 
     expect(report.findings).toEqual([
       {
+        source: "gate",
+        gate: "paths_owned",
         severity: "blocking",
         path: "src/auth.ts",
         line: null,
@@ -320,11 +345,50 @@ describe("gate report", () => {
           'Path "src/auth.ts" is outside the slice\'s declared owned paths.',
       },
       {
-        severity: "blocking",
+        source: "gate",
+        gate: "paths_touched",
+        severity: "concern",
         path: "test/auth.test.ts",
         line: null,
         summary: 'Owned path "test/auth.test.ts" was not changed.',
       },
     ]);
+  });
+
+  test("changed-path gates skip when the authoritative list is unavailable", async () => {
+    const fixture = harness();
+    const report = await runGates({
+      ...fixture.input,
+      changedPaths: null,
+      changedPathsUnavailableReason: "unsafe in-place worktree",
+    });
+
+    expect(report.gates.slice(0, 3)).toEqual([
+      {
+        name: "paths_owned",
+        severity: "blocking",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: unsafe in-place worktree",
+        findings: [],
+      },
+      {
+        name: "paths_touched",
+        severity: "concern",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: unsafe in-place worktree",
+        findings: [],
+      },
+      {
+        name: "diff_non_empty",
+        severity: "blocking",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: unsafe in-place worktree",
+        findings: [],
+      },
+    ]);
+    expect(report.findings).toEqual([]);
   });
 });

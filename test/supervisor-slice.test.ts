@@ -66,6 +66,8 @@ import type {
   CommitSpec,
   CreatedWorktree,
   MergeResult,
+  UncommittedDiff,
+  UncommittedDiffSpec,
   WorktreeEngine,
   WorktreeSession,
   WorktreeSpec,
@@ -400,6 +402,28 @@ class FakeEngine implements WorktreeEngine {
   }
 }
 
+/** A fake whose diff answers are authoritative and ordered by attempt. */
+class DiffingFakeEngine extends FakeEngine {
+  readonly diffs: UncommittedDiffSpec[] = [];
+
+  constructor(private readonly answers: readonly UncommittedDiff[]) {
+    super();
+  }
+
+  diffUncommitted(spec: UncommittedDiffSpec): Promise<UncommittedDiff> {
+    this.diffs.push(spec);
+    const answer = this.answers[this.diffs.length - 1];
+    if (answer === undefined) {
+      return Promise.reject(
+        new Error(
+          `the diff fake has no answer for read ${this.diffs.length}; it was given ${this.answers.length}`,
+        ),
+      );
+    }
+    return Promise.resolve(answer);
+  }
+}
+
 interface SpawnScript {
   readonly events?: readonly WorkerEvent[];
   readonly outcome?: LaunchedWorkerOutcome;
@@ -722,6 +746,7 @@ type ReviewerIdentityFixture = Extract<
 >["reviewer"];
 
 const BLOCKING_FINDING: ReviewFinding = {
+  source: "model",
   severity: "blocking",
   path: "src/added.ts",
   line: 12,
@@ -729,6 +754,7 @@ const BLOCKING_FINDING: ReviewFinding = {
 };
 
 const CONCERN_FINDING: ReviewFinding = {
+  source: "model",
   severity: "concern",
   path: "src/added.ts",
   line: 30,
@@ -775,6 +801,10 @@ interface Harness {
   readonly ports: SupervisorPorts;
   readonly engine: FakeEngine;
   readonly logs: readonly string[];
+  readonly logCalls: readonly {
+    readonly line: string;
+    readonly level: "normal" | "verbose" | undefined;
+  }[];
   readonly routeRequests: RoutingRequest[];
 }
 
@@ -793,10 +823,15 @@ interface HarnessOptions {
 function makeHarness(options: HarnessOptions = {}): Harness {
   const engine = options.engine ?? new FakeEngine();
   const logs: string[] = [];
+  const logCalls: Array<{
+    line: string;
+    level: "normal" | "verbose" | undefined;
+  }> = [];
   const routeRequests: RoutingRequest[] = [];
   return {
     engine,
     logs,
+    logCalls,
     routeRequests,
     ports: {
       engine,
@@ -805,8 +840,9 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       // A deterministic clock: every call advances by exactly 5 ms, so an
       // attempt that calls it twice reports exactly 5 ms.
       now: makeClock(),
-      log: (line) => {
+      log: (line, level) => {
         logs.push(line);
+        logCalls.push({ line, level });
       },
     },
   };
@@ -3043,9 +3079,9 @@ describe("DefaultSliceRunner worktree ownership", () => {
     );
 
     // The injected clock advances 5 ms per read. The attempt reads it at its
-    // start and its end, and `#reviewQuietly` reads it once more so a reviewer
-    // that throws can still be given a duration.
-    expect(attemptAt(result, 0).durationMs).toBe(10);
+    // start and its end; the deterministic wrapper also starts its own timing
+    // before asking the injected reviewer. No duration comes from wall time.
+    expect(attemptAt(result, 0).durationMs).toBe(15);
   });
 });
 
@@ -3150,6 +3186,173 @@ describe("DefaultSliceRunner review gate", () => {
     expect(failure?.message).toBe(
       "slice slice-auth attempt 1: codex/gpt-5.6-sol found 1 blocking issue(s) in claude/claude-opus-5's work: src/added.ts:12: the loop runs one past the end of the array",
     );
+    expect(
+      harness.logCalls.find((call) =>
+        call.line.includes("attempt 1: review rejected"),
+      )?.level,
+    ).toBe("normal");
+  });
+
+  test("a blocking gate rejection takes the ordinary retry and escalation path", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([
+      { outcome: OK_OUTCOME },
+      { outcome: OK_OUTCOME },
+    ]);
+    const engine = new DiffingFakeEngine([
+      {
+        paths: ["outside.ts"],
+        patch: "+outside\n",
+        truncated: false,
+        totalCharacters: 9,
+      },
+      {
+        paths: ["src/added.ts"],
+        patch: "+inside\n",
+        truncated: false,
+        totalCharacters: 8,
+      },
+    ]);
+    const harness = makeHarness({ engine, workers: { claude: claude.worker } });
+    const reviewer = fakeReviewer([APPROVED]);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute(
+        [routedTo(OPUS), routedTo(HAIKU)],
+        harness.routeRequests,
+      ),
+      review: reviewer,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: world.slots,
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "gate retry",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(attemptAt(result, 0).failure?.kind).toBe("REVIEW_REJECTED");
+    expect(attemptAt(result, 0).review?.reviewer?.vendor).toBe("deterministic");
+    expect(harness.routeRequests[1]?.excluded).toEqual([
+      { vendor: "claude", model: "claude-opus-5" },
+    ]);
+    expect(harness.routeRequests[1]?.escalated).toBe(true);
+    // The model reviewer was not spent on the gate-rejected first attempt; it
+    // was called exactly once, after attempt 2's deterministic checks passed.
+    expect(reviewer.requests().map((request) => request.attempt)).toEqual([2]);
+    expect(harness.engine.commits.length).toBe(1);
+  });
+
+  test("a paths_touched violation alone does not fail the attempt", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const engine = new DiffingFakeEngine([
+      {
+        paths: ["src/added.ts"],
+        patch: "+inside\n",
+        truncated: false,
+        totalCharacters: 8,
+      },
+    ]);
+    const harness = makeHarness({ engine, workers: { claude: claude.worker } });
+    const reviewer = fakeReviewer([APPROVED]);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: reviewer,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: {
+          ...SLICE,
+          ownedPaths: ["src/added.ts", "test/unused.test.ts"],
+        },
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+      }),
+      2000,
+      "paths_touched concern",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(harness.engine.commits.length).toBe(1);
+    const review = attemptAt(result, 0).review;
+    expect(review?.verdict).toBe("approved");
+    expect(
+      review?.verdict === "approved" ? review.findings : [],
+    ).toContainEqual({
+      source: "gate",
+      gate: "paths_touched",
+      severity: "concern",
+      path: "test/unused.test.ts",
+      line: null,
+      summary: 'Owned path "test/unused.test.ts" was not changed.',
+    });
+  });
+
+  test("a configured test command is executed in the worktree before model review", async () => {
+    const world = await makeWorld();
+    const claude = claudeAdapter([{ outcome: OK_OUTCOME }]);
+    const engine = new DiffingFakeEngine([
+      {
+        paths: ["src/added.ts"],
+        patch: "+inside\n",
+        truncated: false,
+        totalCharacters: 8,
+      },
+    ]);
+    const harness = makeHarness({ engine, workers: { claude: claude.worker } });
+    const reviewer = fakeReviewer([]);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: stubRoute([routedTo(OPUS)], harness.routeRequests),
+      review: reviewer,
+    });
+
+    const result = await withBound(
+      runner.run({
+        slice: SLICE,
+        directive: DIRECTIVE,
+        session: world.session,
+        attemptSlots: firstSlot(world),
+        routing: ROUTING,
+        unsafeInPlace: false,
+        testCommand: [process.execPath, "-e", "process.exit(7)"],
+      }),
+      2000,
+      "configured test command",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(attemptAt(result, 0).failure?.kind).toBe("REVIEW_REJECTED");
+    expect(reviewer.requests()).toEqual([]);
+    expect(attemptAt(result, 0).review?.verdict).toBe("rejected");
+    expect(
+      attemptAt(result, 0).review?.verdict === "rejected"
+        ? attemptAt(result, 0).review?.findings
+        : [],
+    ).toContainEqual({
+      source: "gate",
+      gate: "tests_pass",
+      severity: "blocking",
+      path: "src/added.ts",
+      line: null,
+      summary: "The configured test command exited with code 7.",
+    });
   });
 
   test("the review runs before the commit, with the worktree still uncommitted", async () => {
@@ -3329,6 +3532,11 @@ describe("DefaultSliceRunner review gate", () => {
     expect(harness.logs).toContain(
       "slice slice-auth attempt 1: review approved by codex/gpt-5.6-sol (0 blocking, 1 concern(s)) in 0ms",
     );
+    expect(
+      harness.logCalls.find((call) =>
+        call.line.includes("attempt 1: review approved"),
+      )?.level,
+    ).toBe("verbose");
   });
 
   test("a skipped review still commits and is never recorded as an approval", async () => {
@@ -3364,6 +3572,11 @@ describe("DefaultSliceRunner review gate", () => {
     expect(review?.verdict === "skipped" ? review.reason : null).toBe(
       "NO_OTHER_VENDOR",
     );
+    expect(
+      harness.logCalls.find((call) =>
+        call.line.includes("attempt 1: review skipped"),
+      )?.level,
+    ).toBe("normal");
   });
 
   test("an interrupted review leaves the slice ref at its prepared base", async () => {

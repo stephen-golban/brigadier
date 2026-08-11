@@ -83,12 +83,12 @@
  * "the models failed". The outer rung is capped at `concern` precisely so that
  * this failure mode is reachable ONLY when the change itself misbehaves.
  *
- * WHAT THE GATE THEREFORE DOES NOT CATCH, stated so the README can say it: a
- * pre-existing defect in a file a slice touches is not blocked, and at best
+ * WHAT MODEL REVIEW THEREFORE DOES NOT CATCH, stated so the README can say it:
+ * a pre-existing defect in a file a slice touches is not blocked, and at best
  * appears as a non-blocking concern. Nothing outside the diff and its
- * surrounding files is looked at at all. This gate reviews the change; it does
- * not audit the codebase, and it does not run the tests, the linter or the
- * build.
+ * surrounding files is looked at at all. Deterministic review can run one
+ * configured test command first, but until a plan supplies that command it
+ * records `tests_pass` as skipped; it never invents a project test command.
  *
  * WHEN THERE IS NO DIFF, THE DEGRADATION IS VISIBLE. `diffUncommitted` is
  * optional on `WorktreeEngine` and refuses outright for an `unsafeInPlace`
@@ -97,14 +97,11 @@
  * run log says so, and the reviewer falls back to reading the owned paths — the
  * pre-diff behaviour, now named rather than assumed.
  *
- * A COST THAT REMAINS: this runs before `engine.commit` can discover that the worker
- * changed nothing, so a slice heading for `NO_CHANGES` still pays for one
- * reviewer run. That is now knowable in advance rather than unknowable — an
- * empty patch and `NoChangesToCommitError` compare the same two trees, so they
- * are one fact rather than two opinions that could disagree — but acting on it
- * would need a skip reason `ReviewSkipReason` does not have, and inventing a
- * verdict for it here would be worse than the wasted launch. The reviewer is
- * told the change is empty instead.
+ * EMPTY WORK STOPS BEFORE THE MODEL. `diff_non_empty` reads the same changed
+ * path list the engine produced with the patch, so a slice heading for
+ * `NO_CHANGES` is rejected without spending a reviewer. It uses the path list
+ * rather than parsing the bounded, redacted patch: truncation once hid whole
+ * files from this exact class of check.
  *
  * IT FAILS OPEN, AND THAT IS A PRODUCT DECISION RATHER THAN AN OVERSIGHT. A
  * reviewer that cannot be chosen, cannot be launched, or answers unreadably
@@ -116,10 +113,13 @@
  * `SliceReview` has three arms and why the report prints the skip reason.
  */
 
+import { spawn } from "node:child_process";
 import type { VendorConfig } from "../config/contracts.js";
 import type { Effort, Vendor } from "../contracts.js";
+import { shutdownProcessGroup as shutdownProcessGroupDefault } from "../shared/process.js";
 import type { UncommittedDiff } from "../worktree/contracts.js";
 import type {
+  DeterministicGateResult,
   ReviewerIdentity,
   ReviewFinding,
   ReviewSeverity,
@@ -128,9 +128,16 @@ import type {
   SliceReviewRequest,
   SupervisorPorts,
 } from "./contracts.js";
+import type { GateCommandRequest, GatePorts, GateRunResult } from "./gates.js";
+import { runGates } from "./gates.js";
 import type { OneShotEnv } from "./one-shot.js";
 import { runOneShotPrompt } from "./one-shot.js";
 import { describeError } from "./support.js";
+
+type ModelReviewerIdentity = ReviewerIdentity & {
+  readonly vendor: Vendor;
+  readonly effort: Effort;
+};
 
 /**
  * A review is a bounded read, not a coding session. Fifteen minutes is far more
@@ -206,6 +213,13 @@ type ReviewedChange =
   | { readonly kind: "empty" }
   | { readonly kind: "unavailable"; readonly reason: string };
 
+/** One authoritative diff read, shared by deterministic and model review. */
+interface InspectedChange {
+  readonly review: ReviewedChange;
+  readonly changedPaths: readonly string[] | null;
+  readonly changedPathsUnavailableReason?: string;
+}
+
 /**
  * No config is taken here on purpose. Which vendors exist is a property of the
  * RUN, and every request already carries the `RoutingInput` the run was built
@@ -215,23 +229,158 @@ type ReviewedChange =
 export interface CrossVendorReviewerOptions {
   readonly ports: SupervisorPorts;
   readonly env: OneShotEnv;
+  /** Injectable for tests; production executes the tuple directly, not in a shell. */
+  readonly runCommand?: GatePorts["runCommand"];
+  /** Injectable so abort-time process cleanup can be tested deterministically. */
+  readonly shutdownGateProcessGroup?: (pid: number) => Promise<void>;
 }
 
 /**
- * The real gate: pick the other vendor, ask it to review, adjudicate the answer.
+ * The full review path: deterministic checks first, then the other vendor.
  */
 export function createCrossVendorReviewer(
   options: CrossVendorReviewerOptions,
 ): SliceReviewer {
   return {
     review: (request: SliceReviewRequest): Promise<SliceReview> =>
-      reviewSlice(options, request),
+      reviewWithGates(options, request, (inspected) =>
+        reviewSlice(options, request, inspected.review),
+      ),
+  };
+}
+
+/**
+ * Put the deterministic checks in front of an injected reviewer too.
+ *
+ * The injection seam exists so the slice lifecycle can be tested without a
+ * second vendor. Leaving it outside the deterministic wrapper would make the
+ * most important ordering tests exercise a path production never takes.
+ */
+export function createDeterministicGateReviewer(
+  options: Pick<
+    CrossVendorReviewerOptions,
+    "ports" | "runCommand" | "shutdownGateProcessGroup"
+  >,
+  reviewer: SliceReviewer,
+): SliceReviewer {
+  return {
+    review: (request: SliceReviewRequest): Promise<SliceReview> =>
+      reviewWithGates(options, request, () => reviewer.review(request)),
+  };
+}
+
+const DETERMINISTIC_REVIEWER: ReviewerIdentity = {
+  vendor: "deterministic",
+  model: "gates",
+  effort: null,
+};
+
+async function reviewWithGates(
+  options: Pick<
+    CrossVendorReviewerOptions,
+    "ports" | "runCommand" | "shutdownGateProcessGroup"
+  >,
+  request: SliceReviewRequest,
+  reviewModel: (inspected: InspectedChange) => Promise<SliceReview>,
+): Promise<SliceReview> {
+  const startedAt = options.ports.now();
+  const inspected = await readChange(options, request);
+  let gateCleanupFailure: string | undefined;
+  const runCommand: GatePorts["runCommand"] =
+    options.runCommand ??
+    ((commandRequest) =>
+      runGateCommand(
+        commandRequest,
+        request.signal,
+        options.shutdownGateProcessGroup ?? shutdownProcessGroupDefault,
+        (pid, error) => {
+          gateCleanupFailure = `slice ${request.slice.id} attempt ${request.attempt}: the configured tests_pass gate process group (pid ${pid}) may still be running — ${describeError(error)}`;
+        },
+      ));
+  const gateRun = await runGates({
+    changedPaths: inspected.changedPaths,
+    ...(inspected.changedPathsUnavailableReason === undefined
+      ? {}
+      : {
+          changedPathsUnavailableReason:
+            inspected.changedPathsUnavailableReason,
+        }),
+    ownedPaths: request.slice.ownedPaths,
+    worktreePath: request.worktreePath,
+    ...(request.testCommand === undefined
+      ? {}
+      : { testCommand: request.testCommand }),
+    ports: {
+      runCommand,
+    },
+  });
+  const redacted = redactGateRun(options, request, gateRun);
+  if (request.signal?.aborted === true) {
+    const redact = (artifact: string): string =>
+      options.ports.engine.redact(request.worktree, artifact);
+    return {
+      verdict: "skipped",
+      reviewer: null,
+      reason: "CANCELLED",
+      message: redact(
+        `slice ${request.slice.id} attempt ${request.attempt} was not reviewed because the run was cancelled during deterministic review`,
+      ),
+      findings: redacted.findings,
+      gates: redacted.gates,
+      ...(gateCleanupFailure === undefined
+        ? {}
+        : { cleanupFailure: redact(gateCleanupFailure) }),
+      durationMs: options.ports.now() - startedAt,
+    };
+  }
+  if (redacted.findings.some((finding) => finding.severity === "blocking")) {
+    // No model identity is borrowed here: the sentinel is what keeps a
+    // deterministic rejection truthful in renderers written before gates were
+    // introduced, while every finding still names its exact source and gate.
+    return {
+      verdict: "rejected",
+      reviewer: DETERMINISTIC_REVIEWER,
+      findings: redacted.findings,
+      gates: redacted.gates,
+      durationMs: options.ports.now() - startedAt,
+    };
+  }
+
+  // Passing gates are prerequisites, not substitutes. The model result keeps
+  // its original verdict — especially `skipped` — and only gains the measured
+  // gate evidence that preceded it.
+  let modelReview: SliceReview;
+  try {
+    modelReview = await reviewModel(inspected);
+  } catch (error) {
+    const redact = (artifact: string): string =>
+      options.ports.engine.redact(request.worktree, artifact);
+    modelReview = {
+      verdict: "skipped",
+      reviewer: null,
+      reason: "REVIEWER_FAILED",
+      message: redact(
+        `slice ${request.slice.id} attempt ${request.attempt} was not reviewed: the reviewer threw instead of reporting: ${describeError(error)}`,
+      ),
+      durationMs: options.ports.now() - startedAt,
+    };
+  }
+  return {
+    ...modelReview,
+    findings: [
+      ...redacted.findings,
+      ...(modelReview.verdict === "skipped"
+        ? (modelReview.findings ?? [])
+        : modelReview.findings),
+    ],
+    gates: redacted.gates,
   };
 }
 
 async function reviewSlice(
   options: CrossVendorReviewerOptions,
   request: SliceReviewRequest,
+  change: ReviewedChange,
 ): Promise<SliceReview> {
   const startedAt = options.ports.now();
   const elapsed = (): number => options.ports.now() - startedAt;
@@ -277,11 +426,6 @@ async function reviewSlice(
     ),
     "verbose",
   );
-
-  // Taken AFTER the two skip checks above: a run with one vendor configured
-  // spawns no reviewer, and computing a diff nobody will read would charge
-  // every slice of a single-vendor install for a gate that cannot happen.
-  const change = await readChange(options, request);
 
   const answer = await runOneShotPrompt(worker, {
     id: redact(`${sliceId}-review-${request.attempt}`),
@@ -421,7 +565,7 @@ function otherVendor(
  * failed. A reviewer is not that re-routed slice worker, so it never receives
  * the rung. A model whose ceiling is `medium` reviews at `medium`.
  */
-function reviewerIdentity(vendor: VendorConfig): ReviewerIdentity {
+function reviewerIdentity(vendor: VendorConfig): ModelReviewerIdentity {
   const permitted = vendor.models.find(
     (model) => model.id === vendor.defaultModel,
   );
@@ -442,19 +586,17 @@ function cappedEffort(ceiling: Effort | undefined): Effort {
 /**
  * The change this attempt made, or the reason there is no diff of it.
  *
- * IT NEVER THROWS AND IT NEVER SKIPS THE REVIEW. A diff is what makes the
- * review good, not what makes it possible: a gate that refused to run without
- * one would turn every `--unsafe-in-place` run, and every consumer supplying
- * its own engine, into a slice that commits unreviewed. So a failure here
- * degrades to the pre-diff behaviour and says so twice — on the run log, which
- * the CLI prints and the MCP surface captures, and inside the reviewer's own
- * prompt, which is the only place that can stop the reviewer believing it saw
- * a change it was never shown.
+ * IT NEVER THROWS AND IT NEVER SKIPS MODEL REVIEW. Without a diff the three
+ * changed-path gates are recorded as skipped — never passed — while the model
+ * still degrades to reading whole files. The degradation is stated twice: on
+ * the run log, which the CLI prints and the MCP surface captures, and inside
+ * the reviewer's prompt, which is the only place that can stop the reviewer
+ * believing it saw a change it was never shown.
  */
 async function readChange(
-  options: CrossVendorReviewerOptions,
+  options: Pick<CrossVendorReviewerOptions, "ports">,
   request: SliceReviewRequest,
-): Promise<ReviewedChange> {
+): Promise<InspectedChange> {
   const redact = (artifact: string): string =>
     options.ports.engine.redact(request.worktree, artifact);
   const where = redact(`slice ${request.slice.id} attempt ${request.attempt}`);
@@ -465,7 +607,11 @@ async function readChange(
       `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
       "normal",
     );
-    return { kind: "unavailable", reason };
+    return {
+      review: { kind: "unavailable", reason },
+      changedPaths: null,
+      changedPathsUnavailableReason: reason,
+    };
   }
 
   let diff: UncommittedDiff;
@@ -480,7 +626,11 @@ async function readChange(
       `${where}: no diff of the change is available (${reason}), so the reviewer is reading whole files instead`,
       "normal",
     );
-    return { kind: "unavailable", reason };
+    return {
+      review: { kind: "unavailable", reason },
+      changedPaths: null,
+      changedPathsUnavailableReason: reason,
+    };
   }
 
   if (diff.truncated) {
@@ -492,9 +642,126 @@ async function readChange(
       "normal",
     );
   }
-  return diff.patch === ""
-    ? { kind: "empty" }
-    : { kind: "diff", patch: diff.patch };
+  return {
+    review:
+      diff.patch === ""
+        ? { kind: "empty" }
+        : { kind: "diff", patch: diff.patch },
+    // This list is deliberately not parsed from `patch`: the patch is bounded
+    // and redacted, while these paths came from the engine's full git result.
+    changedPaths: diff.paths,
+  };
+}
+
+function redactGateRun(
+  options: Pick<CrossVendorReviewerOptions, "ports">,
+  request: SliceReviewRequest,
+  result: GateRunResult,
+): GateRunResult {
+  const redact = (artifact: string): string =>
+    options.ports.engine.redact(request.worktree, artifact);
+  const redactFinding = (finding: ReviewFinding): ReviewFinding => ({
+    ...finding,
+    path: finding.path === null ? null : redact(finding.path),
+    summary: redact(finding.summary),
+  });
+  const gates: DeterministicGateResult[] = result.gates.map((gate) =>
+    gate.status === "skipped"
+      ? { ...gate, reason: redact(gate.reason) }
+      : { ...gate, findings: gate.findings.map(redactFinding) },
+  );
+  return {
+    gates,
+    findings: result.findings.map(redactFinding),
+  };
+}
+
+async function runGateCommand(
+  request: GateCommandRequest,
+  signal: AbortSignal | undefined,
+  shutdownProcessGroup: (pid: number) => Promise<void>,
+  onCleanupFailure: (pid: number, error: unknown) => void,
+): Promise<{ readonly exitCode: number }> {
+  if (signal?.aborted === true) {
+    throw new Error("The gate command was aborted.");
+  }
+  const [executable, ...arguments_] = request.command;
+  return await new Promise((resolve, reject) => {
+    const child = spawn(executable, arguments_, {
+      cwd: request.cwd,
+      detached: true,
+      stdio: "ignore",
+    });
+    let settled = false;
+    let aborting = false;
+    const settle = (
+      result:
+        | { readonly ok: true; readonly exitCode: number }
+        | { readonly ok: false; readonly error: unknown },
+    ): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (result.ok) {
+        resolve({ exitCode: result.exitCode });
+      } else {
+        reject(result.error);
+      }
+    };
+    const onAbort = (): void => {
+      if (settled || aborting) {
+        return;
+      }
+      aborting = true;
+      const pid = child.pid;
+      if (pid === undefined) {
+        settle({
+          ok: false,
+          error: new Error(
+            "The gate command was aborted before its process id was available.",
+          ),
+        });
+        return;
+      }
+      void shutdownProcessGroup(pid).then(
+        () => {
+          settle({
+            ok: false,
+            error: new Error("The gate command was aborted."),
+          });
+        },
+        (error: unknown) => {
+          onCleanupFailure(pid, error);
+          settle({ ok: false, error });
+        },
+      );
+    };
+    child.once("error", (error) => {
+      if (!aborting) {
+        settle({ ok: false, error });
+      }
+    });
+    child.once("exit", (exitCode) => {
+      if (!aborting) {
+        const pid = child.pid;
+        if (pid !== undefined) {
+          // A detached leader can exit cleanly while background descendants
+          // keep its process group alive. Reap that group best-effort without
+          // delaying or changing the command's already-known verdict.
+          void shutdownProcessGroup(pid).catch(() => undefined);
+        }
+        // A signal-terminated command did not pass. The gate only needs the
+        // zero/non-zero distinction, so one is the honest portable encoding.
+        settle({ ok: true, exitCode: exitCode ?? 1 });
+      }
+    });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) {
+      onAbort();
+    }
+  });
 }
 
 /**
@@ -811,6 +1078,7 @@ function readFinding(value: unknown): ReviewFinding | null {
     return null;
   }
   return {
+    source: "model",
     severity,
     path:
       typeof record.path === "string" && record.path !== ""

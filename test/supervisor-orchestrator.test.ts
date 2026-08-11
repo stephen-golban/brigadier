@@ -25,6 +25,7 @@ import {
   readdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,6 +41,7 @@ import type {
   Worker,
 } from "../src/contracts.js";
 import type { AnyQuotaOracle } from "../src/quota/contracts.js";
+import { renderQuietRunReport } from "../src/report/render.js";
 import type { SliceDifficulty } from "../src/routing/contracts.js";
 import { buildCapabilities } from "../src/supervisor/capabilities.js";
 import type {
@@ -114,11 +116,14 @@ const SLUG = "demo";
 const INTEGRATION_BRANCH = "brigadier/demo";
 const NOW = 1_700_000_000_000;
 
-function makeConfig(models: readonly string[]): BrigadierConfig {
+function makeConfig(
+  models: readonly string[],
+  linkedSecretPaths: readonly string[] = [],
+): BrigadierConfig {
   return parseConfig({
     version: CONFIG_VERSION,
     secretsConsent: true,
-    linkedSecretPaths: [],
+    linkedSecretPaths,
     allowDegradedRouting: false,
     vendors: [
       {
@@ -885,7 +890,8 @@ describe("session preparation", () => {
     expect(harness.report.ok).toBe(false);
     expect(harness.report.failure).toEqual({
       reason: "PREPARE_FAILED",
-      message: "scratch base already exists",
+      message:
+        "PREPARE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     });
     expect(harness.report.integrationBranch).toBeNull();
     expect(harness.ops).toEqual([
@@ -896,6 +902,107 @@ describe("session preparation", () => {
     expect(harness.report.slices[0]?.attempts[0]?.routed?.model).toBe(
       "claude-sonnet-5",
     );
+  });
+
+  test("a prepare failure redacts linked secret values from the report message", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-prepare-redaction-"));
+    try {
+      const repositoryPath = join(root, "repo");
+      const linkedSecretPath = "runtime.env";
+      const secret = "prepare-secret-value-7bC3xQ";
+      await mkdir(repositoryPath);
+      await writeFile(
+        join(repositoryPath, linkedSecretPath),
+        `ACCESS_TOKEN=${secret}\n`,
+      );
+      const config = makeConfig(["claude-sonnet-5"], [linkedSecretPath]);
+      const request: RunRequest = {
+        ...runRequest(planDocument([slice("a")]), 1),
+        repositoryPath,
+      };
+      const harness = await execute(
+        request,
+        fakeEngine({
+          prepareError: `could not finish secret inventory for ${secret}`,
+        }),
+        fakeRunner(),
+        config,
+        buildCapabilities(config),
+      );
+
+      expect(harness.report.failure).toEqual({
+        reason: "PREPARE_FAILED",
+        message: "could not finish secret inventory for [REDACTED]",
+      });
+      expect(harness.report.failure?.message.includes(secret)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a root repository path does not erase slashes from a failure diagnostic", async () => {
+    const harness = await execute(
+      {
+        ...runRequest(planDocument([slice("a")]), 1),
+        repositoryPath: "/",
+      },
+      fakeEngine({
+        prepareError: "could not inspect /tmp/project/config.json",
+      }),
+      fakeRunner(),
+    );
+
+    expect(harness.report.failure).toEqual({
+      reason: "PREPARE_FAILED",
+      message: "could not inspect /tmp/project/config.json",
+    });
+  });
+
+  test("a prepare failure omits raw detail when the redaction inventory cannot be rebuilt", async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "brigadier-prepare-fail-closed-"),
+    );
+    try {
+      const repositoryPath = join(root, "repo");
+      const linkedSecretPath = "runtime.env";
+      const unreadableLinkedPath = "redaction-loop.env";
+      const secret = "prepare-fallback-secret-4mN8pR";
+      await mkdir(repositoryPath);
+      await writeFile(
+        join(repositoryPath, linkedSecretPath),
+        `ACCESS_TOKEN=${secret}\n`,
+      );
+      await symlink(
+        unreadableLinkedPath,
+        join(repositoryPath, unreadableLinkedPath),
+      );
+      const config = makeConfig(
+        ["claude-sonnet-5"],
+        [linkedSecretPath, unreadableLinkedPath],
+      );
+      const request: RunRequest = {
+        ...runRequest(planDocument([slice("a")]), 1),
+        repositoryPath,
+      };
+      const harness = await execute(
+        request,
+        fakeEngine({
+          prepareError: `secret inventory failed while handling ${secret}`,
+        }),
+        fakeRunner(),
+        config,
+        buildCapabilities(config),
+      );
+
+      expect(harness.report.failure).toEqual({
+        reason: "PREPARE_FAILED",
+        message:
+          "PREPARE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
+      });
+      expect(harness.report.failure?.message.includes(secret)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("secret paths are inventoried for redaction even without link consent", async () => {
@@ -1212,7 +1319,7 @@ describe("wave failure", () => {
     const failure = harness.report.slices[0]?.attempts[0]?.failure;
     expect(failure?.kind).toBe("WORKER_FAILED");
     expect(failure?.message).toBe(
-      "slice runner threw for a: runner exploded for a",
+      "slice runner threw for a: SLICE_RUNNER_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     );
     expect(harness.report.slices[1]?.ok).toBe(true);
     // The surviving sibling is still merged and still cleaned up.
@@ -1402,7 +1509,8 @@ describe("reconciliation", () => {
     expect(harness.report.ok).toBe(false);
     expect(harness.report.failure).toEqual({
       reason: "MERGE_CONFLICT",
-      message: "merge a: error merge exploded for brigadier/demo/slice-1",
+      message:
+        "merge a: error MERGE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     });
     expect(harness.report.merges.map((record) => record.sliceId)).toEqual([
       "b",
@@ -1455,7 +1563,7 @@ describe("cleanup", () => {
       "release demo",
     ]);
     expect(harness.log).toContain(
-      "cleanup a: remove exploded for brigadier/demo/slice-1",
+      "cleanup a: WORKTREE_REMOVE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     );
     // A directory left behind does not invalidate merges that landed.
     expect(harness.report.ok).toBe(true);
@@ -1549,7 +1657,7 @@ describe("quota", () => {
       ],
     );
     expect(harness.log[0]).toBe(
-      "quota claude: unavailable (credentials unreadable)",
+      "quota claude: unavailable (QUOTA_READ_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable)",
     );
     expect(harness.report.ok).toBe(true);
     expect(harness.report.slices[0]?.ok).toBe(true);
@@ -1912,7 +2020,7 @@ describe("releasing the session's refs", () => {
     );
 
     expect(harness.log).toContain(
-      "release demo: refusing to retire refs while a worktree is active",
+      "release demo: SESSION_RELEASE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     );
     // The run itself succeeded, and a failure to tidy up does not undo that.
     expect(harness.report.ok).toBe(true);
@@ -1979,6 +2087,48 @@ describe("releasing the session's refs", () => {
  * can only do that from a field.
  */
 describe("cleanup failures", () => {
+  test("a scaffold failure names its directory while redacting an inventoried value", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-scaffold-redaction-"));
+    const secret = "sk_live_scaffold_7bC3xQ";
+    const repositoryPath = join(root, `repo-${secret}`);
+    const linkedSecretPath = "runtime.env";
+    await mkdir(repositoryPath);
+    await writeFile(
+      join(repositoryPath, linkedSecretPath),
+      `ACCESS_TOKEN=${secret}\n`,
+    );
+    await writeFile(`${repositoryPath}-brigadier`, "not a directory");
+    try {
+      const config = makeConfig(["claude-sonnet-5"], [linkedSecretPath]);
+      const harness = await execute(
+        {
+          ...runRequest(planDocument([slice("a")]), 1),
+          repositoryPath,
+        },
+        fakeEngine(),
+        fakeRunner(),
+        config,
+        buildCapabilities(config),
+      );
+
+      expect(harness.report.cleanupFailures).toHaveLength(2);
+      expect(harness.report.cleanupFailures[0]).toContain(
+        `scaffold ${join(root, "repo-[REDACTED]-brigadier", SLUG)}:`,
+      );
+      expect(harness.report.cleanupFailures[1]).toContain(
+        `scaffold ${join(root, "repo-[REDACTED]-brigadier")}:`,
+      );
+      const rendered = renderQuietRunReport(harness.report);
+      expect(rendered).toContain("cleanup failure: scaffold ");
+      expect(rendered).toContain("[REDACTED]-brigadier");
+      expect(rendered).not.toContain(secret);
+      expect(harness.log.join("\n")).not.toContain(secret);
+      expect(harness.report.ok).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("a failed remove and a failed release are both carried, in order", async () => {
     const engine = fakeEngine({
       removeThrows: ["brigadier/demo/slice-1"],
@@ -1991,8 +2141,8 @@ describe("cleanup failures", () => {
     );
 
     expect(harness.report.cleanupFailures).toEqual([
-      "cleanup a: remove exploded for brigadier/demo/slice-1",
-      "release demo: refusing to retire refs while a worktree is active",
+      "cleanup a: WORKTREE_REMOVE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
+      "release demo: SESSION_RELEASE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     ]);
     // The run's own verdict is untouched by a failure to tidy up.
     expect(harness.report.ok).toBe(true);
@@ -2016,7 +2166,7 @@ describe("cleanup failures", () => {
 
     expect(harness.report.cleanupFailures).toEqual([
       "slice a attempt 1: the claude/claude-opus-5 worker (pid 4242) may still be running",
-      "release demo: refs are pinned",
+      "release demo: SESSION_RELEASE_FAILED: diagnostic detail omitted because linked-secret redaction is unavailable",
     ]);
   });
 

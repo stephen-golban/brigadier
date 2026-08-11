@@ -32,6 +32,10 @@ import { type McpRunControl, runMcpServer } from "../mcp/server.js";
 import type { Planner, PlannerOutcome } from "../planner/index.js";
 import { createModelPlanner } from "../planner/index.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
+import {
+  renderQuietRunReport,
+  writeRunRecordDetail,
+} from "../report/render.js";
 import type { RoutedWorker } from "../routing/index.js";
 // Imported from the module rather than the barrel on purpose: the interrupt
 // helpers are CLI plumbing, not supervisor API, and `src/index.ts` re-exports
@@ -678,6 +682,8 @@ Options for run:
                        dry run still runs a planner model and costs tokens; it
                        creates no slice worktree or ref, spawns no slice worker,
                        and writes no commit
+      --verbose        print the full per-attempt report and verbose progress
+                       log instead of the compact run summary
       --unsafe-in-place
                        run workers in this checkout instead of isolated
                        worktrees; every file here becomes visible to every worker
@@ -927,6 +933,7 @@ interface RunInvocation {
   readonly slug: string | null;
   readonly maxWorkers: number;
   readonly dryRun: boolean;
+  readonly verbose: boolean;
   readonly unsafeInPlace: boolean;
 }
 
@@ -1020,8 +1027,10 @@ async function runPlan(options: RunOptions): Promise<number> {
   const dependencies = buildRunDependencies({
     config,
     env,
-    log: (line: string) => {
-      stdout.write(`${line}\n`);
+    log: (line: string, level = "normal") => {
+      if (level === "normal" || invocation.verbose) {
+        stdout.write(`${line}\n`);
+      }
     },
     ...(options.harness === undefined ? {} : { harness: options.harness }),
   });
@@ -1071,7 +1080,19 @@ async function runPlan(options: RunOptions): Promise<number> {
     await disposeOracles(dependencies.ports, stderr);
   }
 
-  renderRunReport(stdout, report);
+  const detailLine = await writeRunRecordDetail(report, {
+    environment: options.env,
+    repositoryPath: options.cwd,
+    linkedSecretPaths: config.linkedSecretPaths,
+  });
+  if (invocation.verbose) {
+    renderRunReport(stdout, report);
+    if (detailLine !== null) {
+      stdout.write(`${detailLine}\n`);
+    }
+  } else {
+    stdout.write(`\n${renderQuietRunReport(report, { detailLine })}\n`);
+  }
   return (
     interruptedExitCode(options.signal) ?? (report.ok ? RUN_OK : RUN_FAILED)
   );
@@ -1366,7 +1387,7 @@ function interruptedExitCode(signal: AbortSignal | undefined): number | null {
 interface RunDependenciesInput {
   readonly config: BrigadierConfig;
   readonly env: LaunchEnv;
-  readonly log: (line: string) => void;
+  readonly log: SupervisorPorts["log"];
   readonly harness?: RunHarness;
 }
 
@@ -1609,6 +1630,7 @@ function parseRunArguments(argv: readonly string[]): RunArguments {
   let slug: string | null = null;
   let maxWorkers = 1;
   let dryRun = false;
+  let verbose = false;
   let unsafeInPlace = false;
 
   let index = 0;
@@ -1666,6 +1688,10 @@ function parseRunArguments(argv: readonly string[]): RunArguments {
       dryRun = true;
       continue;
     }
+    if (argument === "--verbose") {
+      verbose = true;
+      continue;
+    }
     if (argument === "--unsafe-in-place") {
       unsafeInPlace = true;
       continue;
@@ -1691,7 +1717,7 @@ function parseRunArguments(argv: readonly string[]): RunArguments {
     task = argument;
   }
 
-  const rest = { slug, maxWorkers, dryRun, unsafeInPlace };
+  const rest = { slug, maxWorkers, dryRun, verbose, unsafeInPlace };
   if (task !== null) {
     if (planSource !== null) {
       return {
@@ -1860,17 +1886,23 @@ function renderReview(out: OutputStream, attempt: SliceAttempt): void {
     return;
   }
   const reviewer = `${review.reviewer.vendor}/${review.reviewer.model}`;
+  const effort =
+    review.reviewer.effort === null ? "" : ` effort=${review.reviewer.effort}`;
   out.write(
-    `        review: ${review.verdict} by ${reviewer} effort=${review.reviewer.effort} in ${review.durationMs}ms\n`,
+    `        review: ${review.verdict} by ${reviewer}${effort} in ${review.durationMs}ms\n`,
   );
   for (const finding of review.findings) {
+    const gate =
+      finding.source === "gate" ? ` [${finding.gate ?? "unknown_gate"}]` : "";
     const where =
       finding.path === null
         ? ""
         : finding.line === null
           ? ` ${finding.path}`
           : ` ${finding.path}:${finding.line}`;
-    out.write(`          ${finding.severity}${where}: ${finding.summary}\n`);
+    out.write(
+      `          ${finding.severity}${gate}${where}: ${finding.summary}\n`,
+    );
   }
 }
 
