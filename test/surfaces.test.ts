@@ -18,7 +18,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -33,6 +33,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createTools } from "../src/mcp/tools.ts";
 import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
 import { nodeSurfaceIo, runInstall, sha256 } from "../src/surfaces/install.ts";
@@ -64,8 +65,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1919,
   },
   "claude-code/hooks/handoff.mjs": {
-    sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
-    bytes: 4570,
+    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
+    bytes: 5467,
   },
   "claude-code/hooks/hooks.json": {
     sha256: "896daf07fe5d2ca91b92f51a4de35d3f713395c6cc0b6ea610d0462b6f582992",
@@ -88,8 +89,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3185,
   },
   "codex/hooks/handoff.mjs": {
-    sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
-    bytes: 4570,
+    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
+    bytes: 5467,
   },
   "codex/skills/brigadier/SKILL.md": {
     sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
@@ -1288,6 +1289,105 @@ describe("the handoff hook", () => {
     }
   }, 30_000);
 
+  test("a Codex rollout transcript is counted and reported in one sentence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "rollout.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"session_meta","payload":{"id":"session-abc"}}',
+          '{"type":"event_msg","payload":{"type":"task_started"}}',
+          '{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Working through the request."}]}}',
+          '{"type":"response_item","payload":{"type":"reasoning","role":"assistant","summary":[]}}',
+          '{"type":"turn_context","payload":{"turn_id":"turn-1"}}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The requested work is complete."}]}}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context after 2 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unrecognised transcript shape degrades to the shorter sentence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "transcript.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"metadata","session_id":"abc"}',
+          '{"type":"tool_result","content":"done"}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a mixed transcript sums Claude Code and Codex assistant turns", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "transcript.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"assistant","message":"Claude Code turn"}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}',
+          '{"type":"assistant","message":"another Claude Code turn"}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context after 3 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("an absent or unreadable transcript degrades to the shorter sentence", async () => {
     const withoutPath = await runHook(
       JSON.stringify({ hook_event_name: "PreCompact" }),
@@ -1308,6 +1408,77 @@ describe("the handoff hook", () => {
     );
     expect(missing.exitCode).toBe(0);
     expect(missing.stdout).toBe(withoutPath.stdout);
+  }, 30_000);
+
+  test("a FIFO transcript degrades to the shorter sentence instead of hanging", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "transcript.fifo");
+      const created = spawnSync("mkfifo", [transcript]);
+      if (created.error !== undefined || created.status !== 0) {
+        throw new Error(
+          `mkfifo failed: status=${created.status}, error=${created.error}`,
+        );
+      }
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a directory as transcript_path degrades to the shorter sentence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const readMarker = join(scratch, "directory-read-attempted");
+      const preload = join(scratch, "observe-directory-read.mjs");
+      await writeFile(
+        preload,
+        [
+          'import fs from "node:fs";',
+          'import { syncBuiltinESMExports } from "node:module";',
+          "const originalReadFileSync = fs.readFileSync;",
+          "fs.readFileSync = function (...args) {",
+          "  if (args[0] === process.env.BRIGADIER_TEST_DIRECTORY_TRANSCRIPT) {",
+          '    fs.writeFileSync(process.env.BRIGADIER_TEST_DIRECTORY_READ_MARKER, "");',
+          "  }",
+          "  return originalReadFileSync.apply(this, args);",
+          "};",
+          "syncBuiltinESMExports();",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: scratch,
+        }),
+        {
+          NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+          BRIGADIER_TEST_DIRECTORY_TRANSCRIPT: scratch,
+          BRIGADIER_TEST_DIRECTORY_READ_MARKER: readMarker,
+        },
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+      expect(existsSync(readMarker)).toBe(false);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   }, 30_000);
 
   test("a transcript too large to walk is not walked", async () => {
@@ -1347,6 +1518,34 @@ describe("the handoff hook", () => {
     const notAnObject = await runHook('"a bare string"', {});
     expect(notAnObject.exitCode).toBe(0);
     expect(notAnObject.stdout).toBe("");
+  }, 30_000);
+
+  test("a top-level JSON array on stdin produces silence", async () => {
+    const array = await runHook("[]", {});
+    expect(array.exitCode).toBe(0);
+    expect(array.stdout).toBe("");
+
+    const number = await runHook("42", {});
+    expect(number.exitCode).toBe(0);
+    expect(number.stdout).toBe("");
+
+    const nullValue = await runHook("null", {});
+    expect(nullValue.exitCode).toBe(0);
+    expect(nullValue.stdout).toBe("");
+  }, 30_000);
+
+  test("a closed stdout does not turn the hook into a failure", () => {
+    const pipeline = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -o pipefail\nprintf '%s' '{"hook_event_name":"PreCompact"}' | node ${JSON.stringify(hookPath)} | true`,
+      ],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    // A timeout would set error; if the pipeline hangs, this assertion fails clearly.
+    expect(pipeline.error).toBeUndefined();
+    expect(pipeline.status).toBe(0);
   }, 30_000);
 
   test("stdin that never ends is abandoned rather than waited on forever", async () => {

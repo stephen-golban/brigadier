@@ -460,6 +460,13 @@ at least one file was refused or could not be written, `2` usage error.
   provision, copy, or symlink it. In this repository, `bun test` succeeds while
   `bun run typecheck` and `bun run check` exit 127 because `tsc` and `biome`
   are not found. This applies to every worker vendor.
+- **A worker cannot fetch a missing dependency.** A Codex worker's sandbox
+  disables networking, so it cannot fetch anything; a Claude worker has no shell
+  at all. Independently, a worker's write lane is exactly its slice's
+  `ownedPaths`, so it cannot create `node_modules/` at the repository root
+  unless a slice explicitly owns that path. Consequently, `bun run typecheck`
+  and `bun run check` cannot be made to work inside a worker and must be
+  verified by the human running brigadier.
 - **Only Claude's quota is read during a run.** Codex's quota oracle needs a
   `codex app-server` subprocess, and starting one on every run — including dry
   runs, including runs that touch no Codex model — would let an unrelated vendor
