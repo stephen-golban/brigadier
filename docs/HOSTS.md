@@ -111,11 +111,19 @@ re-reviewing an edited script means deliberately changing the registration and
 approving it again. The README installed beside `handoff.mjs` explains the
 approval step.
 
-Codex CLI 0.145.0 exposes no inspection surface for persisted hook approval:
-`codex doctor` emits no hook diagnostic, and `codex --help` lists no `hooks`
-subcommand. A user who is unsure whether their approval was persisted therefore
-has no way to determine it from brigadier or Codex; the only observable signal
-is the hook's own `systemMessage` during an actual compaction.
+The earlier claim that a user has no way to determine whether hook approval was
+persisted was wrong. Measured on codex-cli 0.147.0, persisted trust is readable
+non-interactively from `$CODEX_HOME/config.toml` under a `[hooks.state]` table:
+an entry keyed as `<hooks file>:<snake_case event>:<group index>:<hook index>`
+carries a `trusted_hash`. This directly answers whether approval was persisted,
+and verifies the existing claim that approval binds to the registration rather
+than to the script's contents: the recorded hash matches neither the hook script
+nor the hooks file. The narrower observation remains true on codex-cli 0.147.0:
+there is no dedicated hook diagnostic command—`codex doctor` output contains
+the string `hook` zero times, and `codex --help` lists no `hooks` subcommand.
+`codex --help` does
+list `--dangerously-bypass-hook-trust`, which `surfaces/codex/hooks/README.md`
+documents.
 
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
 including brigadier's own workers, and no flag suppresses it. Keep it doctrine.
