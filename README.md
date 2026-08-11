@@ -453,8 +453,13 @@ at least one file was refused or could not be written, `2` usage error.
   entirely — granting it would silently widen the lane to the whole filesystem.
   Claude workers get `Read`, `Glob`, `Grep`, `Edit`, `Write` and nothing else.
   Codex workers run under a real filesystem sandbox profile instead. A slice
-  that requires running the test suite should go to Codex, or be verified by
-  you.
+  that requires running the test suite should go to Codex only when it does not
+  need installed dependencies, or be verified by you.
+- **Dependency-provided verification commands are unavailable.** Slice
+  worktrees have no `node_modules/`: it is ignored, and brigadier does not
+  provision, copy, or symlink it. In this repository, `bun test` succeeds while
+  `bun run typecheck` and `bun run check` exit 127 because `tsc` and `biome`
+  are not found. This applies to every worker vendor.
 - **Only Claude's quota is read during a run.** Codex's quota oracle needs a
   `codex app-server` subprocess, and starting one on every run — including dry
   runs, including runs that touch no Codex model — would let an unrelated vendor

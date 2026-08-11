@@ -224,9 +224,10 @@ executable, and the notarized DMG rides along as evidence.
 
 ## Moving the version, everywhere it lives
 
-`0.0.0` appears in more places than `package.json`, and two of them will fail
-`bun test` if you miss them — deliberately. This list was produced by actually
-bumping the version to `0.1.0` in a scratch tree and running the full suite.
+`0.0.0` appears in more places than `package.json`, and several are enforced by
+`bun test` — deliberately. This list reflects HEAD on 2026-08-11, when it was
+checked by actually bumping the version to `0.1.0` in a scratch tree and running
+the full suite.
 
 **Enforced — the release or the test suite fails if you skip these:**
 
@@ -236,24 +237,30 @@ bumping the version to `0.1.0` in a scratch tree and running the full suite.
    `scripts/verify-tag-version.sh`: a pin that drifts names a platform package
    version that will never be published, and `npm install` would then quietly
    fall back to the slower JavaScript launcher instead of failing.
-3. `test/mcp.test.ts` → `const VERSION`. Two tests fail until it matches.
-4. `test/mcp-entry.test.ts` → the golden `initialize` response string, which
+3. `test/mcp.test.ts` → `const VERSION` and the four golden JSON-RPC frames that
+   embed `"version":"0.0.0"`. When `package.json` is bumped to `0.1.0` with
+   items 1 and 2 applied and every test file untouched, two tests in this file
+   fail; changing that constant alone does not update the golden frames.
+4. `test/mcp-repository-path.test.ts` → its golden `initialize` response frame,
+   which embeds `"version":"0.0.0"`. This file was added in `4d0dd97` and missed
+   when this list was revised.
+5. `test/mcp-entry.test.ts` → the golden `initialize` response string, which
    embeds `"version":"0.0.0"`. One test fails until it matches.
 
 **Not enforced — nothing will tell you, so do them by hand:**
 
-5. `bun.lock` → the four `optionalDependencies` entries. Regenerate with
+6. `bun.lock` → the four `optionalDependencies` entries. Regenerate with
    `bun install` after editing `package.json` and commit the result.
    (`bun install --frozen-lockfile` tolerates the mismatch, because the platform
    packages are optional and currently unresolvable, so CI will *not* catch a
    stale lockfile here.)
-6. `src/surfaces/templates.ts` → the `claude-desktop/manifest.json` template
+7. `src/surfaces/templates.ts` → the `claude-desktop/manifest.json` template
    string contains `"version": "0.0.0"`.
-7. `surfaces/claude-desktop/manifest.json` → the staged copy of the same value.
-8. `README.md` → the two passages stating the package is unpublished at `0.0.0`.
+8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same value.
+9. `README.md` → the two passages stating the package is unpublished at `0.0.0`.
    They stop being true the moment the release lands.
 
-> **Items 6 and 7 are unenforced only if you skip them. Doing them turns
+> **Items 7 and 8 are unenforced only if you skip them. Doing them turns
 > `bun test` red until you also move a pin.**
 >
 > `test/surfaces.test.ts` pins every installable surface file by absolute
@@ -267,7 +274,7 @@ bumping the version to `0.1.0` in a scratch tree and running the full suite.
 > neither of which mentions the version, so the reason is not obvious from the
 > failure.
 >
-> Edit item 6 and item 7 together, keeping them byte-identical, then recompute:
+> Edit item 7 and item 8 together, keeping them byte-identical, then recompute:
 >
 > ```sh
 > shasum -a 256 surfaces/claude-desktop/manifest.json
@@ -281,7 +288,7 @@ bumping the version to `0.1.0` in a scratch tree and running the full suite.
 
 **Deliberately left behind:**
 
-9. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
+10. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
    digests until *after* the release exists. The real archives must be built and
    hashed before the formula can name them, so this file is updated at the end,
    by `scripts/update-homebrew-formula.ts`, never by hand.
@@ -307,9 +314,9 @@ npm pkg set "version=${VERSION}" \
 bun install
 ```
 
-Then edit items 3, 4, 6, 7, and 8 from the list above by hand.
+Then edit items 3, 4, 5, 7, 8, and 9 from the list above by hand.
 
-Items 6 and 7 change a pinned file, so recompute the pin before you run the gate:
+Items 7 and 8 change a pinned file, so recompute the pin before you run the gate:
 
 ```sh
 shasum -a 256 surfaces/claude-desktop/manifest.json

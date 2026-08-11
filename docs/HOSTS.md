@@ -111,6 +111,12 @@ re-reviewing an edited script means deliberately changing the registration and
 approving it again. The README installed beside `handoff.mjs` explains the
 approval step.
 
+Codex CLI 0.145.0 exposes no inspection surface for persisted hook approval:
+`codex doctor` emits no hook diagnostic, and `codex --help` lists no `hooks`
+subcommand. A user who is unsure whether their approval was persisted therefore
+has no way to determine it from brigadier or Codex; the only observable signal
+is the hook's own `systemMessage` during an actual compaction.
+
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
 including brigadier's own workers, and no flag suppresses it. Keep it doctrine.
 

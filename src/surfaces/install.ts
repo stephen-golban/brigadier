@@ -467,7 +467,8 @@ Options:
       --all        install every host above
       --dry-run    report what would be written and write nothing
       --force      replace a file that brigadier did not write, or that was
-                   edited after brigadier wrote it
+                   edited after brigadier wrote it (written with mode 0644 or
+                   0755, not the replaced file's mode)
   -h, --help       print this message
 
 Exit codes:
