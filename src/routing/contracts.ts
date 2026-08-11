@@ -44,6 +44,7 @@ export interface SliceRequirements {
   readonly imageInput?: boolean;
   readonly webSearch?: boolean;
   readonly structuredOutput?: boolean;
+  readonly commandExecution?: boolean;
   readonly minContextWindowTokens?: number;
 }
 

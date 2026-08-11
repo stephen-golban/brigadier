@@ -67,6 +67,12 @@ export interface AdapterDeclaration<V extends string> {
   readonly vendor: V;
   readonly executable: string;
   readonly processCompletion: ProcessCompletionBehavior;
+  /**
+   * Whether an editable slice worker can run shell commands. Claude's
+   * Edit/Write allowlist withholds Bash when editable paths exist; read-only or
+   * empty-lane workers omit that allowlist entirely.
+   */
+  readonly workerShell: "available" | "withheld";
 }
 
 /**
@@ -78,11 +84,13 @@ export const ADAPTER_DECLARATIONS = [
     vendor: "claude",
     executable: "claude",
     processCompletion: "signals-then-must-be-killed",
+    workerShell: "withheld",
   },
   {
     vendor: "codex",
     executable: "codex",
     processCompletion: "self-exits",
+    workerShell: "available",
   },
 ] as const satisfies readonly AdapterDeclaration<string>[];
 

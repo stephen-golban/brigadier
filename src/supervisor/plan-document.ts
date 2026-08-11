@@ -125,6 +125,7 @@ const REQUIREMENT_KEY_LIST = [
   "imageInput",
   "webSearch",
   "structuredOutput",
+  "commandExecution",
   "minContextWindowTokens",
 ] as const;
 type _RequirementKeysAreExact = Assert<
@@ -147,6 +148,7 @@ const REQUIREMENT_FLAGS = [
   "imageInput",
   "webSearch",
   "structuredOutput",
+  "commandExecution",
 ] as const;
 type _RequirementFlagsAreExact = Assert<
   Exactly<(typeof REQUIREMENT_FLAGS)[number], BooleanRequirementKey>
@@ -386,6 +388,7 @@ function parseRequirements(
     imageInput?: boolean;
     webSearch?: boolean;
     structuredOutput?: boolean;
+    commandExecution?: boolean;
     minContextWindowTokens?: number;
   } = {};
   for (const flag of REQUIREMENT_FLAGS) {

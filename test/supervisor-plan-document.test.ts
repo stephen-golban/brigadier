@@ -255,6 +255,7 @@ describe("parsePlanDocument: the accepted document", () => {
         slice({
           requires: {
             minContextWindowTokens: 0,
+            commandExecution: true,
             structuredOutput: true,
             webSearch: false,
             imageInput: true,
@@ -266,14 +267,25 @@ describe("parsePlanDocument: the accepted document", () => {
       imageInput: true,
       webSearch: false,
       structuredOutput: true,
+      commandExecution: true,
       minContextWindowTokens: 0,
     });
     expect(Object.keys(parsed.directives[0]?.requires ?? {})).toEqual([
       "imageInput",
       "webSearch",
       "structuredOutput",
+      "commandExecution",
       "minContextWindowTokens",
     ]);
+  });
+
+  test("accepts a false command execution requirement", () => {
+    const parsed = parsePlanDocument(
+      document([slice({ requires: { commandExecution: false } })]),
+    );
+    expect(parsed.directives[0]?.requires).toEqual({
+      commandExecution: false,
+    });
   });
 
   test("keeps an empty requires block as a present, empty object", () => {
@@ -535,6 +547,7 @@ describe("parsePlanDocument: requires rejection", () => {
               imageInput: "yes",
               webSearch: 1,
               structuredOutput: null,
+              commandExecution: "bash",
             },
           }),
         ]),
@@ -543,6 +556,7 @@ describe("parsePlanDocument: requires rejection", () => {
       "slices[0].requires.imageInput must be a boolean",
       "slices[0].requires.webSearch must be a boolean",
       "slices[0].requires.structuredOutput must be a boolean",
+      "slices[0].requires.commandExecution must be a boolean",
     ]);
   });
 

@@ -75,12 +75,13 @@
 
 import type { BrigadierConfig } from "../config/contracts.js";
 import { EFFORT_LADDER } from "../config/contracts.js";
-import type {
-  Capability,
-  Effort,
-  QuotaSnapshot,
-  QuotaWindow,
-  Vendor,
+import {
+  ADAPTER_DECLARATIONS,
+  type Capability,
+  type Effort,
+  type QuotaSnapshot,
+  type QuotaWindow,
+  type Vendor,
 } from "../contracts.js";
 import { modelQuotaStatus } from "../quota/contracts.js";
 import {
@@ -888,6 +889,7 @@ function demandsCapability(requires: SliceRequirements | undefined): boolean {
     requires.imageInput === true ||
     requires.webSearch === true ||
     requires.structuredOutput === true ||
+    requires.commandExecution === true ||
     (requires.minContextWindowTokens !== undefined &&
       requires.minContextWindowTokens > 0)
   );
@@ -910,6 +912,16 @@ function judgeCapability(
   requires: SliceRequirements | undefined,
   demands: boolean,
 ): string | null {
+  if (
+    requires?.commandExecution === true &&
+    ADAPTER_DECLARATIONS.some(
+      (declaration) =>
+        declaration.vendor === entry.vendor &&
+        declaration.workerShell === "withheld",
+    )
+  ) {
+    return `${describe(entry)} cannot satisfy the command execution requirement because its worker adapter withholds shell access`;
+  }
   if (capability === undefined) {
     if (!demands) {
       return null;
@@ -962,6 +974,9 @@ function describeRequirements(requires: SliceRequirements | undefined): string {
   }
   if (requires?.structuredOutput === true) {
     parts.push("structured output");
+  }
+  if (requires?.commandExecution === true) {
+    parts.push("command execution");
   }
   const minimum = requires?.minContextWindowTokens;
   if (minimum !== undefined && minimum > 0) {

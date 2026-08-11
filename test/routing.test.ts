@@ -962,6 +962,78 @@ describe("capability filter", () => {
     ).toBe("gpt-5.6-sol");
   });
 
+  test("command execution removes withheld adapters and routes an available one", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["claude-sonnet-5", "high"]] },
+      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+    ]);
+    const routed = expectRouted(
+      route(
+        request("standard", { requires: { commandExecution: true } }),
+        input(config, [
+          capability("claude", "claude-sonnet-5"),
+          capability("codex", "gpt-5.6-sol"),
+        ]),
+      ),
+    );
+    expect(routed.vendor).toBe("codex");
+    expect(routed.model).toBe("gpt-5.6-sol");
+    expect(routed.rationale[2]).toBe(
+      "capability: slice requires command execution; 1 of 2 model(s) passed",
+    );
+  });
+
+  test("command execution fails by name when no available model qualifies", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["claude-sonnet-5", "high"]] },
+      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+    ]);
+    const failure = expectFailure(
+      route(
+        request("standard", { requires: { commandExecution: true } }),
+        input(config, []),
+      ),
+    );
+    expect(failure.reason).toBe("NO_CAPABLE_MODEL");
+    expect(failure.message).toBe(
+      'no configured model can take slice "slice-1" at standard difficulty; 2 model(s) were eliminated',
+    );
+    expect(failure.rejected).toEqual([
+      {
+        vendor: "claude",
+        model: "claude-sonnet-5",
+        stage: "capability",
+        reason:
+          "claude/claude-sonnet-5 cannot satisfy the command execution requirement because its worker adapter withholds shell access",
+      },
+      {
+        vendor: "codex",
+        model: "gpt-5.6-sol",
+        stage: "capability",
+        reason:
+          "brigadier has no capability record for codex/gpt-5.6-sol, and this slice requires command execution",
+      },
+    ]);
+  });
+
+  test("an absent or false command execution requirement does not re-rank", () => {
+    const config = makeConfig([
+      { vendor: "claude", models: [["claude-sonnet-5", "high"]] },
+      { vendor: "codex", models: [["gpt-5.6-sol", "high"]] },
+    ]);
+    const capabilities = [
+      capability("claude", "claude-sonnet-5"),
+      capability("codex", "gpt-5.6-sol"),
+    ];
+    const baseline = route(request("standard"), input(config, capabilities));
+    const explicitFalse = route(
+      request("standard", { requires: { commandExecution: false } }),
+      input(config, capabilities),
+    );
+    expect(explicitFalse).toEqual(baseline);
+    expect(expectRouted(baseline).vendor).toBe("claude");
+  });
+
   test("a context window below the floor is rejected", () => {
     const config = makeConfig([
       {
@@ -1083,6 +1155,7 @@ describe("capability filter", () => {
             imageInput: false,
             webSearch: false,
             structuredOutput: false,
+            commandExecution: false,
           },
         }),
         input(twoVendorConfig(), []),

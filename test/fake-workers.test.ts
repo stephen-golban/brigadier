@@ -150,11 +150,13 @@ describe("worker contracts", () => {
         vendor: "claude",
         executable: "claude",
         processCompletion: "signals-then-must-be-killed",
+        workerShell: "withheld",
       },
       {
         vendor: "codex",
         executable: "codex",
         processCompletion: "self-exits",
+        workerShell: "available",
       },
     ]);
   });
