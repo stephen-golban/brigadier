@@ -77,7 +77,7 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3041,
   },
   "claude-desktop/manifest.json": {
-    sha256: "3c59451856ffbcc451e6fa1ea31572951d95317ec1d382b7dab87b6952f03f5f",
+    sha256: "ca12f56795d0800bdd9e1cc55826e76168ff01a3c92a1a05dbfd1ba0cbb77beb",
     bytes: 1597,
   },
   "codex/AGENTS.md": {
