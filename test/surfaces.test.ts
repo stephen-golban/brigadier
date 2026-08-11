@@ -1541,8 +1541,10 @@ describe("the handoff hook", () => {
         "-c",
         `set -o pipefail\nprintf '%s' '{"hook_event_name":"PreCompact"}' | node ${JSON.stringify(hookPath)} | true`,
       ],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: 20_000 },
     );
+    // A timeout would set error; if the pipeline hangs, this assertion fails clearly.
+    expect(pipeline.error).toBeUndefined();
     expect(pipeline.status).toBe(0);
   }, 30_000);
 
