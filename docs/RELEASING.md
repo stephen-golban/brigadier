@@ -263,9 +263,8 @@ the current version to the next version. This list was verified by the past
 8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same
    value. Move it from the current version to the next version too.
 9. `README.md` → the two passages stating the package is unpublished at the
-   current version. Move their version references to the next version and
-   reword their release status: they stop being true the moment the release
-   lands.
+   current version. Move their version references to the next version. Once the
+   release lands, reword their release status: they stop being true then.
 10. `src/config/contracts.ts` → the comment explaining that the package is
     unpublished at the current version, so re-running `init` is a complete
     remedy and no migration path is owed. Move its version reference to the next
@@ -315,9 +314,10 @@ the current version to the next version. This list was verified by the past
 Run from a clean checkout on macOS, on a branch, with `VERSION` set to the
 version you intend to ship. Nothing here is public and every line is
 reversible.
+Set `VERSION` to the version being released.
 
 ```sh
-export VERSION=0.1.0
+export VERSION=REPLACE_WITH_RELEASE_VERSION
 
 npm pkg set "version=${VERSION}" \
   "optionalDependencies[@stephen-golban/brigadier-darwin-arm64]=${VERSION}" \
