@@ -65,8 +65,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1919,
   },
   "claude-code/hooks/handoff.mjs": {
-    sha256: "f141449ed765a7312fd72a87baff9ace85ca4a9daca41767f8a26abf1f101bf3",
-    bytes: 5287,
+    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
+    bytes: 5467,
   },
   "claude-code/hooks/hooks.json": {
     sha256: "896daf07fe5d2ca91b92f51a4de35d3f713395c6cc0b6ea610d0462b6f582992",
@@ -89,8 +89,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3185,
   },
   "codex/hooks/handoff.mjs": {
-    sha256: "f141449ed765a7312fd72a87baff9ace85ca4a9daca41767f8a26abf1f101bf3",
-    bytes: 5287,
+    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
+    bytes: 5467,
   },
   "codex/skills/brigadier/SKILL.md": {
     sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
@@ -1416,7 +1416,9 @@ describe("the handoff hook", () => {
       const transcript = join(scratch, "transcript.fifo");
       const created = spawnSync("mkfifo", [transcript]);
       if (created.error !== undefined || created.status !== 0) {
-        return;
+        throw new Error(
+          `mkfifo failed: status=${created.status}, error=${created.error}`,
+        );
       }
       const run = await runHook(
         JSON.stringify({
@@ -1530,6 +1532,18 @@ describe("the handoff hook", () => {
     const nullValue = await runHook("null", {});
     expect(nullValue.exitCode).toBe(0);
     expect(nullValue.stdout).toBe("");
+  }, 30_000);
+
+  test("a closed stdout does not turn the hook into a failure", () => {
+    const pipeline = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -o pipefail\nprintf '%s' '{"hook_event_name":"PreCompact"}' | node ${JSON.stringify(hookPath)} | true`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(pipeline.status).toBe(0);
   }, 30_000);
 
   test("stdin that never ends is abandoned rather than waited on forever", async () => {
