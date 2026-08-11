@@ -66,7 +66,10 @@ function buildMessage(raw) {
     : `brigadier: this session is out of context after ${turns} assistant turn(s). ${ADVICE}`;
 }
 
-/** Null whenever the count cannot be established honestly. */
+/**
+ * Claude Code assistant records and Codex assistant message response items are
+ * recognised because any other transcript shape cannot be counted honestly.
+ */
 function countAssistantTurns(transcriptPath) {
   if (typeof transcriptPath !== "string" || transcriptPath.length === 0) {
     return null;
@@ -75,20 +78,33 @@ function countAssistantTurns(transcriptPath) {
     if (statSync(transcriptPath).size > MAX_TRANSCRIPT_BYTES) {
       return null;
     }
-    let turns = 0;
+    let claudeTurns = 0;
+    let codexTurns = 0;
     for (const line of readFileSync(transcriptPath, "utf8").split("\n")) {
       if (line.length === 0) {
         continue;
       }
       try {
-        if (JSON.parse(line).type === "assistant") {
-          turns += 1;
+        const entry = JSON.parse(line);
+        if (entry.type === "assistant") {
+          claudeTurns += 1;
+        }
+        const payload = entry.payload;
+        if (
+          entry.type === "response_item" &&
+          typeof payload === "object" &&
+          payload !== null &&
+          payload.type === "message" &&
+          payload.role === "assistant"
+        ) {
+          codexTurns += 1;
         }
       } catch {
         // A partially written transcript line is normal; skip it.
       }
     }
-    return turns;
+    const turns = claudeTurns + codexTurns;
+    return turns === 0 ? null : turns;
   } catch {
     return null;
   }

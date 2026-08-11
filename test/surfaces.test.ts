@@ -64,8 +64,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1919,
   },
   "claude-code/hooks/handoff.mjs": {
-    sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
-    bytes: 4570,
+    sha256: "d6344c1683d0ba2044939a299f136e3a43ab94988824cfbb5fd4fd9059a49b2c",
+    bytes: 5097,
   },
   "claude-code/hooks/hooks.json": {
     sha256: "896daf07fe5d2ca91b92f51a4de35d3f713395c6cc0b6ea610d0462b6f582992",
@@ -88,8 +88,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3185,
   },
   "codex/hooks/handoff.mjs": {
-    sha256: "175458810ac053db483b653564ba985da567937c3ad77968014d0f345ffa88a9",
-    bytes: 4570,
+    sha256: "d6344c1683d0ba2044939a299f136e3a43ab94988824cfbb5fd4fd9059a49b2c",
+    bytes: 5097,
   },
   "codex/skills/brigadier/SKILL.md": {
     sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
@@ -1266,6 +1266,105 @@ describe("the handoff hook", () => {
           '{"type":"assistant","message":"still going"}',
           "{ truncated line",
           '{"type":"assistant","message":"nearly out of room"}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context after 3 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a Codex rollout transcript is counted and reported in one sentence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "rollout.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"session_meta","payload":{"id":"session-abc"}}',
+          '{"type":"event_msg","payload":{"type":"task_started"}}',
+          '{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}',
+          '{"type":"response_item","payload":{"type":"reasoning","role":"assistant","summary":[]}}',
+          '{"type":"turn_context","payload":{"turn_id":"turn-1"}}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context after 2 assistant turn(s). Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unrecognised transcript shape degrades to the shorter sentence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "transcript.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"metadata","session_id":"abc"}',
+          '{"type":"tool_result","content":"done"}',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const run = await runHook(
+        JSON.stringify({
+          hook_event_name: "PreCompact",
+          transcript_path: transcript,
+          session_id: "abc",
+        }),
+        {},
+      );
+      expect(run.timedOut).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe(
+        '{"systemMessage":"brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
+      );
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a mixed transcript sums Claude Code and Codex assistant turns", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-hook-"));
+    try {
+      const transcript = join(scratch, "transcript.jsonl");
+      await writeFile(
+        transcript,
+        [
+          '{"type":"assistant","message":"Claude Code turn"}',
+          '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}',
+          '{"type":"assistant","message":"another Claude Code turn"}',
           "",
         ].join("\n"),
         "utf8",
