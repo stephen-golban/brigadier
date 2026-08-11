@@ -89,7 +89,7 @@ test("the packaged executable answers initialize over its real stdio transport",
 
     expect(session.timedOut).toBe(false);
     expect(session.stdout).toBe(
-      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.0.0"}}}\n',
+      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.0"}}}\n',
     );
     expect(session.stderr).toBe("");
     expect(session.exitCode).toBe(0);
