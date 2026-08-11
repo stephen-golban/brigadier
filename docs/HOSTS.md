@@ -126,9 +126,9 @@ byte-identical. This is consistent with approval binding to the registration,
 but whether Codex re-prompts at the next interactive session start was not
 observed, and the converse — that changing the registration revokes trust —
 remains untested. The narrower observation remains true on codex-cli 0.147.0:
-there is no dedicated hook diagnostic command — `codex doctor` output contains
-string `hook` zero times, and `codex --help` lists no `hooks` subcommand. `codex
---help` does list `--dangerously-bypass-hook-trust`, which
+there is no dedicated hook diagnostic command — `codex doctor` output
+contains the string `hook` zero times, and `codex --help` lists no `hooks`
+subcommand. `codex --help` does list `--dangerously-bypass-hook-trust`, which
 `surfaces/codex/hooks/README.md` documents.
 
 `$CODEX_HOME/AGENTS.md` is loaded by Codex CLI 0.145.0 into **every** session,
