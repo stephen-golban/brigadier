@@ -259,6 +259,10 @@ the full suite.
 8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same value.
 9. `README.md` → the two passages stating the package is unpublished at `0.0.0`.
    They stop being true the moment the release lands.
+10. `src/config/contracts.ts` → the comment explaining that the package is
+    unpublished at `0.0.0`, so re-running `init` is a complete remedy and no
+    migration path is owed. Once the release lands, reword it: re-running `init`
+    remains correct, but that premise does not.
 
 > **Items 7 and 8 are unenforced only if you skip them. Doing them turns
 > `bun test` red until you also move a pin.**
@@ -288,7 +292,7 @@ the full suite.
 
 **Deliberately left behind:**
 
-10. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
+11. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
    digests until *after* the release exists. The real archives must be built and
    hashed before the formula can name them, so this file is updated at the end,
    by `scripts/update-homebrew-formula.ts`, never by hand.
@@ -314,7 +318,7 @@ npm pkg set "version=${VERSION}" \
 bun install
 ```
 
-Then edit items 3, 4, 5, 7, 8, and 9 from the list above by hand.
+Then edit items 3, 4, 5, 7, 8, 9, and 10 from the list above by hand.
 
 Items 7 and 8 change a pinned file, so recompute the pin before you run the gate:
 
