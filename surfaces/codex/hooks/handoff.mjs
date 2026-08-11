@@ -57,7 +57,11 @@ function buildMessage(raw) {
   } catch {
     return null;
   }
-  if (typeof payload !== "object" || payload === null) {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
     return null;
   }
   const turns = countAssistantTurns(payload.transcript_path);
@@ -68,14 +72,17 @@ function buildMessage(raw) {
 
 /**
  * Claude Code assistant records and Codex assistant message response items are
- * recognised because any other transcript shape cannot be counted honestly.
+ * counted; when neither shape appears, this returns null. An uncounted message
+ * serves the caller better than a zero that may falsely describe an unfamiliar
+ * transcript shape.
  */
 function countAssistantTurns(transcriptPath) {
   if (typeof transcriptPath !== "string" || transcriptPath.length === 0) {
     return null;
   }
   try {
-    if (statSync(transcriptPath).size > MAX_TRANSCRIPT_BYTES) {
+    const stats = statSync(transcriptPath);
+    if (!stats.isFile() || stats.size > MAX_TRANSCRIPT_BYTES) {
       return null;
     }
     let claudeTurns = 0;
