@@ -447,8 +447,6 @@ at least one file was refused or could not be written, `2` usage error.
 
 ## Limits worth knowing before you rely on it
 
-- **Workers cannot install missing dependencies.** Codex workers have a shell, but its network access is disabled; Claude workers have no shell and cannot use network tools. The missing `node_modules/` is not something a worker can install, so `bun run typecheck` and `bun run check` cannot be made to work inside a worker. A slice that requires installing a dependency must be verified by the human running Brigadier.
-
 - **The gate does not run anything.** No tests, no linter, no build. See above.
 - **A Claude worker cannot run commands.** Its lane is enforced by `Edit` and
   `Write` tool rules rather than an OS sandbox, so `Bash` is withheld
@@ -462,6 +460,12 @@ at least one file was refused or could not be written, `2` usage error.
   provision, copy, or symlink it. In this repository, `bun test` succeeds while
   `bun run typecheck` and `bun run check` exit 127 because `tsc` and `biome`
   are not found. This applies to every worker vendor.
+- **Workers cannot install missing dependencies.** Codex workers have a shell, but
+  its network access is disabled; Claude workers have no shell and cannot
+  use network tools. The missing `node_modules/` is not something a worker can
+  install, so `bun run typecheck` and `bun run check` cannot be made to work
+  inside a worker. A slice that requires installing a dependency must be verified
+  by the human running brigadier.
 - **Only Claude's quota is read during a run.** Codex's quota oracle needs a
   `codex app-server` subprocess, and starting one on every run — including dry
   runs, including runs that touch no Codex model — would let an unrelated vendor
