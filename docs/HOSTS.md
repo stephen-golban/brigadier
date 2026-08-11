@@ -119,10 +119,14 @@ carries a `trusted_hash`. This directly answers whether approval was persisted,
 and is consistent with the documented claim that approval binds to the
 registration rather than to the script's contents: the recorded hash matches
 neither the SHA-256 of `handoff.mjs` nor the SHA-256 of the hooks file. That
-claim has not been directly tested; a direct test would change the script and
-confirm trust survives, then change the registration and confirm trust is
-revoked. The narrower observation remains true on codex-cli 0.147.0: there is
-no dedicated hook diagnostic command — `codex doctor` output contains the
+claim has limited direct evidence: on codex-cli 0.147.0, changing the script
+without changing its registration left `$CODEX_HOME/config.toml`, including the
+recorded trust entry and its recorded hash, and `$CODEX_HOME/hooks.json`
+byte-identical. This is consistent with approval binding to the registration,
+but whether Codex re-prompts at the next interactive session start was not
+observed, and the converse — that changing the registration revokes trust —
+remains untested. The narrower observation remains true on codex-cli 0.147.0:
+there is no dedicated hook diagnostic command — `codex doctor` output contains
 string `hook` zero times, and `codex --help` lists no `hooks` subcommand. `codex
 --help` does list `--dangerously-bypass-hook-trust`, which
 `surfaces/codex/hooks/README.md` documents.
