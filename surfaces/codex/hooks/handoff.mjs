@@ -37,6 +37,9 @@ const ADVICE =
 main();
 
 function main() {
+  // A host that stops reading must not turn this hook into a failure; a gone
+  // pipe has no useful recovery, so swallow its write error.
+  process.stdout.on("error", () => {});
   readStdin((raw) => {
     const message = buildMessage(raw);
     if (message !== null) {
