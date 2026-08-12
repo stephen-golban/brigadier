@@ -36,7 +36,7 @@ last four stages more tightly together. Its actual procedure is:
 4. Filter on required image input, web search, structured output, and minimum
    context window. A missing capability record passes only when the slice asks
    for none of those things
-   ([`src/routing/contracts.ts:43`](../src/routing/contracts.ts#L43) and
+   ([`src/routing/contracts.ts:44`](../src/routing/contracts.ts#L44) and
    [`src/routing/router.ts:895`](../src/routing/router.ts#L895)).
 5. Match each survivor's model ID against the competence table and split ranked
    from unranked models. Ranked models at or above the difficulty floor can enter
@@ -71,7 +71,7 @@ there is no independent final cost calculation.
 
 Every successful route returns a human-readable rationale containing the pool,
 quota result, any exclusions, capability result, scores and floor, effort base,
-and clamps ([`src/routing/contracts.ts:94`](../src/routing/contracts.ts#L94)).
+and clamps ([`src/routing/contracts.ts:100`](../src/routing/contracts.ts#L100)).
 Failures return the stage and concrete reason for each rejection.
 
 ## The competence table
@@ -151,17 +151,17 @@ makes that coupling reviewable; it does not remove the maintenance hazard.
 
 Brigadier's effort ladder is exactly `medium | high | xhigh`, ordered from low
 to high in
-[`src/config/contracts.ts:40`](../src/config/contracts.ts#L40). The default
+[`src/config/contracts.ts:46`](../src/config/contracts.ts#L46). The default
 configured ceiling is `high`
-([`src/config/contracts.ts:47`](../src/config/contracts.ts#L47)). On an initial
+([`src/config/contracts.ts:57`](../src/config/contracts.ts#L57)). On an initial
 attempt, a `routine` slice starts at `medium`; `standard` and `hard` start at
 `high`. No initial difficulty predicts `xhigh`
-([`src/routing/router.ts:984`](../src/routing/router.ts#L984)).
+([`src/routing/router.ts:1008`](../src/routing/router.ts#L1008)).
 
 The recorded rationale for reserving `xhigh` is that above `high` models take
 longer, use more tokens, hallucinate more, and produce worse work. The source
 records that as a product rationale, not as a measured result
-([`src/routing/contracts.ts:72`](../src/routing/contracts.ts#L72)). No evidence
+([`src/routing/contracts.ts:74`](../src/routing/contracts.ts#L74)). No evidence
 for those comparative claims is shipped with the router.
 
 After a worker actually runs and the attempt fails, the supervisor records that
@@ -180,7 +180,7 @@ does the model's reported support. A `high` ceiling clamps an escalated request
 back to `high`; only a model permitted and reported to support `xhigh` can run at
 `xhigh` ([`src/routing/router.ts:1010`](../src/routing/router.ts#L1010)). The
 router also asserts before returning that `xhigh` was earned by an escalated
-request ([`src/routing/router.ts:1046`](../src/routing/router.ts#L1046)).
+request ([`src/routing/router.ts:1063`](../src/routing/router.ts#L1063)).
 
 The supervisor now earns that flag from evidence rather than the attempt number.
 It adds a model to `excluded` only when a worker process actually ran, and sets
@@ -191,7 +191,7 @@ itself unlock `xhigh`.
 ## Degraded routing
 
 `allowDegradedRouting` defaults to `false`
-([`src/config/contracts.ts:95`](../src/config/contracts.ts#L95) and
+([`src/config/contracts.ts:100`](../src/config/contracts.ts#L100) and
 [`src/init/propose.ts:175`](../src/init/propose.ts#L175)). Ordinary
 routing admits only ranked models that establish the requested difficulty floor.
 
@@ -210,7 +210,7 @@ contradict cheapest-adequate selection. Ordinary routing has an adequate set
 and minimizes within it. Salvage exists because that set is empty, so minimizing
 would select the weakest known-inadequate model. The rationale names the waived
 floor, setting, candidates, scores, and winner
-([`src/routing/router.ts:1098`](../src/routing/router.ts#L1098)).
+([`src/routing/router.ts:1100`](../src/routing/router.ts#L1100)).
 
 Every successful salvage route records `waivedDifficultyFloor: true`. For a
 ranked winner this records a known below-floor score. For an unranked winner it
@@ -256,11 +256,11 @@ The vendors expose different quota shapes:
 Model-scoped labels are matched case-insensitively at alphanumeric token
 boundaries against model IDs. Empty labels, labels with no letters, and bare
 vendor-family words such as `claude`, `codex`, or `gpt` are refused
-([`src/quota/contracts.ts:182`](../src/quota/contracts.ts#L182)). These guards
+([`src/quota/contracts.ts:183`](../src/quota/contracts.ts#L183)). These guards
 reduce false matches; they do not make unreviewed wire data trustworthy. A
 genuine token belonging to an unrelated model can still match, and a true match
 can remove that model from routing
-([`src/quota/contracts.ts:149`](../src/quota/contracts.ts#L149)). If false
+([`src/quota/contracts.ts:150`](../src/quota/contracts.ts#L150)). If false
 matches remove the whole configured pool, the visible failure can be a spurious
 `ALL_VENDORS_EXHAUSTED` while capacity is actually healthy.
 
@@ -278,9 +278,9 @@ Vendor is not an input to competence rank, difficulty, effort, or cost. A reader
 can verify this at the scoring boundary: `scoreModelId` accepts only a model ID
 ([`src/routing/competence.ts:110`](../src/routing/competence.ts#L110)), and the
 cost sort compares only score and configuration order
-([`src/routing/router.ts:715`](../src/routing/router.ts#L715)). There is no
+([`src/routing/router.ts:721`](../src/routing/router.ts#L721)). There is no
 `preferVendor`, vendor hint, or task-to-vendor table in `RoutingRequest`
-([`src/routing/contracts.ts:66`](../src/routing/contracts.ts#L66)). Moving a
+([`src/routing/contracts.ts:68`](../src/routing/contracts.ts#L68)). Moving a
 model up or down requires an auditable change to the competence table.
 
 The unqualified statement “vendor is never an input” is nevertheless broader

@@ -1,6 +1,7 @@
 /**
- * The supervisor vocabulary. WO-011 owns this file and may amend it freely; it
- * must not add its members to the frozen `src/contracts.ts`.
+ * The supervisor vocabulary. It is local to this module and may change freely
+ * within this file; its members deliberately stay out of the shared
+ * `src/contracts.ts`, which is published to consumers.
  *
  * The supervisor is `brigadier run`: it takes a plan somebody already made,
  * routes each slice to a model, gives each slice its own git worktree, spawns a
@@ -130,20 +131,19 @@ export function interruptMessage(reason: unknown): string {
 }
 
 /**
- * Per-slice planning metadata that `Slice` (frozen) has no room for.
+ * Per-slice planning metadata that the shared `Slice` type has no room for.
  *
  * `RoutingRequest` requires a `difficulty` for every slice it routes, and
  * `Slice` in `src/contracts.ts` does not carry one. The value had to live
- * somewhere, and there were two places it could go: inside the frozen contract,
- * or beside it.
+ * somewhere, and there were two places it could go: inside the shared,
+ * published contract, or beside it.
  *
- * Beside it won. The freeze on `src/contracts.ts` held byte-identical through
- * nineteen work orders and has been spent exactly once, for a defect that could
- * not be fixed anywhere else (`QuotaWindow` could not represent per-model
- * metering). This is not that: difficulty is a *planner's* judgement about work,
- * while `Slice` is the launch-time description of a unit of work shared by every
- * adapter. Widening the shared contract so one component upstream of it can pass
- * a note is how a frozen core stops being frozen.
+ * Beside it won. `src/contracts.ts` is widened only for a defect that cannot
+ * be fixed anywhere else — as `QuotaWindow` was, because it could not represent
+ * per-model metering. This is not that: difficulty is a *planner's* judgement
+ * about work, while `Slice` is the launch-time description of a unit of work
+ * shared by every adapter. Widening the shared contract so one component
+ * upstream of it can pass a note is how a stable core stops being stable.
  *
  * The cost of the side channel is honest and worth naming: `PlanDocument` must
  * keep two parallel sequences aligned by `sliceId`, and a caller that builds one
@@ -158,7 +158,7 @@ export interface SliceDirective {
 }
 
 /**
- * A validated plan document: the frozen `Plan` plus its side-channel directives.
+ * A validated plan document: the shared `Plan` plus its side-channel directives.
  *
  * "Validated" here means *shaped*, not *schedulable*. This type asserts that
  * every field exists with the right type and that a directive accompanies every
@@ -437,7 +437,7 @@ export type SliceFailureKind =
  * the worker produced, when the worker changed no files, or when the commit did
  * not land. That is the complete list.
  *
- * `REVIEW_REJECTED` IS THE GATE DECISION #24 WAS WRITTEN FOR, AND UNTIL IT
+ * `REVIEW_REJECTED` IS THE CROSS-VENDOR REVIEW GATE, AND UNTIL IT
  * EXISTED THE ESCALATION HERE WAS DRIVEN ONLY BY WORKERS THAT DID NOT FINISH.
  * That is what changed: a slice whose worker cheerfully produces a wrong but
  * committable diff is no longer `ok: true` by default. It is read by a model
@@ -541,7 +541,7 @@ export const SLICE_FAILURE_KINDS = [
  * One spawn of one slice. `attempt` 2 exists only after attempt 1 failed.
  *
  * Attempts are recorded rather than overwritten because the second attempt is
- * not a do-over: decision #20 makes `xhigh` an *earned* escalation, unlocked
+ * not a do-over: `xhigh` is an *earned* escalation, unlocked
  * only by an observed gate failure, so attempt 1's failure is the evidence that
  * justifies attempt 2's effort level. Discarding it would leave the report
  * asserting a top-rung run with no reason on the record for why it was allowed.

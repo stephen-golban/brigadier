@@ -1,8 +1,10 @@
 /**
- * WO-008A owns this discovery contract. The types between the FROZEN markers
- * are consumed verbatim by WO-008B (`brigadier init`) and must not be renamed,
- * widened, or restructured. WO-008A must not add its members to the frozen
- * `src/contracts.ts`.
+ * The discovery contract. `DiscoveredVendor`, `DiscoveredModel`,
+ * `DiscoveryReport`, `DiscoveryWarning`, and `Discoverer` are exported from
+ * the package root and consumed verbatim by `brigadier init`, so renaming,
+ * widening, or restructuring any of them is a breaking change. Types that only
+ * this module needs — the injectable seam below — belong here rather than in
+ * the shared `src/contracts.ts`.
  *
  * Discovery reports what a vendor said about itself. It deliberately does not
  * narrow to brigadier's own `Effort` ladder: Codex reports six reasoning
@@ -13,11 +15,9 @@
 
 import type { Vendor } from "../contracts.js";
 
-/* ------------------------------ FROZEN (WO-008B) ------------------------- */
-
 /** A worker CLI found on this machine. */
 export interface DiscoveredVendor {
-  readonly vendor: Vendor; // from src/contracts.ts — frozen
+  readonly vendor: Vendor; // from the shared contract in src/contracts.ts
   readonly executable: string; // absolute resolved path
   readonly version: string; // as reported by the CLI, verbatim
   /**
@@ -73,8 +73,6 @@ export interface Discoverer {
   /** Never throws for a missing or broken vendor — reports it in the result. */
   discover(): Promise<DiscoveryReport>;
 }
-
-/* ---------------------------- END FROZEN (WO-008B) ----------------------- */
 
 /**
  * The injectable seam. Every probe reaches the outside world through

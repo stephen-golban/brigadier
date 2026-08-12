@@ -1150,9 +1150,13 @@ function writeOutcome(stdout: OutputStream, outcome: FileOutcome): void {
 /* ------------------------------------------------------------------------ */
 
 /**
- * An unreadable or unrecognizable manifest is treated as empty, which fails in
- * the safe direction: with no record, every pre-existing file is refused rather
- * than replaced.
+ * An absent or unrecognizable manifest — missing, not JSON, or not a record of
+ * the expected version and shape — is treated as empty, which fails in the safe
+ * direction: with no record, every pre-existing file is refused rather than
+ * replaced. A manifest that exists but cannot be read is a different case and
+ * is not treated as empty: `readIfPresent` rethrows every error but a missing
+ * file, `readManifest` catches only the parse, and `runInstall` turns what
+ * escapes into "could not safely read" and exit 1 before any file is placed.
  */
 interface ManifestRead {
   readonly files: ReadonlyMap<string, string>;

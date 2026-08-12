@@ -1,7 +1,7 @@
 /**
- * WO-009B owns the plan-validation vocabulary. It remains separate from the
- * frozen worker contracts because planning can evolve without widening the
- * launch protocol shared by every adapter.
+ * The plan-validation vocabulary. It remains separate from the shared worker
+ * contracts because planning can evolve without widening the launch protocol
+ * shared by every adapter.
  */
 
 export type PlanIssueCode =

@@ -84,7 +84,7 @@ const CANONICAL_BYTES = `{
 `;
 
 /**
- * A complete version-1 file, exactly as WO-008B's `init` wrote it: a
+ * A complete version-1 file, exactly as the version-1 `init` wrote it: a
  * `quotaFallbackModel` on the vendor, no `allowDegradedRouting`, and
  * `"version": 1`. Every one of those three differences is independently
  * rejectable, which is the reason the version check has to run first and alone.
@@ -186,7 +186,7 @@ describe("parseConfig", () => {
   });
 
   /**
-   * WO-010H bumped the on-disk version because it removed a vendor key and
+   * Version 2 bumped the on-disk version because it removed a vendor key and
    * added a root one. `parseConfig` rejects unknown keys, so a version-1 file
    * that fell through to the ordinary rules would come back as one
    * `unknown key "quotaFallbackModel"` per vendor plus a missing-boolean issue:

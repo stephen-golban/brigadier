@@ -825,10 +825,10 @@ export class DefaultSliceRunner implements SliceRunner {
     if (review.verdict === "rejected") {
       return {
         ok: false,
-        // TRUE, AND IT IS THE WHOLE MECHANISM OF DECISION #24. A model that
-        // produced work a second vendor found broken has failed this slice, so
-        // it goes on `excluded` and attempt 2 is routed somewhere else with
-        // `escalated: true`. Every other gate-shaped failure in this file
+        // TRUE, AND IT IS THE WHOLE MECHANISM OF GATE-FAILURE ESCALATION. A
+        // model that produced work a second vendor found broken has failed this
+        // slice, so it goes on `excluded` and attempt 2 is routed somewhere else
+        // with `escalated: true`. Every other gate-shaped failure in this file
         // reports a worker that did not finish; this one reports work that
         // finished badly, which is the case the escalation was designed for and
         // which nothing in this product could reach until now.
@@ -1427,10 +1427,10 @@ function launchFailure(message: string): WorktreeOutcome {
  * failure that reads like flakiness.
  *
  * `REVIEW_REJECTED` IS THE MEMBER THIS WHOLE MECHANISM WAS BUILT FOR, and it is
- * retryable without qualification. Decision #24 — "a slice that fails its gate
- * re-routes to the next model up the competence table" — described a path that
- * existed here and could not be reached, because until the cross-vendor gate
- * landed nothing in this product was a gate. A rejection is the one failure
+ * retryable without qualification. The escalation rule — a slice that fails its
+ * gate re-routes to the next model up the competence table — described a path
+ * that existed here and could not be reached, because until the cross-vendor
+ * gate landed nothing in this product was a gate. A rejection is the one failure
  * that is unambiguously ABOUT THE MODEL: the worker finished, produced a diff,
  * and a second vendor read it and said it was wrong. `#runInWorktree` records
  * it with `workerRan: true`, so the failing pair goes on `excluded` and the

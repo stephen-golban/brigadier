@@ -1,9 +1,10 @@
 /**
- * The routing vocabulary. WO-009A owns this file and may amend it freely; it
- * must not add its members to the frozen `src/contracts.ts`.
+ * The routing vocabulary. It is local to this module and may change freely
+ * within this file; its members deliberately stay out of the shared
+ * `src/contracts.ts`, which is published to consumers.
  *
- * Decision #7 fixes the pipeline as `capability filter → competence rank →
- * difficulty → effort → cost`, and fixes what may enter it. **Vendor is never
+ * The pipeline is fixed as `capability filter → competence rank →
+ * difficulty → effort → cost`, and so is what may enter it. **Vendor is never
  * an input.** There is deliberately no `preferVendor`, no `vendorHint`, and no
  * per-task vendor table anywhere in these types: the candidate pool is every
  * configured model from every configured vendor competing on one scale, and the
@@ -72,7 +73,7 @@ export interface RoutingRequest {
   readonly excluded?: readonly ExcludedModel[];
   /**
    * True only when this slice already ran and failed its gate. This is the ONLY
-   * thing that can unlock `xhigh` (decisions #9/#20): above `high`, models take
+   * thing that can unlock `xhigh`: above `high`, models take
    * longer, burn more tokens, hallucinate more, and do worse work, so the top
    * rung is earned by an observed failure and never predicted from a planner's
    * opinion of the work.
@@ -113,7 +114,8 @@ export interface RoutedWorker {
    * the only claim of that shape the router can honestly make. It replaces
    * `usedQuotaFallback`, which claimed something about *where the slice ran* —
    * "the winner is an exhausted account's configured substitution" — that
-   * per-model quota metering (WO-010B) made unreachable and WO-010H deleted.
+   * per-model quota metering made unreachable, and which has since been
+   * deleted.
    * A user whose Opus limit ran out and whose slice went to Sonnet is not
    * running on quota brigadier believes is spent, and the old flag was already
    * documented as false for them; there is now no case where it would have been

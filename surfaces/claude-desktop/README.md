@@ -17,7 +17,7 @@ reason Desktop is the one host where the tiny doctrine file is not the answer.
 
 ## The handoff hook does not exist here
 
-Design decision #10's transcript-watching handoff works on Claude Code. On
+The transcript-watching handoff works on Claude Code. On
 opencode, its event names were verified only on 1.18.16, without triggering live
 compaction, and remain version-dependent. On Codex, brigadier registers it and
 Codex trust-gates the registration; approval remains valid if the script at that

@@ -1,6 +1,7 @@
 /**
- * WO-003 owns these worktree contracts and may amend them freely within this
- * file. WO-003 must not add their members to the frozen `src/contracts.ts`.
+ * The worktree contracts. They are local to this module and may change freely
+ * within this file; their members deliberately stay out of the shared
+ * `src/contracts.ts`, which is published to consumers.
  */
 
 /** Mandatory policy for linked secret files and verbatim-value redaction. */

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * The handoff hook (design decision #10).
+ * The handoff hook.
  *
  * A host session that is about to run out of context is exactly the session most
  * tempted to keep grinding rather than delegate. This hook watches for that

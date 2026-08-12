@@ -38,7 +38,7 @@ asymmetry is the whole reason brigadier ships an MCP server at all
 
 ## The handoff hook, honestly
 
-Design decision #10 asks for a transcript-watching hook that fires a handoff when
+Brigadier wants a transcript-watching hook that fires a handoff when
 a session is about to run out of context — the moment the host model is most
 tempted to keep grinding rather than delegate. It does not exist uniformly:
 

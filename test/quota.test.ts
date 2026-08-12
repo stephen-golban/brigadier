@@ -745,7 +745,8 @@ describe("Claude quota ingress", () => {
 
     // The window itself is exhausted; the snapshot is not, because the event
     // carries no account-scoped window and therefore says nothing about the
-    // account. Before WO-010 this same event reported `exhausted` vendor-wide.
+    // account. Before per-model quota metering this same event reported
+    // `exhausted` vendor-wide.
     expect(normalized).toEqual({
       vendor: "claude",
       status: "unknown",
@@ -817,8 +818,8 @@ describe("Claude quota ingress", () => {
    * but `ACCOUNT_WINDOW_SHAPES` maps both `seven_day` and
    * `seven_day_overage_included` to weekly/account, so the two independent
    * buckets collided. The later, healthier one erased the exhausted one outright
-   * — the exact overwrite WO-010 removed for model-scoped buckets, left in place
-   * for two account-scoped ones.
+   * — the exact overwrite that per-model quota metering removed for
+   * model-scoped buckets, left in place for two account-scoped ones.
    */
   test("keeps two account-scoped weekly buckets apart by their wire type", async () => {
     const sevenDay = claudeEvent("seven_day", "rejected", 1, 1_000);
@@ -1208,7 +1209,7 @@ describe("modelQuotaStatus", () => {
     }).toEqual({ opus: "exhausted", haiku: "available" });
   });
 
-  /** Pinned unchanged across WO-010K: neither guard may move these. */
+  /** Pinned: neither guard may move these. */
   test("a model-scoped window still claims its own tier and only its own", () => {
     const snapshot = snapshotOf([modelWindow("opus", "exhausted")]);
 

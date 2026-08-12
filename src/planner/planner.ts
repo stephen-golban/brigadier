@@ -194,7 +194,7 @@ async function planTask(
  * The candidate plan, through the one gate this unit is allowed to use.
  *
  * THE BUDGET IS ENFORCED HERE AND NOWHERE ELSE, and it is enforced as a REFUSAL
- * rather than a truncation. Decision #8 makes fan-out earned: the user said how
+ * rather than a truncation. Fan-out is earned: the user said how
  * many workers they were willing to spend, and a planner that returned more
  * slices than that has answered a different question. Silently running the extra
  * slices would spend worktrees the user did not authorize; silently dropping
@@ -292,13 +292,12 @@ function planDocumentAsFile(document: PlanDocument): unknown {
  * wanted from that vendor, which is the right answer to "who should read this
  * repository and think about it".
  *
- * The first vendor rather than a chosen one because decision #19 forbids vendor
- * from being a routing input, so there is no principled ordering to apply; the
- * order is discovery's. Stated here so the day a user wants to pick is not
- * silent.
+ * The first vendor rather than a chosen one because vendor is never a routing
+ * input, so there is no principled ordering to apply; the order is
+ * discovery's. Stated here so the day a user wants to pick is not silent.
  *
- * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. Decision #20 makes
- * `xhigh` an escalation earned by an observed gate failure. Planning happens
+ * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. `xhigh` is an
+ * escalation earned by an observed gate failure. Planning happens
  * before any gate exists to fail, so it can never have earned the rung.
  */
 function plannerIdentity(vendor: VendorConfig): PlannerIdentity {
@@ -330,7 +329,7 @@ function cappedEffort(ceiling: Effort | undefined): Effort {
  * two ever disagree the gate wins by construction because the prompt has no
  * enforcement power at all.
  *
- * IT DEFAULTS TO ONE SLICE. Decision #8: fan-out is earned. The budget sentence
+ * IT DEFAULTS TO ONE SLICE. Fan-out is earned. The budget sentence
  * is stated as a hard cap AND as a default of one, because a model told only
  * "at most 4" reliably returns 4.
  *
