@@ -84,6 +84,16 @@ test("the notarization script copies the signed payload binary back after signin
   expect(copyBackIndex).toBeGreaterThan(signIndex);
 });
 
+// Note for a future maintainer: the workflow tests below pin each new runtime
+// check's exact `run:` text, but never assert its `if:` condition or the
+// ad-hoc sign → rejection check → notarization → positive gate ordering.
+// Setting both checks to `if: false` would leave all four notarization tests
+// green while the runtime checks are skipped. Deleting the ad-hoc-sign step
+// would leave them green without guaranteeing that the negative control's input
+// was deliberately ad-hoc signed.
+// The conditions are correct as shipped, so this was adjudicated non-blocking
+// for `v0.1.1`. Closing the gap means asserting the `if:` conditions and the
+// ad-hoc sign → rejection check → notarization → positive gate ordering.
 test("the release workflow proves the notarization requirement rejects the ad-hoc binary", () => {
   const workflow = readFileSync(workflowPath, "utf8");
   const stepIndex = workflow.indexOf(`- name: ${AD_HOC_CONTROL_STEP_NAME}`);
