@@ -74,6 +74,29 @@ the cross-vendor model review. A failing project test therefore rejects the
 slice without spending a reviewer. When `verify` is absent, `tests_pass` is
 reported as skipped rather than passed.
 
+Once `verify.command` is present the gate is required to run, so **a command
+that cannot be started is a blocking failure and not a skip**. A misspelled
+executable, one that is not on `PATH`, or one that is not executable produces a
+`tests_pass` result of `failed` carrying `The gate could not run: <error>`, and
+rejects the attempt just as a non-zero exit would. A typo here therefore fails
+every slice in the plan rather than quietly verifying nothing.
+
+**What authorizes this command, precisely.** It runs only when the plan document
+arrived as a **file passed to `brigadier run --plan <file>`**. A plan the
+in-process planner produced from a task description (`brigadier run "<task>"`)
+cannot carry one: any `verify.command` the planner model proposes is discarded
+before the run starts, so a planner's own output can never grant itself process
+execution. A plan supplied to the MCP `run` tool is not authorized either.
+
+**The grant is keyed on the argv, not on the author.** Nothing verifies who
+wrote the file — passing it with `--plan` is the capability. An agent that
+writes `plan.json` and then runs `brigadier run --plan plan.json` is therefore
+**granting the capability to itself**, and this is the workflow the bundled
+Claude Code and Codex skills describe. Treat `verify.command` in a plan you did
+not write as code you are about to execute with your own permissions: brigadier
+prints the argv in the report of every run that has one, and reads it back to
+you on `--dry-run` before anything is spawned.
+
 ### Slice fields
 
 | Field | Type | Required | Notes |

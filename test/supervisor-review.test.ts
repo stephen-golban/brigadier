@@ -1007,6 +1007,120 @@ describe("createCrossVendorReviewer", () => {
     });
   });
 
+  test("a configured tests_pass executable that cannot start rejects the review", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+    const harness = makeHarness({ codex }, engine.engine);
+    const reviewer = createCrossVendorReviewer({
+      ports: harness.ports,
+      env: ENV,
+    });
+    const verdict = await reviewer.review({
+      ...requestFor(BOTH_VENDORS, CLAUDE_BUILDER),
+      testCommand: [join(tmpdir(), "brigadier-executable-that-does-not-exist")],
+    });
+
+    expect(verdict.verdict).toBe("rejected");
+    expect(codex.specs).toEqual([]);
+    expect(
+      verdict.gates?.find((gate) => gate.name === "tests_pass"),
+    ).toMatchObject({
+      name: "tests_pass",
+      severity: "blocking",
+      status: "failed",
+    });
+    expect(
+      verdict.verdict === "rejected" &&
+        verdict.findings.some(
+          (finding) =>
+            finding.source === "gate" &&
+            finding.gate === "tests_pass" &&
+            finding.severity === "blocking" &&
+            finding.summary.startsWith("The gate could not run:"),
+        ),
+    ).toBe(true);
+  });
+
+  test("verification mutations are diffed for containment and cannot reach commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-gate-mutation-"));
+    const outsidePath = join(root, "outside.ts");
+    let commits = 0;
+    const session = {
+      repositoryPath: root,
+      slug: "gate-mutation",
+      baseCommit: "0".repeat(40),
+      baseBranch: "brigadier/gate-mutation/base",
+      integrationBranch: "brigadier/gate-mutation/integration",
+    };
+    const engine: SupervisorPorts["engine"] = {
+      prepare: async () => session,
+      create: async () => ({
+        repositoryPath: root,
+        path: root,
+        branch: "brigadier/gate-mutation/slice-1",
+        isolated: true,
+        session,
+      }),
+      commit: async (spec) => {
+        commits += 1;
+        return { commit: "commit-that-must-not-exist", message: spec.message };
+      },
+      diffUncommitted: async () => ({
+        paths: existsSync(outsidePath)
+          ? ["src/auth.ts", "test/auth.test.ts", "outside.ts"]
+          : ["src/auth.ts", "test/auth.test.ts"],
+        patch: DEFAULT_PATCH,
+        truncated: false,
+        totalCharacters: DEFAULT_PATCH.length,
+      }),
+      merge: async () => {
+        throw new Error("the slice runner must not merge");
+      },
+      redact: (_worktree, artifact) => artifact,
+      remove: async () => undefined,
+      release: async () => undefined,
+    };
+    const claude = fakeAdapter("claude", { outcome: outcomeWith("done") });
+    const harness = makeHarness({ claude }, engine);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: () => ({ ok: true, routed: CLAUDE_BUILDER }),
+    });
+
+    try {
+      const result = await runner.run({
+        slice: SLICE,
+        directive: { sliceId: SLICE.id, difficulty: "standard" },
+        session,
+        attemptSlots: [{ sliceNumber: 1, worktreePath: root }],
+        routing: routingFor(CLAUDE_ONLY),
+        unsafeInPlace: false,
+        testCommand: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(outsidePath)}, "verification mutation");`,
+        ],
+      });
+
+      expect(existsSync(outsidePath)).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.commit).toBe(null);
+      expect(result.attempts[0]?.review?.verdict).toBe("rejected");
+      expect(commits).toBe(0);
+      expect(
+        result.attempts[0]?.review?.findings?.some(
+          (finding) =>
+            finding.gate === "paths_owned" && finding.path === "outside.ts",
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("aborting a configured test gate terminates its child and reports the gate as skipped", async () => {
     const root = await mkdtemp(join(tmpdir(), "brigadier-gate-abort-"));
     const readyPath = join(root, "gate.pid");

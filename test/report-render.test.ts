@@ -212,6 +212,38 @@ describe("the quiet run report", () => {
     ).toContain("  interrupted: workers were cancelled and worktrees removed");
   });
 
+  test("shows a skipped deterministic gate and its reason in compact output", () => {
+    const attempt = approvedAttempt(1, "8f3c9a2");
+    if (attempt.review === null || attempt.review.verdict !== "approved") {
+      throw new Error("expected an approved fixture");
+    }
+    const report = baseReport({
+      slices: [
+        successfulSlice("writer", "8f3c9a2", [
+          {
+            ...attempt,
+            review: {
+              ...attempt.review,
+              gates: [
+                {
+                  name: "tests_pass",
+                  severity: "blocking",
+                  status: "skipped",
+                  reason: "No test command was configured.",
+                  findings: [],
+                },
+              ],
+            },
+          },
+        ]),
+      ],
+    });
+
+    expect(renderQuietRunReport(report)).toContain(
+      "(tests_pass skipped: No test command was configured., approved by codex)",
+    );
+  });
+
   test("a dry run discloses verification as argv and makes an absent command explicit", () => {
     const command = [
       "bun",
@@ -233,6 +265,25 @@ describe("the quiet run report", () => {
         baseReport({ dryRun: true, integrationBranch: null }),
       ),
     ).toContain("  no verify command; the tests_pass gate will be skipped\n");
+  });
+
+  test("discloses the verification argv on a real run, not only a dry run", () => {
+    const command = [
+      "bun",
+      "test",
+      "--filter",
+      "argument with spaces",
+    ] as const;
+
+    // The run that actually spawns this process with the user's permissions is
+    // the run that has to name it. Printing it only in the preview meant the
+    // one execution nobody could see was the real one.
+    expect(
+      renderQuietRunReport(baseReport({ testCommand: command })),
+    ).toContain(`  verify command: ${JSON.stringify(command)}\n`);
+    // A real run with nothing to disclose says nothing; "would be skipped" is a
+    // statement about a run that has not happened yet.
+    expect(renderQuietRunReport(baseReport())).not.toContain("verify command");
   });
 });
 

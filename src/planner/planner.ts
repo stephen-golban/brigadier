@@ -26,12 +26,11 @@
  *      `validatePlan` (`src/plan/validate.ts`) as step 1 of every run, before
  *      it prepares a session, creates a worktree, or writes a ref.
  *
- * SO THE SAFETY PROPERTY IS EXACTLY THIS: a model-authored plan and a
- * human-authored plan are indistinguishable by the time anything acts on them.
- * There is no planner-only code path into the supervisor, no `PlanDocument`
- * constructed by hand anywhere in this unit, and no second copy of any rule.
- * Nothing the model emits can make brigadier do something it would not do for a
- * file on disk containing the same bytes.
+ * Plan structure follows one validation path, but command capability does not:
+ * a model-authored `verify.command` is discarded when the printable plan file
+ * is built. Only a later, user-authored `--plan` invocation can authorize a
+ * command. The supervisor also receives that provenance explicitly and refuses
+ * verification commands when the capability was not granted by the caller.
  *
  * HOW I KNOW THE MODEL CANNOT WEAKEN `validatePlan`:
  *
@@ -256,17 +255,15 @@ function planFromReply(
  * `document.plan` straight out would emit a plan file that the parser then
  * rejects for a missing `difficulty`. The directives are documented to be one
  * per slice in slice order, which is what makes the rejoin below exact.
- * `verify` likewise lives beside `plan`; it must be re-emitted because the CLI
- * redacts and re-parses this JSON before executing it, so omitting the field
- * here would silently turn a configured deterministic gate into a skipped one.
+ * `verify` deliberately is not re-emitted. This function serializes model
+ * output, and allowing that output to name a process would let repository
+ * prompt injection execute with the user's permissions. A human can add the
+ * command after saving the printed JSON and authorize it with `--plan`.
  */
 function planDocumentAsFile(document: PlanDocument): unknown {
   return {
     id: document.plan.id,
     goal: document.plan.goal,
-    ...(document.verify === undefined
-      ? {}
-      : { verify: { command: [...document.verify.command] } }),
     slices: document.plan.slices.map((slice, index) => {
       const directive = document.directives[index];
       return {

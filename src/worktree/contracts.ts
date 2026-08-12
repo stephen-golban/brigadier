@@ -35,7 +35,42 @@ export interface WorktreeSession {
   /** Retired with slice refs when the prefix-conflicting integration ref is materialized. */
   readonly baseBranch: string;
   readonly integrationBranch: string;
+  /**
+   * An opaque, unguessable identifier minted for THIS `prepare()` call, and the
+   * only thing that names this run's cumulative redaction inventory.
+   *
+   * IT EXISTS BECAUSE THE SLUG DOES NOT IDENTIFY A RUN. A long-lived MCP server
+   * runs the same plan id — and therefore the same slug, against the same
+   * repository, with the same linked-secret paths — as many times as it is
+   * asked to. A lookup keyed on those fields answers "SOME terminal session
+   * that looked like this", so run B's worker output could be written under run
+   * A's inventory and the fail-closed elide silently skipped. A token minted
+   * here is matched by identity or not at all.
+   *
+   * OPTIONAL FOR PUBLIC-API COMPATIBILITY, in the same way `diffUncommitted` is:
+   * `WorktreeSession` is a value third-party engines and test doubles produce,
+   * and a required member would break every existing one. `GitWorktreeEngine` —
+   * the only engine `brigadier run` constructs — always mints it. Its ABSENCE IS
+   * NOT A NEUTRAL DEFAULT: a caller persisting worker output has no way to reach
+   * a cumulative inventory without it and must fail closed.
+   */
+  readonly recordToken?: string;
 }
+
+/**
+ * An immutable exact-value redactor captured from one worktree session.
+ *
+ * THERE IS NO ENGINE METHOD THAT HANDS ONE OUT, and that is the design rather
+ * than an omission. The caller that needs a session's cumulative inventory —
+ * the durable run-record writer — runs after `release()`, from a report, with
+ * no engine handle in scope; a method on this interface would be unreachable
+ * from the one place that has to fail closed. `createSecretRedactor()` in
+ * `./engine.js` is the seam: it looks the session up in the engine module's own
+ * registry by `WorktreeSession.recordToken` and THROWS when no session matches,
+ * which is what turns "inventory unavailable" into an elided record instead of
+ * a cleartext one. See that function for what it reads and what it consumes.
+ */
+export type SecretRedactor = (artifact: string) => string;
 
 export interface WorktreeSpec {
   readonly session: WorktreeSession;

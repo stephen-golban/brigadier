@@ -950,6 +950,32 @@ describe("brigadier run: the task positional", () => {
     });
   });
 
+  test("a model-authored verify command is not forwarded to slice execution", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const command = [process.execPath, "-e", "process.exit(0)"] as const;
+      const plan = { ...PLAN, verify: { command } };
+      const planner = new RecordingPlanner({
+        kind: "planned",
+        document: parsePlanDocument(plan),
+        json: JSON.stringify(plan, null, 2),
+        planner: { vendor: "claude", model: "claude-opus-5", effort: "high" },
+      });
+      const result = await invoke({
+        argv: ["run", "fix the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('"verify"');
+      expect(result.runner?.inputs.map((input) => input.testCommand)).toEqual([
+        undefined,
+        undefined,
+      ]);
+    });
+  });
+
   test("--max-workers raises the planner's fan-out budget", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
       const planner = new RecordingPlanner(plannedOutcome());

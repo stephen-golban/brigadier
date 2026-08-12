@@ -155,10 +155,31 @@ export const GATES = [
 ] as const satisfies readonly Gate[];
 
 export async function runGates(input: GateInput): Promise<GateRunResult> {
+  return await runGateSet(input, GATES);
+}
+
+/** Run the command gate before anything snapshots the tree it may mutate. */
+export async function runVerificationGate(
+  input: GateInput,
+): Promise<GateRunResult> {
+  return await runGateSet(input, [TESTS_PASS]);
+}
+
+/** Run the gates whose evidence comes from the authoritative post-verify diff. */
+export async function runChangedPathGates(
+  input: GateInput,
+): Promise<GateRunResult> {
+  return await runGateSet(input, [PATHS_OWNED, PATHS_TOUCHED, DIFF_NON_EMPTY]);
+}
+
+async function runGateSet(
+  input: GateInput,
+  gates: readonly Gate[],
+): Promise<GateRunResult> {
   const results: GateResult[] = [];
   const findings: ReviewFinding[] = [];
 
-  for (const gate of GATES) {
+  for (const gate of gates) {
     const reason = gate.skipReason?.(input) ?? null;
     if (reason !== null) {
       results.push({
@@ -175,15 +196,23 @@ export async function runGates(input: GateInput): Promise<GateRunResult> {
     try {
       gateFindings = await gate.check(input);
     } catch (error) {
-      // A configured command that could not even start did not pass. Recording
-      // the gate as skipped preserves that distinction without blaming the
-      // builder for an infrastructure failure brigadier could not measure.
+      // `skipReason` is the sole deliberately-not-applicable path. Reaching the
+      // check means this gate was required to run, so an exception is measured
+      // failure evidence — especially for a blocking command gate that never
+      // started — rather than an invisible skip.
+      const gateFindings = [
+        finding(
+          gate,
+          primaryPath(input),
+          `The gate could not run: ${describeError(error)}`,
+        ),
+      ];
+      findings.push(...gateFindings);
       results.push({
         name: gate.name,
         severity: gate.severity,
-        status: "skipped",
-        reason: `The gate could not run: ${describeError(error)}`,
-        findings: [],
+        status: "failed",
+        findings: gateFindings,
       });
       continue;
     }

@@ -269,9 +269,22 @@ complete field reference, every validation rule, and every error code are in
 [docs/PLAN-FORMAT.md](docs/PLAN-FORMAT.md).
 
 A model-authored plan and a hand-written one pass through **the same unmodified
-validator**. There is no planner-only path into the supervisor: whatever the
-planner proposes is parsed by the function that reads your plan files, and
-validated by the function that validates them, before a single ref is written.
+structural validator**. Command capability is the deliberate exception, and the
+rule is exact: `verify.command` runs only when the plan reached brigadier as a
+**file passed to `brigadier run --plan <file>`**. A plan the in-process planner
+produced from a task description cannot carry one — its `verify.command` is
+discarded before the run starts — and neither can a plan handed to the MCP
+`run` tool.
+
+**The grant follows the file, not the author.** Nothing here checks who wrote
+the plan; `--plan <file>` is the capability. So when an agent authors
+`plan.json` and then runs `brigadier run --plan plan.json` — which is exactly
+what the bundled Claude Code and Codex skills tell it to do — **that agent is
+granting itself command execution**, and any instruction it absorbed from the
+repository it is working in reaches `spawn` through it. Read the `verify` block
+of an agent-written plan before running it, the same way you would read the
+diff. Every run that has a verification command now prints it as argv in its own
+report, so a command that ran is visible in the output of the run that ran it.
 
 ## Reading a run
 
@@ -331,7 +344,9 @@ model. Style, naming and formatting are explicitly out of scope.
 > your linter, or your build.** If a plan supplies `verify.command`, the
 > deterministic `tests_pass` gate runs it before model review and a non-zero
 > exit rejects the attempt. brigadier does not invent that command; without one,
-> the gate runs nothing and is skipped — a slice can still be wrong.
+> the gate runs nothing and is skipped — a slice can still be wrong. With one
+> that cannot be started, the gate is a **blocking failure rather than a skip**,
+> so a typo in `verify.command` rejects every slice.
 
 ### It fails open
 

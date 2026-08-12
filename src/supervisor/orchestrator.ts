@@ -277,6 +277,10 @@ async function executeRun(
   dependencies: RunnerDependencies,
   request: RunRequest,
 ): Promise<RunReport> {
+  const testCommand =
+    request.verifyCommandAuthorized === true
+      ? request.document.verify?.command
+      : undefined;
   if (!Number.isSafeInteger(request.maxWorkers) || request.maxWorkers <= 0) {
     throw new RangeError("maxWorkers must be a positive safe integer");
   }
@@ -285,9 +289,7 @@ async function executeRun(
       ok: false,
       slug: request.slug,
       dryRun: request.dryRun === true,
-      ...(request.document.verify === undefined
-        ? {}
-        : { testCommand: request.document.verify.command }),
+      ...(testCommand === undefined ? {} : { testCommand }),
       integrationBranch: null,
       slices: [],
       merges: [],
@@ -336,6 +338,17 @@ async function executeRun(
    */
   const cleanupFailures: string[] = [];
 
+  /**
+   * This run's own session identity, assigned the moment `prepare()` returns.
+   *
+   * Declared here rather than read off `session` inside `finish`, because
+   * `finish` is called from return paths that run BEFORE `session` is assigned
+   * — reading it there would be a temporal-dead-zone `ReferenceError` on every
+   * early failure. Absent is the honest answer on those paths: no session
+   * exists, so no cumulative inventory can be reached for one.
+   */
+  let sessionToken: string | undefined;
+
   const finish = (fields: {
     readonly ok: boolean;
     readonly integrationBranch: string | null;
@@ -350,14 +363,13 @@ async function executeRun(
     ok: fields.ok,
     slug: request.slug,
     dryRun,
-    ...(request.document.verify === undefined
-      ? {}
-      : { testCommand: request.document.verify.command }),
+    ...(testCommand === undefined ? {} : { testCommand }),
     integrationBranch: fields.integrationBranch,
     slices: fields.slices,
     merges: fields.merges,
     planIssues: fields.planIssues,
     failure: fields.failure,
+    ...(sessionToken === undefined ? {} : { sessionToken }),
     durationMs: ports.now() - startedAt,
     // Sampled here rather than passed in by each caller, so no return path can
     // forget it and no return path can disagree with another about it.
@@ -524,6 +536,7 @@ async function executeRun(
         consentToLink: config.secretsConsent,
       },
     });
+    sessionToken = session.recordToken;
   } catch (error) {
     return finish({
       ok: false,
@@ -614,9 +627,7 @@ async function executeRun(
               ),
               routing: routingInput,
               unsafeInPlace: request.unsafeInPlace === true,
-              ...(request.document.verify === undefined
-                ? {}
-                : { testCommand: request.document.verify.command }),
+              ...(testCommand === undefined ? {} : { testCommand }),
               ...(request.signal === undefined
                 ? {}
                 : { signal: request.signal }),
@@ -1233,9 +1244,13 @@ async function redactFailureMessage(
   error: unknown,
 ): Promise<string> {
   try {
-    // This rebuild sees only current file contents, so a value rotated away
-    // mid-run is not covered. The session's cumulative inventory is stronger;
-    // using it here needs a session-scoped redactor seam on the engine.
+    // This rebuild reads the current linked files AND unions in the cumulative
+    // inventory of any live session over this repository, so a value rotated
+    // away mid-run and a value written into the file since that session started
+    // are both covered. Passing no `sessionToken` is what asks for that union;
+    // a token would ask for one specific run's inventory alone, which is the
+    // right question for a durable record and the wrong one here, because a
+    // failure can arrive before any session exists to mint a token.
     const redact = await createSecretRedactor({
       repositoryPath,
       linkedSecretPaths,

@@ -129,7 +129,7 @@ import type {
   SupervisorPorts,
 } from "./contracts.js";
 import type { GateCommandRequest, GatePorts, GateRunResult } from "./gates.js";
-import { runGates } from "./gates.js";
+import { runChangedPathGates, runVerificationGate } from "./gates.js";
 import type { OneShotEnv } from "./one-shot.js";
 import { runOneShotPrompt } from "./one-shot.js";
 import { describeError } from "./support.js";
@@ -284,7 +284,6 @@ async function reviewWithGates(
   reviewModel: (inspected: InspectedChange) => Promise<SliceReview>,
 ): Promise<SliceReview> {
   const startedAt = options.ports.now();
-  const inspected = await readChange(options, request);
   let gateCleanupFailure: string | undefined;
   const runCommand: GatePorts["runCommand"] =
     options.runCommand ??
@@ -297,14 +296,12 @@ async function reviewWithGates(
           gateCleanupFailure = `slice ${request.slice.id} attempt ${request.attempt}: the configured tests_pass gate process group (pid ${pid}) may still be running — ${describeError(error)}`;
         },
       ));
-  const gateRun = await runGates({
-    changedPaths: inspected.changedPaths,
-    ...(inspected.changedPathsUnavailableReason === undefined
-      ? {}
-      : {
-          changedPathsUnavailableReason:
-            inspected.changedPathsUnavailableReason,
-        }),
+  // INVARIANT: verification finishes before the authoritative diff is read.
+  // The command runs in the live worktree and may mutate tracked files, so the
+  // only tree containment and model review inspect is exactly the tree commit
+  // will stage. Moving `readChange` above this call reopens a review/commit gap.
+  const verificationRun = await runVerificationGate({
+    changedPaths: null,
     ownedPaths: request.slice.ownedPaths,
     worktreePath: request.worktreePath,
     ...(request.testCommand === undefined
@@ -314,6 +311,28 @@ async function reviewWithGates(
       runCommand,
     },
   });
+  const inspected = await readChange(options, request);
+  const changedPathRun = await runChangedPathGates({
+    changedPaths: inspected.changedPaths,
+    ...(inspected.changedPathsUnavailableReason === undefined
+      ? {}
+      : {
+          changedPathsUnavailableReason:
+            inspected.changedPathsUnavailableReason,
+        }),
+    ownedPaths: request.slice.ownedPaths,
+    worktreePath: request.worktreePath,
+    ports: { runCommand },
+  });
+  const reportedVerificationRun =
+    request.signal?.aborted === true
+      ? skippedCancelledVerification(verificationRun)
+      : verificationRun;
+  // Keep the stable public gate order even though tests_pass executes first.
+  const gateRun: GateRunResult = {
+    gates: [...changedPathRun.gates, ...reportedVerificationRun.gates],
+    findings: [...changedPathRun.findings, ...reportedVerificationRun.findings],
+  };
   const redacted = redactGateRun(options, request, gateRun);
   if (request.signal?.aborted === true) {
     const redact = (artifact: string): string =>
@@ -374,6 +393,26 @@ async function reviewWithGates(
         : modelReview.findings),
     ],
     gates: redacted.gates,
+  };
+}
+
+/** Cancellation deliberately stops a running command; it is not a gate fault. */
+function skippedCancelledVerification(result: GateRunResult): GateRunResult {
+  return {
+    gates: result.gates.map((gate) =>
+      gate.status === "failed"
+        ? {
+            name: gate.name,
+            severity: gate.severity,
+            status: "skipped" as const,
+            reason:
+              gate.findings[0]?.summary ??
+              "The gate could not run because the review was cancelled.",
+            findings: [],
+          }
+        : gate,
+    ),
+    findings: [],
   };
 }
 

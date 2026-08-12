@@ -4,7 +4,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { ConfigEnvironment } from "../config/store.js";
+import { type ConfigEnvironment, nodeConfigIo } from "../config/store.js";
+import type { WorkerOutputPersistence } from "../run-record/index.js";
 import { writeRunRecord } from "../run-record/index.js";
 import type { RunReport, SliceResult } from "../supervisor/contracts.js";
 import { createSecretRedactor } from "../worktree/engine.js";
@@ -37,19 +38,44 @@ export async function writeRunRecordDetail(
   }
 
   let redactor: Awaited<ReturnType<typeof createSecretRedactor>>;
+  let workerOutput: WorkerOutputPersistence = "include";
   try {
-    // This rebuild sees only current file contents, so a value rotated away
-    // mid-run is not covered. The session's cumulative inventory is stronger;
-    // using it here needs a session-scoped redactor seam on the engine.
-    // Never fall back to an identity redactor. If the inventory cannot be
-    // built, preserving the report is less important than refusing to persist
-    // it with secrets exposed.
+    // THE TOKEN IS THIS RUN'S SESSION AND NOTHING ELSE IS. Asking by slug used
+    // to match "some terminal session with this name", which in a long-lived
+    // MCP server running the same plan twice can be the PREVIOUS run's leftover
+    // registration — writing run B's worker output under run A's inventory and
+    // skipping the elide below without saying so. A report that carries no
+    // token names no session, so it takes the fail-closed branch.
+    const sessionToken = report.sessionToken;
+    if (sessionToken === undefined) {
+      throw new Error("run report carries no worktree session token");
+    }
     redactor = await createSecretRedactor({
       repositoryPath: options.repositoryPath,
       linkedSecretPaths: options.linkedSecretPaths,
+      sessionToken,
     });
   } catch {
-    return unavailableRunRecordDetail();
+    // A failure before `prepare()` has no session inventory and no worker
+    // output. Its already-scrubbed diagnostic can still use the tokenless
+    // redactor, which reads the current linked files and unions in any live
+    // session over this repository. That union is still NOT an equivalent
+    // fallback once a worker ran: reaching this branch means THIS run's
+    // inventory was not reachable, and a value it saw rotate away may sit in
+    // worker output, in the worker's own stderr-bearing failure message, or in
+    // a reviewer's findings with nothing left on disk or in another session to
+    // match it against.
+    try {
+      redactor = await createSecretRedactor({
+        repositoryPath: options.repositoryPath,
+        linkedSecretPaths: options.linkedSecretPaths,
+      });
+      if (hasWorkerDerivedText(report)) {
+        workerOutput = "elide";
+      }
+    } catch {
+      return unavailableRunRecordDetail();
+    }
   }
 
   try {
@@ -57,6 +83,8 @@ export async function writeRunRecordDetail(
       report,
       { runId: randomUUID(), environment: options.environment },
       redactor,
+      nodeConfigIo,
+      workerOutput,
     );
     return `  full detail: ${path}`;
   } catch (error) {
@@ -66,6 +94,26 @@ export async function writeRunRecordDetail(
       return unavailableRunRecordDetail();
     }
   }
+}
+
+/**
+ * Whether anything a subprocess produced could be sitting in this report.
+ *
+ * IT ASKS ABOUT THREE FIELDS, NOT ONE. A worker's stderr — up to 64 KiB of it —
+ * is normalized into `WorkerFailure.message` and interpolated again into
+ * `SliceAttempt.failure.message`, and a reviewer's prose lands in
+ * `SliceReview`. An attempt can carry any of those with `outcome` still null,
+ * so a test for `outcome` alone let two of the three routes through.
+ */
+function hasWorkerDerivedText(report: RunReport): boolean {
+  return report.slices.some((slice) =>
+    slice.attempts.some(
+      (attempt) =>
+        attempt.outcome !== null ||
+        attempt.failure !== null ||
+        attempt.review !== null,
+    ),
+  );
 }
 
 function unavailableRunRecordDetail(): string {
@@ -86,8 +134,17 @@ export function renderQuietRunReport(
     `${report.dryRun ? "dry run" : "run"} ${report.slug}: ${count} ${count === 1 ? "slice" : "slices"}, ${humanizeDuration(report.durationMs)} → ${report.integrationBranch ?? "(none)"}`,
   ];
 
-  if (report.dryRun) {
-    lines.push(describeDryRunVerifyCommand(report));
+  // DISCLOSED ON EVERY RUN THAT HAS ONE, not only on dry runs. This argv is a
+  // process brigadier launches with the user's own permissions, from a file the
+  // user passed to `--plan` — and, in the documented agent-driven workflow,
+  // from a file an agent wrote and an agent named. A capability that executes
+  // has to be legible in the output of the run that executed it; printing it
+  // only in the preview meant the one run that actually spawned it said
+  // nothing. A run with no command still says so on a dry run, where "what
+  // would happen" is the whole question.
+  const verifyLine = describeVerifyCommand(report);
+  if (verifyLine !== null) {
+    lines.push(verifyLine);
   }
 
   if (report.interrupted) {
@@ -129,14 +186,25 @@ export function renderQuietRunReport(
 }
 
 /**
+ * The verification argv this run will execute, or null when there is nothing
+ * for the caller to disclose.
+ *
  * JSON is used as an argv notation, not as a command builder. Rejoining the
  * elements with spaces would falsely suggest shell parsing and make arguments
  * containing whitespace impossible to distinguish in the preview.
+ *
+ * NULL AND "no verify command" ARE DIFFERENT ANSWERS. A dry run is asked what
+ * would happen, so the absence of a command is itself the answer and gets a
+ * line. A real run is asked what did happen; a line about a command nobody ran
+ * is noise, and the caller drops it.
  */
-export function describeDryRunVerifyCommand(report: RunReport): string {
-  return report.testCommand === undefined
+export function describeVerifyCommand(report: RunReport): string | null {
+  if (report.testCommand !== undefined) {
+    return `  verify command: ${JSON.stringify(report.testCommand)}`;
+  }
+  return report.dryRun
     ? "  no verify command; the tests_pass gate will be skipped"
-    : `  verify command: ${JSON.stringify(report.testCommand)}`;
+    : null;
 }
 
 export function humanizeDuration(durationMs: number): string {
@@ -199,6 +267,11 @@ function describeAnnotation(report: RunReport, slice: SliceResult): string {
         : "not reviewed: gate not reached",
     );
     return parts.join(", ");
+  }
+  for (const gate of review.gates ?? []) {
+    if (gate.status === "skipped") {
+      parts.push(`${gate.name} skipped: ${gate.reason}`);
+    }
   }
   if (review.verdict === "skipped") {
     parts.push(`not reviewed: ${review.reason}`);

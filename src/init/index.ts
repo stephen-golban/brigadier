@@ -33,7 +33,7 @@ import type { Planner, PlannerOutcome } from "../planner/index.js";
 import { createModelPlanner } from "../planner/index.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
 import {
-  describeDryRunVerifyCommand,
+  describeVerifyCommand,
   renderQuietRunReport,
   writeRunRecordDetail,
 } from "../report/render.js";
@@ -1015,7 +1015,7 @@ async function runPlan(options: RunOptions): Promise<number> {
   if (resolved.kind === "stop") {
     return resolved.code;
   }
-  const { document, config, env } = resolved;
+  const { document, config, env, verifyCommandAuthorized } = resolved;
 
   const slug = invocation.slug ?? deriveSlug(document.plan.id);
   if (slug === null) {
@@ -1038,6 +1038,7 @@ async function runPlan(options: RunOptions): Promise<number> {
 
   const request: RunRequest = {
     document,
+    verifyCommandAuthorized,
     repositoryPath: options.cwd,
     slug,
     maxWorkers: invocation.maxWorkers,
@@ -1114,6 +1115,7 @@ type ResolvedPlan =
   | {
       readonly kind: "ok";
       readonly document: RunRequest["document"];
+      readonly verifyCommandAuthorized: boolean;
       readonly config: BrigadierConfig;
       readonly env: LaunchEnv;
     }
@@ -1181,6 +1183,7 @@ async function resolvePlanFromFile(
   return {
     kind: "ok",
     document,
+    verifyCommandAuthorized: true,
     config: environment.config,
     env: environment.env,
   };
@@ -1302,6 +1305,7 @@ async function resolvePlanFromTask(
   return {
     kind: "ok",
     document,
+    verifyCommandAuthorized: false,
     config: environment.config,
     env: environment.env,
   };
@@ -1775,8 +1779,12 @@ function renderRunReport(out: OutputStream, report: RunReport): void {
   out.write(
     `\n${report.dryRun ? "dry run" : "run"} ${report.slug}: ${report.slices.length} slice(s) in ${report.durationMs}ms\n`,
   );
-  if (report.dryRun) {
-    out.write(`${describeDryRunVerifyCommand(report)}\n`);
+  // Every run that has a verification argv discloses it, not only the preview.
+  // See `describeVerifyCommand`: this is a process launched with the user's
+  // permissions, and the run that launches it is the run that has to say so.
+  const verifyLine = describeVerifyCommand(report);
+  if (verifyLine !== null) {
+    out.write(`${verifyLine}\n`);
   }
   // Printed before the slice lines rather than with the failure at the bottom,
   // because it changes how every line below it should be read: "cancelled" on a

@@ -137,10 +137,30 @@ to be read as *re-slice this*, not as *the models failed*.
 - **Nothing outside the diff and its surrounding files is examined.** This gate
   reviews the change; it does not audit the codebase.
 - **The model reviewer does not run your tests, your linter, or your build.** If
-  a plan supplies `verify.command`, the deterministic `tests_pass` gate runs it
-  before model review and a non-zero exit rejects the attempt. brigadier does
-  not invent that command; without one, the gate runs nothing and is skipped.
-  A slice can still be wrong.
+  a plan document passed as a file to `brigadier run --plan <file>` supplies
+  `verify.command`, the deterministic `tests_pass` gate runs it before model
+  review and a non-zero exit rejects the attempt. Without such a command the
+  gate runs nothing and is reported as skipped. A slice can still be wrong.
+- **A verify command that cannot be started is a blocking failure, not a skip.**
+  A skip means brigadier decided the gate did not apply — for `tests_pass`, that
+  the plan configured no command at all. Once a command is configured the gate is
+  required to run, so a command that cannot even be spawned (a misspelled
+  executable, one that is not on `PATH`, one that is not executable) is recorded
+  as `status: "failed"` with a blocking finding reading
+  `The gate could not run: <error>`, and the attempt is rejected exactly as a
+  non-zero exit would be. **A typo in `verify.command` therefore rejects every
+  slice in the plan**, twice each, until both attempts are spent. It is loud on
+  purpose: the alternative is a gate that silently verifies nothing while the
+  report says the run was reviewed. Read a run where every slice failed
+  `tests_pass` with `could not run` as a broken command, not as broken code.
+- **The gate is not a sandbox for the verify command.** `tests_pass` spawns that
+  argv in the slice's worktree with your permissions. The in-process planner's
+  own output cannot carry one — a `verify.command` it proposes is discarded —
+  but the grant is keyed on the plan arriving via `--plan <file>`, not on who
+  authored the file. **An agent that writes the plan file and composes the argv
+  is granting itself command execution**, which is precisely the workflow the
+  bundled skills describe. Every run that has a verification command prints it
+  as argv in its report.
 
 ## The adjudication rule
 

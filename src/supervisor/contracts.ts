@@ -194,6 +194,14 @@ export interface PlanDocument {
  */
 export interface RunRequest {
   readonly document: PlanDocument;
+  /**
+   * Explicit capability grant for `document.verify.command`.
+   *
+   * The CLI sets this only for a user-supplied `--plan` document. Model-authored
+   * plans and callers that omit the provenance fail closed: their command data
+   * may still be displayed or saved, but the supervisor will never execute it.
+   */
+  readonly verifyCommandAuthorized?: boolean;
   readonly repositoryPath: string;
   readonly slug: string;
   readonly maxWorkers: number;
@@ -902,6 +910,24 @@ export interface RunReport {
     readonly reason: RunFailureReason;
     readonly message: string;
   } | null;
+  /**
+   * `WorktreeSession.recordToken` for the session this run prepared, and the
+   * only handle a later caller has on this run's cumulative secret inventory.
+   *
+   * ABSENT MEANS "NO SESSION OF THIS RUN'S IS REACHABLE", which is the truth on
+   * every report built before `prepare()` succeeded and on every report an
+   * engine without `recordToken` support produced. It is never a neutral
+   * default: the durable-record writer reads its absence as "fail closed" and
+   * elides every worker-derived string rather than redacting it against files
+   * that may have been rotated since the worker ran.
+   *
+   * IT IS THE TOKEN AND NOT THE SLUG BECAUSE THE SLUG IS NOT AN IDENTITY. A
+   * long-lived MCP server runs the same plan id repeatedly; a slug lookup can
+   * match a previous run's leftover registration, and writing run B's worker
+   * output through run A's inventory is exactly the leak the elide exists to
+   * prevent.
+   */
+  readonly sessionToken?: string;
   readonly durationMs: number;
 }
 

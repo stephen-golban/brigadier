@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   cp,
   lstat,
@@ -29,6 +30,7 @@ import type {
   CreatedWorktree,
   MergeResult,
   MergeSpec,
+  SecretRedactor,
   UncommittedDiff,
   UncommittedDiffSpec,
   WorktreeEngine,
@@ -138,7 +140,29 @@ interface SessionState {
   accumulatedHead: string;
   integrationMaterialized: boolean;
   refsReleased: boolean;
+  /** The orchestrator has reached its terminal release step for this run. */
+  recordReady: boolean;
 }
+
+/**
+ * Sessions awaiting their end-of-run durable record, plus weak discovery of
+ * active sessions for failure-message redaction.
+ *
+ * THIS PAIR IS THE MECHANISM, and `createSecretRedactor` is its only reader.
+ * There is no `WorktreeEngine` method that hands a session's inventory out:
+ * the durable-record writer runs after `release()` with a report and no engine
+ * handle, so a method it could not call would document a seam that fails open.
+ * A terminal entry is found by `WorktreeSession.recordToken` and consumed on
+ * the first read; nothing else identifies a run.
+ *
+ * The strong reference is deliberate: a completely failed run carries no
+ * worktree handle in its report, so a weak registry could lose the only route
+ * to the cumulative inventory between `release()` and record writing. The
+ * report path consumes matching terminal entries as soon as it snapshots
+ * their values.
+ */
+const activeSessionRedactionRegistry = new Set<WeakRef<SessionState>>();
+const terminalSessionRedactionRegistry = new Set<SessionState>();
 
 interface WorktreeState {
   readonly sessionState: SessionState;
@@ -159,20 +183,46 @@ export interface SecretRedactorSpec {
   readonly repositoryPath: string;
   readonly linkedSecretPaths: readonly string[];
   readonly redactionValues?: readonly string[];
+  /**
+   * `WorktreeSession.recordToken` — require and consume the terminal cumulative
+   * inventory for EXACTLY the run that minted this token.
+   *
+   * IT IS A TOKEN RATHER THAN A SLUG BECAUSE A SLUG IS NOT AN IDENTITY. Two
+   * runs of the same plan in one long-lived MCP process share a slug, a
+   * repository and a linked-secret list, so a slug lookup can hand run B the
+   * stale registration run A left behind and let run B's worker output be
+   * written under run A's inventory. A token minted in `prepare()` matches one
+   * session or none.
+   *
+   * Absence of a match is an error so durable persistence can fail closed
+   * instead of falling back to current linked-file contents, which cannot
+   * cover a value that rotated mid-run.
+   */
+  readonly sessionToken?: string;
   /** Test seam for proving that every search advances and work stays counted. */
   readonly onScan?: () => void;
 }
 
-/** Redacts inventoried exact values from one artifact. */
-export type SecretRedactor = (artifact: string) => string;
+export type { SecretRedactor } from "./contracts.js";
 
 /**
- * Builds the inventory-backed redactor without preparing a session.
+ * Builds an inventory-backed redactor without preparing a new session.
  *
- * This performs reads only: it runs no Git command and creates no ref, commit,
- * worktree, or directory. It deliberately covers verbatim values only. A value
- * transformed, summarized, truncated, derived, or re-encoded by a model is not
- * the same byte sequence and remains outside this guarantee.
+ * `sessionToken` requires the terminal session that minted it — matched by token
+ * identity and by nothing else — and consumes its durable-record registration
+ * after taking an immutable snapshot of exactly that run's cumulative
+ * inventory.
+ *
+ * A TOKENLESS REDACTOR ALWAYS READS THE CURRENT LINKED FILES, and unions any
+ * matching live session's cumulative inventory on top. Both halves are needed
+ * and neither substitutes for the other: the session knows values that have
+ * since been rotated away, and the files know values written after the session
+ * captured its inventory. Reading the file is also the only branch that can
+ * fail, and it fails loudly on purpose, into the caller's fail-closed path.
+ *
+ * No path runs a Git command or creates a ref, commit, worktree, or directory.
+ * This deliberately covers verbatim values only. A transformed, summarized,
+ * truncated, derived, or re-encoded value remains outside this guarantee.
  */
 export async function createSecretRedactor(
   spec: SecretRedactorSpec,
@@ -182,11 +232,57 @@ export async function createSecretRedactor(
     spec.linkedSecretPaths,
     "linked secret",
   );
-  const redactionValues = await collectRedactionValues(
+  // THE TWO LOOKUPS ARE DIFFERENT QUESTIONS AND SHARE NO PREDICATE. A token
+  // lookup asks "is this the session that minted this token", which repository
+  // path and linked-secret list cannot make more true and can only make
+  // spuriously false. A tokenless lookup asks "is there any live session over
+  // this repository holding values the files on disk no longer hold".
+  if (spec.sessionToken !== undefined) {
+    const matchingSessions = registeredSessionStates().filter(
+      (state) =>
+        state.session.recordToken === spec.sessionToken && state.recordReady,
+    );
+    if (matchingSessions.length === 0) {
+      throw new Error("session redaction inventory is unavailable");
+    }
+    // ONE RUN'S CUMULATIVE INVENTORY AND NOTHING ELSE. This is the durable
+    // record of a specific run: its own inventory already accumulates every
+    // value that file held while it ran, and mixing in a later run's disk
+    // contents would answer a question nobody asked.
+    const redactionValues = normalizeRedactionValues(
+      matchingSessions.flatMap((state) => state.redactionValues),
+    );
+    for (const state of matchingSessions) {
+      consumeSessionRegistration(state);
+    }
+    return (artifact: string): string =>
+      redactText(artifact, redactionValues, spec.onScan);
+  }
+  const matchingSessions = registeredSessionStates().filter(
+    (state) =>
+      state.session.repositoryPath === repositoryPath &&
+      samePaths(state.linkedSecretPaths, linkedSecretPaths),
+  );
+  // THE SESSION INVENTORIES ARE ADDITIONAL TO THE CURRENT FILES, NEVER INSTEAD
+  // OF THEM. Returning a matching session's values alone looks like the safer
+  // answer and is not: a leftover registration was captured at some earlier
+  // moment, so it covers what has since been rotated AWAY and misses whatever
+  // was written since — including the value sitting in the file right now, the
+  // one an exception raised at this instant is most likely to be quoting.
+  // Reading only the files has the mirror-image hole. Unioning has neither.
+  //
+  // `collectRedactionValues` is deliberately not guarded: if the linked file
+  // cannot be read, no inventory here can be proven complete, and every caller
+  // of the tokenless form turns that throw into an omitted-detail fallback.
+  const currentValues = await collectRedactionValues(
     repositoryPath,
     linkedSecretPaths,
     spec.redactionValues ?? [],
   );
+  const redactionValues = normalizeRedactionValues([
+    ...currentValues,
+    ...matchingSessions.flatMap((state) => state.redactionValues),
+  ]);
   return (artifact: string): string =>
     redactText(artifact, redactionValues, spec.onScan);
 }
@@ -357,8 +453,12 @@ export class GitWorktreeEngine implements WorktreeEngine {
       baseCommit,
       baseBranch,
       integrationBranch,
+      // Minted per `prepare()` call, never derived from the slug, the plan or
+      // the repository: two runs of the same plan in one process must not be
+      // able to answer each other's inventory lookup.
+      recordToken: randomUUID(),
     }) satisfies WorktreeSession;
-    this.#sessions.set(session, {
+    const state: SessionState = {
       session,
       dependencyPaths,
       linkedSecretPaths,
@@ -370,7 +470,10 @@ export class GitWorktreeEngine implements WorktreeEngine {
       accumulatedHead: baseCommit,
       integrationMaterialized: false,
       refsReleased: false,
-    });
+      recordReady: false,
+    };
+    this.#sessions.set(session, state);
+    activeSessionRedactionRegistry.add(new WeakRef(state));
     return session;
   }
 
@@ -750,6 +853,12 @@ export class GitWorktreeEngine implements WorktreeEngine {
 
   async release(session: WorktreeSession): Promise<void> {
     const state = this.#sessionState(session);
+    // Set before any cleanup refusal: release is the orchestrator's terminal
+    // session step, and even a cleanup failure still needs a safe run record.
+    if (!state.recordReady) {
+      state.recordReady = true;
+      terminalSessionRedactionRegistry.add(state);
+    }
     if (state.activeWorktrees.size > 0) {
       throw new Error(
         `cannot release worktree session ${session.slug}: ${state.activeWorktrees.size} worktree(s) are still active`,
@@ -1684,6 +1793,49 @@ function normalizeUniquePaths(
     throw new Error(`${label} paths must be unique`);
   }
   return Object.freeze(normalized);
+}
+
+function samePaths(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((path, index) => path === right[index])
+  );
+}
+
+/**
+ * Retires one run's registration from BOTH registries after its durable record
+ * has taken an immutable snapshot.
+ *
+ * DELETING THE TERMINAL ENTRY ALONE DID NOT CONSUME ANYTHING. The same state is
+ * also reachable through a `WeakRef` in the active registry, and that reference
+ * stays live for exactly as long as somebody still holds the `WorktreeSession`
+ * — which is to say, for an unpredictable interval decided by the garbage
+ * collector. "Consumed" that depends on a collection cycle is not a property
+ * anything can be built on: a second write for the same token would sometimes
+ * get the inventory and sometimes fail closed, and which one it got would
+ * depend on memory pressure. Clearing both makes one token good for exactly one
+ * record.
+ */
+function consumeSessionRegistration(state: SessionState): void {
+  terminalSessionRedactionRegistry.delete(state);
+  for (const reference of activeSessionRedactionRegistry) {
+    if (reference.deref() === state) {
+      activeSessionRedactionRegistry.delete(reference);
+    }
+  }
+}
+
+function registeredSessionStates(): readonly SessionState[] {
+  const states = new Set(terminalSessionRedactionRegistry);
+  for (const reference of activeSessionRedactionRegistry) {
+    const state = reference.deref();
+    if (state === undefined) {
+      activeSessionRedactionRegistry.delete(reference);
+    } else {
+      states.add(state);
+    }
+  }
+  return [...states];
 }
 
 function normalizeRepositoryPath(path: string, label: string): string {

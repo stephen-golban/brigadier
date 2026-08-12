@@ -128,6 +128,194 @@ describe("writeRunRecord", () => {
     });
   });
 
+  test("elides worker output when cumulative redaction is unavailable", async () => {
+    const disk = new MemoryIo();
+    const rotatedSecret = "rotated-worker-output-secret";
+    const report: RunReport = {
+      ...SUCCESSFUL_REPORT,
+      slices: [
+        {
+          sliceId: "worker",
+          ok: false,
+          branch: null,
+          commit: null,
+          worktree: null,
+          attempts: [
+            {
+              attempt: 1,
+              routed: null,
+              outcome: {
+                ok: true,
+                output: rotatedSecret,
+                usage: {
+                  input: {
+                    total: 0,
+                    uncached: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                  output: { total: 0, reasoning: null },
+                },
+                durationMs: 1,
+                exitCode: 0,
+                signal: null,
+              },
+              commit: null,
+              failure: { kind: "NO_CHANGES", message: "no changes" },
+              review: null,
+              durationMs: 1,
+            },
+          ],
+        },
+      ],
+    };
+
+    const path = await writeRunRecord(
+      report,
+      {
+        runId: "elided-output",
+        environment: { BRIGADIER_HOME: scratchHome },
+      },
+      (artifact) => artifact,
+      disk,
+      "elide",
+    );
+
+    const bytes = disk.files.get(path) ?? "";
+    expect(bytes).not.toContain(rotatedSecret);
+    expect(bytes).toContain(
+      "[OMITTED: cumulative linked-secret redaction unavailable]",
+    );
+  });
+
+  test("elides every worker-derived string, not only the output field", async () => {
+    const disk = new MemoryIo();
+    // One rotated value reaching the record by all four routes a worker's bytes
+    // actually travel. `output` was the only one the first elide covered.
+    const rotatedSecret = "rotated-worker-stderr-secret";
+    const report: RunReport = {
+      ...SUCCESSFUL_REPORT,
+      ok: false,
+      slices: [
+        {
+          sliceId: "worker",
+          ok: false,
+          branch: "brigadier/demo/slice-1",
+          commit: null,
+          worktree: null,
+          attempts: [
+            {
+              attempt: 1,
+              routed: null,
+              outcome: {
+                ok: false,
+                output: `stdout ${rotatedSecret}`,
+                usage: {
+                  input: {
+                    total: 0,
+                    uncached: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                  output: { total: 0, reasoning: null },
+                },
+                durationMs: 1,
+                exitCode: 1,
+                signal: null,
+                failure: {
+                  // Route 2: `WorkerFailure.message` is up to 64 KiB of the
+                  // worker's own stderr, verbatim.
+                  kind: "UNKNOWN_FAILURE",
+                  message: `stderr ${rotatedSecret}`,
+                  retryable: false,
+                  statusCode: null,
+                },
+              },
+              commit: null,
+              failure: {
+                kind: "WORKER_FAILED",
+                // Route 3: the same stderr interpolated again by the runner.
+                message: `slice worker attempt 1: claude/x failed with UNKNOWN_FAILURE: stderr ${rotatedSecret}`,
+                failure: {
+                  kind: "UNKNOWN_FAILURE",
+                  message: `stderr ${rotatedSecret}`,
+                  retryable: false,
+                  statusCode: null,
+                },
+              },
+              // Route 4: a reviewer is a worker too, and its prose quotes what
+              // it was shown.
+              review: {
+                verdict: "rejected",
+                reviewer: {
+                  vendor: "codex",
+                  model: "gpt-5.6-sol",
+                  effort: "high",
+                },
+                findings: [
+                  {
+                    source: "model",
+                    severity: "blocking",
+                    path: "src/a.ts",
+                    line: 3,
+                    summary: `the diff hardcodes ${rotatedSecret}`,
+                  },
+                ],
+                gates: [
+                  {
+                    name: "tests_pass",
+                    severity: "blocking",
+                    status: "failed",
+                    findings: [
+                      {
+                        source: "gate",
+                        gate: "tests_pass",
+                        severity: "blocking",
+                        path: null,
+                        line: null,
+                        summary: `verify failed: ${rotatedSecret}`,
+                      },
+                    ],
+                  },
+                ],
+                durationMs: 2,
+              },
+              durationMs: 1,
+            },
+          ],
+        },
+      ],
+    };
+
+    const path = await writeRunRecord(
+      report,
+      {
+        runId: "elided-structurally",
+        environment: { BRIGADIER_HOME: scratchHome },
+      },
+      // Deliberately a no-op: the elide is what must remove the value, because
+      // the fallback redactor is built from files the value is no longer in.
+      (artifact) => artifact,
+      disk,
+      "elide",
+    );
+
+    const bytes = disk.files.get(path) ?? "";
+    expect(bytes).not.toContain(rotatedSecret);
+    expect(bytes).toContain(
+      "[OMITTED: cumulative linked-secret redaction unavailable]",
+    );
+
+    // Well-formed and still readable: everything brigadier itself computed
+    // survives, so the record is worth keeping.
+    const record = JSON.parse(bytes) as { readonly report: RunReport };
+    const attempt = record.report.slices[0]?.attempts[0];
+    expect(attempt?.outcome?.ok).toBe(false);
+    expect(attempt?.outcome?.exitCode).toBe(1);
+    expect(attempt?.failure?.kind).toBe("WORKER_FAILED");
+    expect(attempt?.review?.verdict).toBe("rejected");
+  });
+
   test("leaves no partial record when the temporary write fails", async () => {
     const disk = new MemoryIo();
     disk.failWrite = new Error("disk full midway through write");

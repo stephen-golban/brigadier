@@ -168,6 +168,7 @@ function planDocument(
 function runRequest(document: PlanDocument, maxWorkers: number): RunRequest {
   return {
     document,
+    verifyCommandAuthorized: true,
     repositoryPath: REPOSITORY_PATH,
     slug: SLUG,
     maxWorkers,
@@ -2422,6 +2423,7 @@ describe("real repository dependency and redaction proof", () => {
           ...planDocument([producer, consumer]),
           verify: { command: verifyCommand },
         },
+        verifyCommandAuthorized: true,
         repositoryPath,
         slug: "real-waves",
         maxWorkers: 2,
