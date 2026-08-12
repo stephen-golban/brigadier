@@ -256,9 +256,9 @@ export function createCodexQuotaOracle(
 /**
  * The `limitId` of the general bucket every Codex tier shares.
  *
- * R-11 §2a establishes that Sol, Terra, and Luna draw from one allowance at
- * different burn rates, and §2b observed that allowance reported under
- * `limitId: "codex"` with `limitName: null`. Used only as a fallback identity
+ * Sol, Terra, and Luna draw from one allowance at different burn rates, and
+ * that allowance was observed reported under `limitId: "codex"` with
+ * `limitName: null`. Used only as a fallback identity
  * for the aggregate `result.rateLimits` object, which carried no `limitId` in
  * some payloads.
  */

@@ -398,7 +398,7 @@ describe("brigadier init --print-config", () => {
 });
 
 /**
- * WO-010H replaced the per-vendor quota-fallback prompt — "When codex quota
+ * Brigadier replaced the per-vendor quota-fallback prompt — "When codex quota
  * drains, fall back to:" plus a model list — with one question about the
  * behaviour the setting actually controls. The prompt's copy is part of the
  * change and not decoration: the old wording described a substitution that

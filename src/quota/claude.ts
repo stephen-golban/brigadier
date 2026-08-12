@@ -30,15 +30,15 @@ const SEVEN_DAY_MINUTES = 10_080;
 /**
  * The shape of every `rateLimitType` Claude Code 2.1.224 can emit.
  *
- * Extracted from the CLI's own compiled Zod enum, recorded in R-11 §3a:
+ * Extracted from the CLI's own compiled Zod enum:
  * `five_hour | seven_day | seven_day_opus | seven_day_sonnet |
  * seven_day_overage_included | overage`. The previous implementation matched
  * two of those six and dropped the other four into `kind: "unknown"` with a
  * null duration, which is how a model-scoped limit lost its identity.
  *
  * `five_hour` and `seven_day` are account-scoped by definition — the CLI calls
- * them "session limit" and "weekly limit", and R-11 §1b quotes Anthropic saying
- * switching models does not restore access once they are spent.
+ * them "session limit" and "weekly limit", and Anthropic states that switching
+ * models does not restore access once they are spent.
  *
  * `seven_day_overage_included` and `overage` are account-scoped too, and that is
  * a CONSERVATIVE DEFAULT UNDER GENUINE UNCERTAINTY — not a fact read off the
@@ -57,8 +57,8 @@ const SEVEN_DAY_MINUTES = 10_080;
  *
  * What points the other way: the CLI's own display label for
  * `seven_day_overage_included` reads "Fable 5 limit", which names a model
- * family. That is weak evidence rather than none — R-11 §3a shows those labels
- * are plan-dependent prose, and the same table relabels the Sonnet bucket to the
+ * family. That is weak evidence rather than none — those labels are
+ * plan-dependent prose, and the same table relabels the Sonnet bucket to the
  * generic "weekly limit" on `pro` — but it is the only direct signal either way,
  * and it disagrees with the scope chosen here.
  *
@@ -66,15 +66,15 @@ const SEVEN_DAY_MINUTES = 10_080;
  * genuinely model-scoped bucket account-scoped over-restricts and can cost a
  * refused slice. Calling a genuinely account-scoped bucket model-scoped claims
  * every other model still runs on evidence brigadier does not have, and launches
- * a worker into a wall — the exact waste this unit exists to prevent. Under a
+ * a worker into a wall — the exact waste this module exists to prevent. Under a
  * tie in evidence, take the error that wastes capacity over the error that
  * wastes a launch.
  *
  * What would settle it, for whoever picks this up: one observed
  * `rate_limit_event` carrying `rateLimitType: "seven_day_overage_included"` on
  * an account where a *different* model family is known to still run, or the
- * account usage payload's own `limits[].scope.model` field (quoted in R-11 §3a)
- * read for that bucket. Either is direct; nothing short of one of them is.
+ * account usage payload's own `limits[].scope.model` field read for that
+ * bucket. Either is direct; nothing short of one of them is.
  *
  * `overage` sits on the same conservative footing with no display label pointing
  * the other way: "usage credit limit" names a purchased pool, not a model. It
@@ -238,10 +238,10 @@ export function createClaudeQuotaOracle(
  * `seven_day_overage_included` to `kind: "weekly"` with account scope, so the
  * two collided: ingesting a rejected `seven_day` and then an allowed
  * `seven_day_overage_included` made the exhausted seven-day bucket *disappear*
- * and the snapshot report `available`. That is the same overwrite WO-010 removed
- * for model-scoped buckets, left in place for two account-scoped ones — the
- * normalization is deliberately many-to-one, so anything derived from it is
- * many-to-one too.
+ * and the snapshot report `available`. That is the same overwrite window scopes
+ * removed for model-scoped buckets, left in place for two account-scoped ones
+ * — the normalization is deliberately many-to-one, so anything derived from it
+ * is many-to-one too.
  *
  * `rateLimitType` is the vendor's own bucket key, and two different wire types
  * are two different buckets even when they normalize to the same shape. Prefer
@@ -268,7 +268,7 @@ function bucketKey(window: QuotaWindow, rateLimitType: string | null): string {
  *
  * Read straight off the untouched vendor payload the `WorkerEvent` contract
  * already carries, because the normalized `QuotaWindow` has nowhere to put it:
- * `src/contracts.ts` is frozen and its `QuotaScope` is deliberately a normalized
+ * `QuotaScope` in the published `src/contracts.ts` is deliberately a normalized
  * tier token, not a vendor bucket id. Returning null for anything unreadable is
  * what makes the shape fallback in `bucketKey` reachable.
  */

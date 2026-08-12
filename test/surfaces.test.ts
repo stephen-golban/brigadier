@@ -65,16 +65,16 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1919,
   },
   "claude-code/hooks/handoff.mjs": {
-    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
-    bytes: 5467,
+    sha256: "2726afa2525d3e609c6e0a390adcf336dcfd24e41a5eb34d5b61e03383ac10ff",
+    bytes: 5445,
   },
   "claude-code/hooks/hooks.json": {
     sha256: "896daf07fe5d2ca91b92f51a4de35d3f713395c6cc0b6ea610d0462b6f582992",
     bytes: 236,
   },
   "claude-desktop/README.md": {
-    sha256: "32b0330ccf477c5e48b45271b8a43188a19a6ea1852ffc85f3d11dd711807d25",
-    bytes: 3041,
+    sha256: "e410fcf3ef50fe6882b579b49ded0f96c9fde2e817795ffb896b25f11c9ec6aa",
+    bytes: 3023,
   },
   "claude-desktop/manifest.json": {
     sha256: "4df6c2afbd2252372ff7ead8ce203a5c3a3915a862067e6de066978ae4a2a203",
@@ -89,8 +89,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3185,
   },
   "codex/hooks/handoff.mjs": {
-    sha256: "994627f1051e9d89e2794673533b531b9c5bd34eadcc54bea32ca6d86065ca7d",
-    bytes: 5467,
+    sha256: "2726afa2525d3e609c6e0a390adcf336dcfd24e41a5eb34d5b61e03383ac10ff",
+    bytes: 5445,
   },
   "codex/skills/brigadier/SKILL.md": {
     sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
@@ -409,7 +409,7 @@ describe("the surface templates", () => {
       "utf8",
     );
     expect(paragraphContaining(methodology, "not proven to clear it")).toBe(
-      "An unranked model is not proven weaker than a difficulty floor, but it is\nnot proven to clear it either. It is therefore excluded from ordinary eligibility\nand enters the same consented salvage pool as a ranked model below the floor\n([`src/routing/router.ts:733`](../src/routing/router.ts#L733) and\n[`src/routing/router.ts:747`](../src/routing/router.ts#L747)). Without\n`allowDegradedRouting`, an unranked model cannot take the slice.",
+      "An unranked model is not proven weaker than a difficulty floor, but it is\nnot proven to clear it either. It is therefore excluded from ordinary eligibility\nand enters the same consented salvage pool as a ranked model below the floor\n([`src/routing/router.ts:714`](../src/routing/router.ts#L714) and\n[`src/routing/router.ts:735`](../src/routing/router.ts#L735)). Without\n`allowDegradedRouting`, an unranked model cannot take the slice.",
     );
     expect(paragraphContaining(methodology, "contains both kinds")).toBe(
       "With consent, the salvage pool contains both kinds of model that brigadier\ncould not prove meet the requested floor:",
@@ -473,8 +473,8 @@ describe("the surface templates", () => {
 
   test("Desktop doctrine keeps verified hook and staged-build limits explicit", () => {
     const desktop = SURFACE_TEMPLATES["claude-desktop/README.md"] ?? "";
-    expect(paragraphContaining(desktop, "Design decision #10's")).toBe(
-      "Design decision #10's transcript-watching handoff works on Claude Code. On\nopencode, its event names were verified only on 1.18.16, without triggering live\ncompaction, and remain version-dependent. On Codex, brigadier registers it and\nCodex trust-gates the registration; approval remains valid if the script at that\npath changes. On Desktop it is **impossible**, not merely unimplemented:\nDesktop exposes no hook surface of any kind, and an MCP server is invoked by the\nmodel when the model chooses to invoke it — never by the transcript, and never at\nthe moment the context fills. There is no workaround and none is offered.",
+    expect(paragraphContaining(desktop, "transcript-watching handoff")).toBe(
+      "The transcript-watching handoff works on Claude Code. On\nopencode, its event names were verified only on 1.18.16, without triggering live\ncompaction, and remain version-dependent. On Codex, brigadier registers it and\nCodex trust-gates the registration; approval remains valid if the script at that\npath changes. On Desktop it is **impossible**, not merely unimplemented:\nDesktop exposes no hook surface of any kind, and an MCP server is invoked by the\nmodel when the model chooses to invoke it — never by the transcript, and never at\nthe moment the context fills. There is no workaround and none is offered.",
     );
     expect(
       textBetween(

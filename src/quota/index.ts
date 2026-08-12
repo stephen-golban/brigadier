@@ -1,9 +1,9 @@
 /**
- * The quota unit's barrel, re-exported wholesale by `src/index.ts` and
+ * The quota module's barrel, re-exported wholesale by `src/index.ts` and
  * therefore a package API surface, not a convenience import.
  *
  * `modelQuotaStatus` and `deriveAccountStatus` are deliberately NOT here, and
- * WO-010B settled that rather than leaving it open. `modelQuotaStatus` answers
+ * that is a settled decision rather than an open one. `modelQuotaStatus` answers
  * "which windows in this snapshot constrain this model", which is not the same
  * question as "can brigadier run this model" — the router floors its answer
  * with `QuotaSnapshot.status`, because `normalizeCodexRateLimits` can report an

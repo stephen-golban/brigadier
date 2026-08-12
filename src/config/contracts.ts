@@ -1,13 +1,18 @@
 /**
- * WO-008B owns the persisted configuration vocabulary and may amend it freely
- * within this file. It must not add its members to the frozen
- * `src/contracts.ts`.
+ * The persisted configuration vocabulary. It is owned by this module, and its
+ * members deliberately stay out of the shared `src/contracts.ts`, the core
+ * contract every other module compiles against. That is a layering boundary,
+ * not a privacy one: `src/index.ts` re-exports this module through the package
+ * barrel, so every name and shape below is public API. Renaming a member,
+ * changing a field's type, or tightening a value is a breaking change for
+ * consumers and needs the same deliberate semver consideration as an edit to
+ * `src/contracts.ts` itself.
  *
  * The config records *which models are available and permitted* and how high
  * their effort may go. It is deliberately incapable of expressing a
- * "use vendor V for task type T" table: decision #7 keeps vendor out of the
- * routing pipeline (capability filter, competence rank, difficulty, effort,
- * cost), and this schema must never become a back door into it.
+ * "use vendor V for task type T" table: the routing pipeline (capability
+ * filter, competence rank, difficulty, effort, cost) keeps vendor out, and this
+ * schema must never become a back door into it.
  *
  * It also never holds a secret. Model ids, effort ceilings, resolved executable
  * paths, vendor versions, consent flags, and repository-relative paths to
@@ -45,7 +50,7 @@ export const EFFORT_LADDER = [
 ] as const satisfies readonly Effort[];
 
 /**
- * Decision #20: `high` is the default ceiling. `xhigh` remains reachable only
+ * `high` is the default ceiling. `xhigh` remains reachable only
  * as an earned escalation after a routed model runs the slice and fails,
  * whatever ceiling a user records here. A routing failure does not earn it.
  */
@@ -70,7 +75,7 @@ export interface VendorConfig {
 export interface BrigadierConfig {
   readonly version: typeof CONFIG_VERSION;
   readonly vendors: readonly VendorConfig[];
-  /** Decision #6: consent to link secret files into worker worktrees. */
+  /** Consent to link secret files into worker worktrees. */
   readonly secretsConsent: boolean;
   /** Repository-relative `.env`-shaped files approved for worker worktrees. */
   readonly linkedSecretPaths: readonly string[];
@@ -78,9 +83,9 @@ export interface BrigadierConfig {
    * Consent to run a slice on a model that scores below its difficulty floor
    * rather than failing the slice.
    *
-   * This replaces decision #21's per-vendor `quotaFallbackModel` ("when this
-   * vendor's quota drains, fall back to model X"), which WO-010's per-model
-   * quota metering made obsolete in both halves of its job. The substitution
+   * This replaces the earlier per-vendor `quotaFallbackModel` ("when this
+   * vendor's quota drains, fall back to model X"), which per-model quota
+   * metering made obsolete in both halves of its job. The substitution
    * half now happens without it: a drained Opus tier no longer removes Sonnet
    * from the pool, so Sonnet competes and wins on merit through the ordinary
    * pipeline. The consent half is what was actually left — configuring any
@@ -92,7 +97,7 @@ export interface BrigadierConfig {
    * identity is gone: the router already picks the best below-floor model on
    * the machine, from whichever vendor is holding it.
    *
-   * `false` is the default, and it preserves decision #21's spirit: brigadier
+   * `false` is the default, and it preserves that older flag's spirit: brigadier
    * tells the user it could not route the slice rather than quietly running it
    * on something weaker than the work asked for.
    */
@@ -155,9 +160,8 @@ export function narrowEfforts(
  *
  * `null` means the model is not usable by brigadier at a proposed ceiling. That
  * happens when the narrowed ladder is empty (the vendor reports no rung
- * brigadier knows) or contains only `xhigh` (decision #20: `xhigh` is earned on
- * retry after a routed model runs the slice and fails, and must never be
- * predicted up front).
+ * brigadier knows) or contains only `xhigh` (`xhigh` is earned on retry after a
+ * routed model runs the slice and fails, and must never be predicted up front).
  * Writing `high` for such a model would record an effort the vendor does not
  * accept, so the caller must exclude the model instead.
  */

@@ -10,7 +10,7 @@
  *
  * `plan` and `routing` are curated for the same reason. The two entry points
  * (`validatePlan`, `route`), the vocabulary needed to call them and read their
- * results, and the competence data decision #7 promises will be auditable
+ * results, and the competence data the routing policy promises will be auditable
  * (`COMPETENCE_TABLE`, `CompetenceRule`, `DIFFICULTY_FLOORS`) are API. The
  * scoring helpers behind that data — `scoreModelId`, `matchCompetenceRule`,
  * `UNRANKED_SCORE`, `UNRANKED_RATIONALE` — are not: they are how the router and

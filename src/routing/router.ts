@@ -2,7 +2,7 @@
  * The routing engine: one slice plus a judgement of how hard it is, in; one
  * `{vendor, model, effort}` plus the trace that produced it, out.
  *
- * The pipeline is decision #7's, in order — quota, exclusion, capability
+ * The pipeline is fixed, in this order — quota, exclusion, capability
  * filter, competence rank, difficulty, effort, cost — and vendor is not a
  * stage. Exclusion is an eligibility fact about an exact model that already
  * failed this slice, not a ranking input. Every configured model from every
@@ -18,19 +18,19 @@
  *   it. Ranking without that inversion would route every slice to the best
  *   model on the machine and make the "cost" stage decorative.
  * - `xhigh` is unreachable unless a routed model already ran this slice and
- *   failed (decisions #9/#20). Effort is clamped downward only, from a base
+ *   failed. Effort is clamped downward only, from a base
  *   that can be `xhigh` solely on an escalated request, and
  *   `assertEffortEarned` re-checks the result rather than trusting the
  *   arithmetic. A routing failure, where no model ran, does not escalate.
- * - Quota is resolved **per model, not per vendor** (WO-010B). A CLI account
+ * - Quota is resolved **per model, not per vendor**. A CLI account
  *   meters some limits account-wide and others per model tier — a drained
  *   `seven_day_opus` bucket says nothing about Sonnet — so each pooled model
  *   asks `modelQuotaStatus` about itself. Reading only `QuotaSnapshot.status`
  *   made an Opus-only limit invisible to the router, which then routed a hard
  *   slice straight into the drained tier; reading a model-scoped window as
- *   vendor-wide exhaustion, which is what the code did before the WO-010A
- *   reshape, made a healthy Sonnet unreachable. Per-model is the only reading
- *   that is wrong in neither direction.
+ *   vendor-wide exhaustion, which is what the code did before quota windows
+ *   carried a scope, made a healthy Sonnet unreachable. Per-model is the only
+ *   reading that is wrong in neither direction.
  * - The difficulty floor is waived **only with the user's explicit consent**,
  *   recorded as `BrigadierConfig.allowDegradedRouting`. When the ordinary
  *   pipeline yields nothing and the flag is off, `route` fails and says so; a
@@ -46,9 +46,9 @@
  *   floor and nothing else; capability, effort, and quota all still answer "can
  *   this model do the work at all", which no amount of consent changes.
  *
- * WO-010H removed the per-vendor `quotaFallbackModel` this stage used to be
- * built around, and the removal was a deletion rather than a rename because
- * per-model quota (WO-010B) had already taken both halves of its job away:
+ * This stage used to be built around a per-vendor `quotaFallbackModel`. Its
+ * removal was a deletion rather than a rename, because per-model quota had
+ * already taken both halves of its job away:
  *
  * - Its stated job now happens without it. Claude meters Opus separately, so a
  *   drained Opus tier leaves Sonnet in the pool, where Sonnet competes and wins
@@ -56,9 +56,9 @@
  *   consent is spent, and no floor is waived.
  * - Its remaining code path was provably dead. `parseConfig` required a
  *   fallback to name one of that vendor's *own* models, salvage only consulted a
- *   vendor once *every* one of its models was exhausted, and WO-010G made
- *   salvage re-check per-model quota — so the named fallback was always itself
- *   exhausted and always rejected.
+ *   vendor once *every* one of its models was exhausted, and salvage re-checks
+ *   per-model quota — so the named fallback was always itself exhausted and
+ *   always rejected.
  *
  * What was left of it was consent, and consent is what `allowDegradedRouting`
  * records. Everything the field could still reach — the drained half of the
@@ -559,7 +559,7 @@ function judgeQuota(
  * different rule than the one that made it, which is worse than no trace at
  * all. Restating the rule in prose has the same failure mode more quietly: this
  * paragraph went on describing the bare substring test for a release after
- * WO-010F replaced it with token boundaries and the vendor-family guard.
+ * token boundaries and the vendor-family guard replaced it.
  *
  * That probe cannot speak about `"unknown"`, which is also what
  * `modelQuotaStatus` returns for a window that constrains nothing, so windows
@@ -714,7 +714,7 @@ function selectWorker(
   const unranked = scored.filter((entry) => !entry.ranked);
 
   // Cost stage: among everything that clears the bar, the cheapest wins.
-  // Sorting ascending is the whole of decision #7's "cost" — reverse it and
+  // Sorting ascending is the whole of the "cost" stage — reverse it and
   // brigadier routes a README fix to its most expensive model.
   const clearing = ranked
     .filter((entry) => entry.score >= floor)
@@ -732,7 +732,7 @@ function selectWorker(
       reason: `competence score ${below.score} is below the ${request.difficulty} floor of ${floor}`,
     });
   }
-  // RULING FOR DECISION #26: an unranked model is not proven weaker than the
+  // THE UNRANKED-MODEL RULING: an unranked model is not proven weaker than the
   // floor, but neither is it proven to clear the floor. It therefore cannot be
   // an ordinary eligible candidate. It enters the same consented salvage pool
   // as a ranked model below the floor; `waivedDifficultyFloor: true` then means
@@ -1000,7 +1000,7 @@ function validateRequirements(requires: SliceRequirements | undefined): void {
 /* ------------------------------- stage 4 -------------------------------- */
 
 /**
- * Decisions #9/#20 in one function. `xhigh` is reachable only through
+ * The earned-`xhigh` rule in one function. `xhigh` is reachable only through
  * `escalated`, which the supervisor sets after a routed model runs the slice
  * and fails — never after a routing failure and never from difficulty, however
  * hard the planner judged the work.
@@ -1056,7 +1056,7 @@ function resolveEffort(
 }
 
 /**
- * The promise decisions #9/#20 make, re-checked against the value actually
+ * The earned-`xhigh` promise, re-checked against the value actually
  * being returned. The clamp arithmetic already guarantees it; this catches the
  * day someone adds a rung, a special case, or a "just this once" override.
  */
@@ -1108,9 +1108,9 @@ function describeCompetenceLine(
  * normally have rejected, and that it happened because they asked for degraded
  * routing rather than because a rule went wrong.
  *
- * It no longer reports whether the winner's vendor was healthy or drained,
- * because after WO-010H there is no drained candidate to distinguish it from:
- * every model in this pool passed the quota stage.
+ * It does not report whether the winner's vendor was healthy or drained,
+ * because there is no drained candidate to distinguish it from: every model in
+ * this pool passed the quota stage.
  */
 function describeWaivedCompetenceLine(
   request: RoutingRequest,

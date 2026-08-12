@@ -973,7 +973,7 @@ describe("createCrossVendorReviewer", () => {
   });
 
   test("the reviewer's effort is capped at high even when its ceiling is xhigh", async () => {
-    // Decision #20: `xhigh` is earned by an observed gate failure, and the gate
+    // `xhigh` is earned by an observed gate failure, and the gate
     // is the thing that observes one — it can never itself have earned the rung.
     const claude = fakeAdapter("claude", {
       outcome: outcomeWith('{"findings":[]}'),

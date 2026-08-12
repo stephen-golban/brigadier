@@ -370,7 +370,7 @@ describe("createModelPlanner", () => {
   });
 
   /**
-   * DECISION #8: FAN-OUT IS EARNED. A refusal, not a truncation, and not a
+   * FAN-OUT IS EARNED. A refusal, not a truncation, and not a
    * silent acceptance. Truncating would delete work from a plan while reporting
    * success; accepting would spend worktrees the user did not authorize.
    */
@@ -526,7 +526,7 @@ describe("createModelPlanner", () => {
   });
 
   /**
-   * DECISION #20: `xhigh` is earned by an observed gate failure. Planning
+   * `xhigh` IS EARNED BY AN OBSERVED GATE FAILURE. Planning
    * happens before any gate exists to fail, so it can never have earned it.
    */
   test("caps the planner's effort at high even when the ceiling is xhigh", async () => {

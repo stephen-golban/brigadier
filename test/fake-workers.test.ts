@@ -739,8 +739,8 @@ function createNdjsonReader(stream: ReadableStream<Uint8Array>): {
 }
 
 /**
- * Reference oracle for fixture expectations only. WO-001 must replace this
- * function's callers by importing the production normalizer it implements.
+ * Reference oracle for fixture expectations only. Its callers should be moved
+ * onto the production normalizer this function implements.
  */
 function classify(
   events: readonly JsonObject[],
@@ -818,8 +818,8 @@ function assertBehavior(
 }
 
 /**
- * Reference oracle for fixture expectations only. WO-001 must replace this
- * function's callers by importing production token normalization.
+ * Reference oracle for fixture expectations only. Its callers should be moved
+ * onto production token normalization.
  */
 function preferredClaudeInputTotal(result: JsonObject | undefined): number {
   const modelUsage = asObject(result?.modelUsage);

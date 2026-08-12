@@ -1,5 +1,5 @@
 /**
- * The competence matrix — the auditable data decision #7 rests on.
+ * The competence matrix — the auditable data the router rests on.
  *
  * This table used to live in `src/init/propose.ts`, where `init` used it to
  * order the models it offers a user. That was the wrong home: the router is the
@@ -25,7 +25,7 @@ export const UNRANKED_RATIONALE =
 
 /**
  * Ranks by demonstrated competence, not by vendor. Two models from different
- * vendors compete on the same scale, which is what keeps decision #7 honest:
+ * vendors compete on the same scale, which is what keeps the ranking honest:
  * the proposal never says "use vendor V", only "this model outranks that one".
  *
  * Frozen at the array *and* at every rule, not merely `readonly`. `readonly` is
@@ -33,7 +33,7 @@ export const UNRANKED_RATIONALE =
  * and read live by the router on every call, so a consumer holding the same
  * reference could re-score a model between two identical `route` calls and get
  * two different answers. That would break two promises at once: `route` is
- * documented as pure, and decision #7 rests on the ranking being data that
+ * documented as pure, and routing rests on the ranking being data that
  * changes only in a diff someone can review. `Object.freeze` is what makes both
  * true at runtime. Freezing the array alone is not enough — a frozen array
  * still hands out mutable members — so each rule is frozen individually.

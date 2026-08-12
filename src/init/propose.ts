@@ -379,8 +379,8 @@ export function withDefaultModel(
  * instead of failing.
  *
  * It is one setting for the whole config rather than one per vendor, and that
- * is the substance of WO-010H rather than a simplification of it: what is being
- * consented to is a *routing behaviour*, and the router picks the best
+ * is the substance of the design rather than a simplification of it: what is
+ * being consented to is a *routing behaviour*, and the router picks the best
  * below-floor model on the machine without asking which vendor holds it. The
  * per-vendor `withQuotaFallback` this replaces recorded a model id as well, for
  * a substitution that per-model quota metering made the ordinary pipeline

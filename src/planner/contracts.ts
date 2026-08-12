@@ -17,7 +17,7 @@ export interface PlannerRequest {
   /**
    * The fan-out budget: the largest number of slices this plan may contain.
    *
-   * Decision #8 — fan-out is earned. This is 1 unless the user raised it with
+   * Fan-out is earned. This is 1 unless the user raised it with
    * `--max-workers`, and it is enforced deterministically after the model
    * answers rather than merely requested in the prompt.
    */
@@ -28,8 +28,8 @@ export interface PlannerRequest {
 /**
  * What a planning attempt produced.
  *
- * `needs-human` is a FIRST-CLASS OUTCOME, not an error arm. Decision #10 says
- * brigadier refuses to guess on a genuinely ambiguous task: it spawns nothing,
+ * `needs-human` is a FIRST-CLASS OUTCOME, not an error arm. Brigadier refuses
+ * to guess on a genuinely ambiguous task: it spawns nothing,
  * creates nothing, and hands back questions. A user holding questions has not
  * had a run fail, which is why this is a separate member from `failed` and why
  * the CLI gives it its own exit code.

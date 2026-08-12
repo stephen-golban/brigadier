@@ -917,7 +917,8 @@ describe("brigadier run: the task positional", () => {
   });
 
   /**
-   * DECISION #10, AND THE HALF OF IT THAT IS A PROMISE RATHER THAN A MESSAGE.
+   * THE REFUSAL TO GUESS, AND THE HALF OF IT THAT IS A PROMISE RATHER THAN A
+   * MESSAGE.
    *
    * The questions are the visible part. The invisible part — that brigadier
    * spawned nothing and created nothing — is the part a user cannot check and
