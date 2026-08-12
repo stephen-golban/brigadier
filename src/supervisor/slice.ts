@@ -106,7 +106,10 @@ import type {
 } from "./contracts.js";
 import { interruptMessage } from "./contracts.js";
 import { spawnWorker } from "./one-shot.js";
-import { createCrossVendorReviewer } from "./review.js";
+import {
+  createCrossVendorReviewer,
+  createDeterministicGateReviewer,
+} from "./review.js";
 import { buildWorkerSpec, type SpecBuildInput } from "./spec.js";
 import {
   ABORTED,
@@ -278,8 +281,12 @@ export class DefaultSliceRunner implements SliceRunner {
     this.#env = options.env;
     this.#route = options.route ?? defaultRoute;
     this.#review =
-      options.review ??
-      createCrossVendorReviewer({ ports: options.ports, env: options.env });
+      options.review === undefined
+        ? createCrossVendorReviewer({ ports: options.ports, env: options.env })
+        : createDeterministicGateReviewer(
+            { ports: options.ports },
+            options.review,
+          );
   }
 
   async run(input: SliceRunInput): Promise<SliceResult> {
@@ -814,13 +821,16 @@ export class DefaultSliceRunner implements SliceRunner {
       worktreePath: created.path,
       builder: routed,
       routing: input.routing,
+      ...(input.testCommand === undefined
+        ? {}
+        : { testCommand: input.testCommand }),
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
     this.#ports.log(
       redact(
         `slice ${sliceId} attempt ${attempt}: review ${describeVerdict(review)}`,
       ),
-      "normal",
+      review.verdict === "approved" ? "verbose" : "normal",
     );
     if (review.verdict === "rejected") {
       return {

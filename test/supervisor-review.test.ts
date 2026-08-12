@@ -10,6 +10,10 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { BrigadierConfig } from "../src/config/contracts.js";
 import { CONFIG_VERSION } from "../src/config/contracts.js";
 import type {
@@ -25,6 +29,7 @@ import type {
   WorkerSpec,
 } from "../src/contracts.js";
 import type { RoutedWorker, RoutingInput } from "../src/routing/contracts.js";
+import { shutdownProcessGroup } from "../src/shared/process.js";
 import type {
   SliceReview,
   SliceReviewRequest,
@@ -37,6 +42,7 @@ import {
   parseFindings,
 } from "../src/supervisor/review.js";
 import type { LaunchEnv } from "../src/supervisor/slice.js";
+import { DefaultSliceRunner } from "../src/supervisor/slice.js";
 import { buildClaudeCommand } from "../src/worker/claude.js";
 import { buildCodexCommand } from "../src/worker/codex.js";
 import type {
@@ -329,7 +335,7 @@ function fakeEngine(
 
 function plainDiff(patch: string): UncommittedDiff {
   return {
-    paths: patch === "" ? [] : ["src/auth.ts"],
+    paths: patch === "" ? [] : ["src/auth.ts", "test/auth.test.ts"],
     patch,
     truncated: false,
     totalCharacters: patch.length,
@@ -400,6 +406,51 @@ async function withBound<T>(work: Promise<T>, label: string): Promise<T> {
     if (timer !== undefined) {
       clearTimeout(timer);
     }
+  }
+}
+
+async function waitForFileContents(path: string): Promise<string> {
+  const deadline = performance.now() + SETTLE_BOUND_MS;
+  while (true) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      ) {
+        throw error;
+      }
+    }
+    if (performance.now() >= deadline) {
+      throw new Error(`creation of ${path} did not settle`);
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+}
+
+async function waitForProcessToExit(pid: number, label: string): Promise<void> {
+  const deadline = performance.now() + SETTLE_BOUND_MS;
+  while (isProcessAlive(pid)) {
+    if (performance.now() >= deadline) {
+      throw new Error(`${label} did not exit within ${SETTLE_BOUND_MS} ms`);
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -703,6 +754,7 @@ describe("parseFindings", () => {
       ),
     ).toEqual([
       {
+        source: "model",
         severity: "blocking",
         path: "a.ts",
         line: 3,
@@ -723,7 +775,13 @@ describe("parseFindings", () => {
       "```",
     ].join("\n");
     expect(parseFindings(reply)).toEqual([
-      { severity: "concern", path: "b.ts", line: 9, summary: "unclear" },
+      {
+        source: "model",
+        severity: "concern",
+        path: "b.ts",
+        line: 9,
+        summary: "unclear",
+      },
     ]);
   });
 
@@ -749,6 +807,7 @@ describe("parseFindings", () => {
       ),
     ).toEqual([
       {
+        source: "model",
         severity: "blocking",
         path: "a.ts",
         line: 1,
@@ -763,7 +822,13 @@ describe("parseFindings", () => {
         '{"findings":[{"severity":"concern","summary":"general"}]}',
       ),
     ).toEqual([
-      { severity: "concern", path: null, line: null, summary: "general" },
+      {
+        source: "model",
+        severity: "concern",
+        path: null,
+        line: null,
+        summary: "general",
+      },
     ]);
   });
 
@@ -797,7 +862,13 @@ describe("parseFindings", () => {
         '{"findings":[{"severity":" Blocking ","path":null,"line":null,"summary":" trimmed "}]}',
       ),
     ).toEqual([
-      { severity: "blocking", path: null, line: null, summary: "trimmed" },
+      {
+        source: "model",
+        severity: "blocking",
+        path: null,
+        line: null,
+        summary: "trimmed",
+      },
     ]);
   });
 
@@ -881,14 +952,489 @@ describe("createCrossVendorReviewer", () => {
 
     expect(verdict.verdict).toBe("rejected");
     expect(verdict.verdict === "rejected" ? verdict.findings : []).toEqual([
-      { severity: "concern", path: "a.ts", line: 1, summary: "unclear name" },
       {
+        source: "model",
+        severity: "concern",
+        path: "a.ts",
+        line: 1,
+        summary: "unclear name",
+      },
+      {
+        source: "model",
         severity: "blocking",
         path: "src/auth.ts",
         line: 42,
         summary: "the token is never verified",
       },
     ]);
+  });
+
+  test("a blocking deterministic gate rejects before launching the model reviewer", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine({
+      paths: ["src/auth.ts", "test/auth.test.ts", "outside.ts"],
+      patch: DEFAULT_PATCH,
+      truncated: false,
+      totalCharacters: DEFAULT_PATCH.length,
+    });
+
+    const { review: verdict } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      engine.engine,
+    );
+
+    expect(verdict.verdict).toBe("rejected");
+    expect(codex.specs).toEqual([]);
+    expect(verdict.reviewer).toEqual({
+      vendor: "deterministic",
+      model: "gates",
+      effort: null,
+    });
+    expect(
+      verdict.verdict === "rejected" ? verdict.findings : [],
+    ).toContainEqual({
+      source: "gate",
+      gate: "paths_owned",
+      severity: "blocking",
+      path: "outside.ts",
+      line: null,
+      summary:
+        'Path "outside.ts" is outside the slice\'s declared owned paths.',
+    });
+  });
+
+  test("a configured tests_pass executable that cannot start rejects the review", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+    const harness = makeHarness({ codex }, engine.engine);
+    const reviewer = createCrossVendorReviewer({
+      ports: harness.ports,
+      env: ENV,
+    });
+    const verdict = await reviewer.review({
+      ...requestFor(BOTH_VENDORS, CLAUDE_BUILDER),
+      testCommand: [join(tmpdir(), "brigadier-executable-that-does-not-exist")],
+    });
+
+    expect(verdict.verdict).toBe("rejected");
+    expect(codex.specs).toEqual([]);
+    expect(
+      verdict.gates?.find((gate) => gate.name === "tests_pass"),
+    ).toMatchObject({
+      name: "tests_pass",
+      severity: "blocking",
+      status: "failed",
+    });
+    expect(
+      verdict.verdict === "rejected" &&
+        verdict.findings.some(
+          (finding) =>
+            finding.source === "gate" &&
+            finding.gate === "tests_pass" &&
+            finding.severity === "blocking" &&
+            finding.summary.startsWith("The gate could not run:"),
+        ),
+    ).toBe(true);
+  });
+
+  test("verification mutations are diffed for containment and cannot reach commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-gate-mutation-"));
+    const outsidePath = join(root, "outside.ts");
+    let commits = 0;
+    const session = {
+      repositoryPath: root,
+      slug: "gate-mutation",
+      baseCommit: "0".repeat(40),
+      baseBranch: "brigadier/gate-mutation/base",
+      integrationBranch: "brigadier/gate-mutation/integration",
+    };
+    const engine: SupervisorPorts["engine"] = {
+      prepare: async () => session,
+      create: async () => ({
+        repositoryPath: root,
+        path: root,
+        branch: "brigadier/gate-mutation/slice-1",
+        isolated: true,
+        session,
+      }),
+      commit: async (spec) => {
+        commits += 1;
+        return { commit: "commit-that-must-not-exist", message: spec.message };
+      },
+      diffUncommitted: async () => ({
+        paths: existsSync(outsidePath)
+          ? ["src/auth.ts", "test/auth.test.ts", "outside.ts"]
+          : ["src/auth.ts", "test/auth.test.ts"],
+        patch: DEFAULT_PATCH,
+        truncated: false,
+        totalCharacters: DEFAULT_PATCH.length,
+      }),
+      merge: async () => {
+        throw new Error("the slice runner must not merge");
+      },
+      redact: (_worktree, artifact) => artifact,
+      remove: async () => undefined,
+      release: async () => undefined,
+    };
+    const claude = fakeAdapter("claude", { outcome: outcomeWith("done") });
+    const harness = makeHarness({ claude }, engine);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: () => ({ ok: true, routed: CLAUDE_BUILDER }),
+    });
+
+    try {
+      const result = await runner.run({
+        slice: SLICE,
+        directive: { sliceId: SLICE.id, difficulty: "standard" },
+        session,
+        attemptSlots: [{ sliceNumber: 1, worktreePath: root }],
+        routing: routingFor(CLAUDE_ONLY),
+        unsafeInPlace: false,
+        testCommand: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(outsidePath)}, "verification mutation");`,
+        ],
+      });
+
+      expect(existsSync(outsidePath)).toBe(true);
+      expect(result.ok).toBe(false);
+      expect(result.commit).toBe(null);
+      expect(result.attempts[0]?.review?.verdict).toBe("rejected");
+      expect(commits).toBe(0);
+      expect(
+        result.attempts[0]?.review?.findings?.some(
+          (finding) =>
+            finding.gate === "paths_owned" && finding.path === "outside.ts",
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("aborting a configured test gate terminates its child and reports the gate as skipped", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-gate-abort-"));
+    const readyPath = join(root, "gate.pid");
+    const controller = new AbortController();
+    let childPid: number | null = null;
+    try {
+      const codex = fakeAdapter("codex", {
+        outcome: outcomeWith('{"findings":[]}'),
+      });
+      const engine = fakeEngine(plainDiff(DEFAULT_PATCH), [SLICE.id]);
+      const harness = makeHarness({ codex }, engine.engine);
+      const reviewer = createCrossVendorReviewer({
+        ports: harness.ports,
+        env: ENV,
+      });
+      const baseRequest = requestFor(BOTH_VENDORS, CLAUDE_BUILDER);
+      const reviewPromise = reviewer.review({
+        ...baseRequest,
+        worktree: {
+          ...baseRequest.worktree,
+          path: root,
+        },
+        worktreePath: root,
+        testCommand: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        ],
+        signal: controller.signal,
+      });
+
+      childPid = Number(
+        await withBound(
+          waitForFileContents(readyPath),
+          "configured test gate startup",
+        ),
+      );
+      expect(Number.isInteger(childPid)).toBe(true);
+      expect(isProcessAlive(childPid)).toBe(true);
+
+      controller.abort();
+      const verdict = await withBound(
+        reviewPromise,
+        "aborted test gate review",
+      );
+      const testGate = verdict.gates?.find(
+        (gate) => gate.name === "tests_pass",
+      );
+      expect(verdict.verdict).toBe("skipped");
+      expect(verdict.verdict === "skipped" ? verdict.reason : null).toBe(
+        "CANCELLED",
+      );
+      expect(verdict.verdict === "skipped" ? verdict.message : "").toContain(
+        "[REDACTED]",
+      );
+      expect(
+        verdict.verdict === "skipped" ? verdict.cleanupFailure : undefined,
+      ).toBeUndefined();
+      expect(codex.specs).toEqual([]);
+      expect(testGate?.status).toBe("skipped");
+      expect(testGate?.status === "skipped" ? testGate.reason : null).toBe(
+        "The gate could not run: The gate command was aborted.",
+      );
+      expect(isProcessAlive(childPid)).toBe(false);
+    } finally {
+      controller.abort();
+      if (childPid !== null && isProcessAlive(childPid)) {
+        process.kill(childPid, "SIGKILL");
+      }
+      if (existsSync(root)) {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("a failed abort-time gate shutdown reports the surviving process without changing cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-gate-leak-"));
+    const readyPath = join(root, "gate.pid");
+    const controller = new AbortController();
+    const cleanupSecret = "private-shutdown-detail";
+    const shutdownPids: number[] = [];
+    let childPid: number | null = null;
+    try {
+      const codex = fakeAdapter("codex", {
+        outcome: outcomeWith('{"findings":[]}'),
+      });
+      const engine = fakeEngine(plainDiff(DEFAULT_PATCH), [
+        SLICE.id,
+        cleanupSecret,
+      ]);
+      const harness = makeHarness({ codex }, engine.engine);
+      const reviewer = createCrossVendorReviewer({
+        ports: harness.ports,
+        env: ENV,
+        shutdownGateProcessGroup: async (pid) => {
+          shutdownPids.push(pid);
+          // Kill the fixture for real, then deterministically exercise the
+          // supported rejection path without leaving a process behind in CI.
+          await shutdownProcessGroup(pid);
+          throw new Error(cleanupSecret);
+        },
+      });
+      const baseRequest = requestFor(BOTH_VENDORS, CLAUDE_BUILDER);
+      const reviewPromise = reviewer.review({
+        ...baseRequest,
+        worktree: { ...baseRequest.worktree, path: root },
+        worktreePath: root,
+        testCommand: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        ],
+        signal: controller.signal,
+      });
+
+      childPid = Number(
+        await withBound(
+          waitForFileContents(readyPath),
+          "configured leaking test gate startup",
+        ),
+      );
+      controller.abort();
+
+      const verdict = await withBound(
+        reviewPromise,
+        "test gate review with failed shutdown",
+      );
+      expect(verdict.verdict).toBe("skipped");
+      expect(verdict.verdict === "skipped" ? verdict.reason : null).toBe(
+        "CANCELLED",
+      );
+      expect(
+        verdict.verdict === "skipped" ? verdict.cleanupFailure : null,
+      ).toBe(
+        `slice [REDACTED] attempt 1: the configured tests_pass gate process group (pid ${childPid}) may still be running — [REDACTED]`,
+      );
+      expect(shutdownPids).toEqual([childPid]);
+      expect(codex.specs).toEqual([]);
+      expect(isProcessAlive(childPid)).toBe(false);
+    } finally {
+      controller.abort();
+      if (childPid !== null && isProcessAlive(childPid)) {
+        process.kill(childPid, "SIGKILL");
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an abort during a configured gate cancels the slice and never commits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-slice-gate-abort-"));
+    const readyPath = join(root, "gate.pid");
+    const controller = new AbortController();
+    let gatePid: number | null = null;
+    let commits = 0;
+    const session = {
+      repositoryPath: root,
+      slug: "gate-abort",
+      baseCommit: "0".repeat(40),
+      baseBranch: "brigadier/gate-abort/base",
+      integrationBranch: "brigadier/gate-abort/integration",
+    };
+    const engine: SupervisorPorts["engine"] = {
+      prepare: async () => session,
+      create: async (spec) => {
+        const path = spec.path ?? root;
+        await mkdir(path, { recursive: true });
+        return {
+          repositoryPath: root,
+          path,
+          branch: "brigadier/gate-abort/slice-1",
+          isolated: true,
+          session,
+        };
+      },
+      commit: async (spec) => {
+        commits += 1;
+        return { commit: "commit-that-must-not-exist", message: spec.message };
+      },
+      diffUncommitted: async () => plainDiff(DEFAULT_PATCH),
+      merge: async () => {
+        throw new Error("the slice runner must not merge");
+      },
+      redact: (_worktree, artifact) => artifact,
+      remove: async () => undefined,
+      release: async () => undefined,
+    };
+    const claude = fakeAdapter("claude", { outcome: outcomeWith("done") });
+    const harness = makeHarness({ claude }, engine);
+    const runner = new DefaultSliceRunner({
+      ports: harness.ports,
+      env: ENV,
+      route: () => ({ ok: true, routed: CLAUDE_BUILDER }),
+    });
+
+    try {
+      const resultPromise = runner.run({
+        slice: SLICE,
+        directive: { sliceId: SLICE.id, difficulty: "standard" },
+        session,
+        attemptSlots: [{ sliceNumber: 1, worktreePath: root }],
+        routing: routingFor(CLAUDE_ONLY),
+        unsafeInPlace: false,
+        testCommand: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        ],
+        signal: controller.signal,
+      });
+
+      gatePid = Number(
+        await withBound(
+          waitForFileContents(readyPath),
+          "slice test gate startup",
+        ),
+      );
+      expect(isProcessAlive(gatePid)).toBe(true);
+      controller.abort();
+
+      const result = await withBound(resultPromise, "cancelled slice");
+      expect(result.ok).toBe(false);
+      expect(result.cancelled).toBe(true);
+      expect(result.commit).toBe(null);
+      expect(result.attempts[0]?.review?.verdict).toBe("skipped");
+      expect(
+        result.attempts[0]?.review?.verdict === "skipped"
+          ? result.attempts[0].review.reason
+          : null,
+      ).toBe("CANCELLED");
+      expect(commits).toBe(0);
+      expect(isProcessAlive(gatePid)).toBe(false);
+    } finally {
+      controller.abort();
+      if (gatePid !== null && isProcessAlive(gatePid)) {
+        process.kill(gatePid, "SIGKILL");
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a successful test gate reaps background descendants without changing its verdict", async () => {
+    const root = await mkdtemp(join(tmpdir(), "brigadier-gate-descendant-"));
+    const readyPath = join(root, "descendant.pid");
+    let descendantPid: number | null = null;
+    try {
+      const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+      const harness = makeHarness({}, engine.engine);
+      const reviewer = createCrossVendorReviewer({
+        ports: harness.ports,
+        env: ENV,
+      });
+      const baseRequest = requestFor(CLAUDE_ONLY, CLAUDE_BUILDER);
+      const verdict = await withBound(
+        reviewer.review({
+          ...baseRequest,
+          worktree: { ...baseRequest.worktree, path: root },
+          worktreePath: root,
+          testCommand: [
+            process.execPath,
+            "-e",
+            `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, String(child.pid)); child.unref();`,
+          ],
+        }),
+        "successful test gate review",
+      );
+
+      descendantPid = Number(await waitForFileContents(readyPath));
+      expect(verdict.verdict).toBe("skipped");
+      expect(verdict.verdict === "skipped" ? verdict.reason : null).toBe(
+        "NO_OTHER_VENDOR",
+      );
+      expect(
+        verdict.gates?.find((gate) => gate.name === "tests_pass")?.status,
+      ).toBe("passed");
+      await waitForProcessToExit(descendantPid, "background gate descendant");
+      expect(isProcessAlive(descendantPid)).toBe(false);
+    } finally {
+      if (descendantPid !== null && isProcessAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a paths_touched concern alone still launches the model reviewer", async () => {
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine({
+      paths: ["src/auth.ts"],
+      patch: DEFAULT_PATCH,
+      truncated: false,
+      totalCharacters: DEFAULT_PATCH.length,
+    });
+
+    const { review: verdict } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      engine.engine,
+    );
+
+    expect(verdict.verdict).toBe("approved");
+    expect(codex.specs.length).toBe(1);
+    expect(
+      verdict.verdict === "approved" ? verdict.findings : [],
+    ).toContainEqual({
+      source: "gate",
+      gate: "paths_touched",
+      severity: "concern",
+      path: "test/auth.test.ts",
+      line: null,
+      summary: 'Owned path "test/auth.test.ts" was not changed.',
+    });
   });
 
   test("concerns alone approve the slice", async () => {
@@ -1034,7 +1580,15 @@ describe("createCrossVendorReviewer", () => {
     const codex = fakeAdapter("codex", {
       outcome: outcomeWith('{"findings":[]}'),
     });
-    const engine = fakeEngine(plainDiff(DEFAULT_PATCH), [secret]);
+    const engine = fakeEngine(
+      {
+        paths: [`src/${secret}.ts`],
+        patch: DEFAULT_PATCH,
+        truncated: false,
+        totalCharacters: DEFAULT_PATCH.length,
+      },
+      [secret],
+    );
     const harness = makeHarness({ codex }, engine.engine);
     const reviewer = createCrossVendorReviewer({
       ports: harness.ports,
@@ -1093,12 +1647,41 @@ describe("createCrossVendorReviewer", () => {
     expect(artifact).not.toContain(secret);
     expect(verdict.verdict === "rejected" ? verdict.findings : []).toEqual([
       {
+        source: "model",
         severity: "blocking",
         path: "config/[REDACTED].ts",
         line: 17,
         summary: "hard-coded [REDACTED]",
       },
     ]);
+  });
+
+  test("redacts gate-returned paths and summaries before SliceReview", async () => {
+    const secret = "sk-live-gate-815";
+    const codex = fakeAdapter("codex", {
+      outcome: outcomeWith('{"findings":[]}'),
+    });
+    const engine = fakeEngine(
+      {
+        paths: ["src/auth.ts", "test/auth.test.ts", `outside/${secret}.ts`],
+        patch: DEFAULT_PATCH,
+        truncated: false,
+        totalCharacters: DEFAULT_PATCH.length,
+      },
+      [secret],
+    );
+
+    const { review: verdict } = await review(
+      BOTH_VENDORS,
+      CLAUDE_BUILDER,
+      { codex },
+      engine.engine,
+    );
+
+    const artifact = JSON.stringify(verdict);
+    expect(artifact).not.toContain(secret);
+    expect(artifact).toContain("outside/[REDACTED].ts");
+    expect(codex.specs).toEqual([]);
   });
 
   test("the reviewer reads the builder's uncommitted worktree", async () => {
@@ -1195,24 +1778,30 @@ describe("createCrossVendorReviewer", () => {
     );
   });
 
-  test("an empty change is named as one rather than shown as an empty diff", async () => {
+  test("an empty change is rejected by diff_non_empty before model review", async () => {
     const codex = fakeAdapter("codex", {
       outcome: outcomeWith('{"findings":[]}'),
     });
 
-    await review(
+    const { review: verdict } = await review(
       BOTH_VENDORS,
       CLAUDE_BUILDER,
       { codex },
       fakeEngine(plainDiff("")).engine,
     );
 
-    expect(codex.specs[0]?.prompt ?? "").toContain(
-      [
-        "This task changed no file at all: the diff of its work is empty, so",
-        "there is nothing here that would be committed.",
-      ].join("\n"),
-    );
+    expect(verdict.verdict).toBe("rejected");
+    expect(codex.specs).toEqual([]);
+    expect(
+      verdict.verdict === "rejected" ? verdict.findings : [],
+    ).toContainEqual({
+      source: "gate",
+      gate: "diff_non_empty",
+      severity: "blocking",
+      path: "src/auth.ts",
+      line: null,
+      summary: "The slice produced no diff.",
+    });
   });
 
   test("a truncated diff is announced to the reviewer and on the run log", async () => {
@@ -1286,6 +1875,32 @@ describe("createCrossVendorReviewer", () => {
     // not turn every `--unsafe-in-place` run into an unreviewed commit — and
     // both the reviewer and the operator are told the review is the weaker one.
     expect(verdict.verdict).toBe("approved");
+    expect(verdict.gates?.slice(0, 3)).toEqual([
+      {
+        name: "paths_owned",
+        severity: "blocking",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: this run's worktree engine cannot produce one",
+        findings: [],
+      },
+      {
+        name: "paths_touched",
+        severity: "concern",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: this run's worktree engine cannot produce one",
+        findings: [],
+      },
+      {
+        name: "diff_non_empty",
+        severity: "blocking",
+        status: "skipped",
+        reason:
+          "The changed-path list is unavailable: this run's worktree engine cannot produce one",
+        findings: [],
+      },
+    ]);
     expect(harness.logs).toContain(
       "slice slice-auth attempt 1: no diff of the change is available (this run's worktree engine cannot produce one), so the reviewer is reading whole files instead",
     );
@@ -1327,10 +1942,7 @@ describe("createCrossVendorReviewer", () => {
     );
   });
 
-  test("no diff is computed for a slice the gate is going to skip", async () => {
-    // A single-vendor install spawns no reviewer, and computing a diff for a
-    // review that cannot happen would charge every slice of that install for a
-    // git staging pass nobody reads.
+  test("a single-vendor review still computes the diff for deterministic gates", async () => {
     const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
 
     const { review: verdict } = await review(
@@ -1341,6 +1953,33 @@ describe("createCrossVendorReviewer", () => {
     );
 
     expect(verdict.verdict).toBe("skipped");
-    expect(engine.specs).toEqual([]);
+    expect(engine.specs.length).toBe(1);
+  });
+
+  test("passing gates do not manufacture a review when no model can review", async () => {
+    // DETERMINISTIC PASS IS NOT CROSS-VENDOR REVIEW. A single-vendor install
+    // must remain visibly unreviewed rather than borrowing an approval from
+    // checks that cannot substitute for the missing second opinion.
+    const engine = fakeEngine(plainDiff(DEFAULT_PATCH));
+
+    const { review: verdict } = await review(
+      CLAUDE_ONLY,
+      CLAUDE_BUILDER,
+      {},
+      engine.engine,
+    );
+
+    expect(verdict.verdict).toBe("skipped");
+    expect(verdict.verdict === "skipped" ? verdict.reason : null).toBe(
+      "NO_OTHER_VENDOR",
+    );
+    expect(
+      verdict.gates?.map(({ name, status }) => ({ name, status })),
+    ).toEqual([
+      { name: "paths_owned", status: "passed" },
+      { name: "paths_touched", status: "passed" },
+      { name: "diff_non_empty", status: "passed" },
+      { name: "tests_pass", status: "skipped" },
+    ]);
   });
 });

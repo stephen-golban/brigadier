@@ -110,6 +110,7 @@ the shell ate. An empty or whitespace-only task description is refused too.
 | `--max-workers <n>` | slices to run at once (default `1`). For a task description this is also the largest number of slices the planner may propose |
 | `--slug <name>` | names this run's branches (default: derived from the plan id) |
 | `--dry-run` | route every slice and report it; create no worktree or ref, spawn no slice worker, write no commit |
+| `--verbose` | print the full per-attempt report and verbose progress log instead of the compact run summary |
 | `--unsafe-in-place` | run workers in this checkout instead of isolated worktrees; every file here becomes visible to every worker |
 | `-h`, `--help` | print the usage text and exit `0` |
 
@@ -238,12 +239,52 @@ output. A real run learns the limit from the worker and escalates.
 
 ## Reading a run
 
-The report is one line per slice, then one line per attempt beneath it, then the
-gate's verdict beneath that. Printing only the last attempt would hide the
-escalation, which is the single most interesting thing a run produces.
+By default the report is one compact line per slice. It still names interrupts,
+cleanup failures, a run failure, plan issues, retries, and skipped reviews; a
+skipped review is rendered as `not reviewed: <reason>`, never as a pass. A run
+that has a verification command prints it as argv, so a command that ran is
+visible in the output of the run that ran it; a dry run with no command says so
+instead.
 
-Running a two-slice plan for real produces the progress log first and the report
-last. Slice numbers and durations differ every run; every line's shape is
+Running a two-slice plan produces this. The duration, commits, and record name
+are illustrative; every line's shape is what the report renderer emits.
+
+```text
+run csv-export: 2 slices, 8m32s → brigadier/csv-export
+  verify command: ["bun","test"]
+  writer        ok  8f3c9a2  (retried once, approved by codex)
+  writer-tests  ok  1b77e05  (approved by codex)
+  full detail: /Users/you/.brigadier/runs/csv-export-<run-id>.json
+```
+
+- **A rejection is not the end of the slice.** The rejected model goes on an
+  exclusion list and the retry re-routes to a different one. Each slice gets
+  exactly one such escalation — two failures on two different models is evidence
+  the *slice* is wrong, not the model, and no third model fixes that.
+- **A skipped review says so, with its reason**, and never renders as a pass.
+- **Every completed non-dry run attempts to write a JSON record** under
+  `$BRIGADIER_HOME/runs/`, named `<slug>-<run-id>.json`. The `full detail:` line
+  gives its path on success. If redaction cannot be prepared or the write fails,
+  that line reports the failure and the run still succeeds; the work has already
+  landed. A dry run writes no record.
+- **Cleanup failures each get their own `cleanup failure:` line.** `--verbose`
+  groups them under a single `cleanup failures:` heading instead. Neither form
+  claims everything was tidy.
+
+### `--verbose`
+
+`--verbose` restores the full per-attempt report and the verbose progress log:
+one line per slice, then one line per attempt beneath it, then the gate's
+verdict beneath that. Printing only the last attempt would hide the escalation,
+which is the single most interesting thing a run produces. It is the only way to
+see rejected attempts, findings, concerns, reviewer models, and elapsed time in
+the terminal; the run record carries the same detail as JSON.
+
+`brigadier_run` over MCP always returns the compact report and has no verbose
+option. MCP output enters a host model's context window, so per-attempt detail
+would be a token cost on every run.
+
+Slice numbers and durations differ every run; every line's shape below is
 exactly what the logger and the report renderer emit.
 
 ```text
@@ -280,29 +321,31 @@ run csv-export: 2 slice(s) in 512300ms
     writer-tests: merged 6a2b881
 ```
 
-Things to notice, because each is a deliberate design decision:
+Things to notice in this form, because each is a deliberate design decision:
 
-- **A rejection is not the end of the slice.** The rejected model goes on an
-  exclusion list and the retry re-routes to a different one. Each slice gets
-  exactly one such escalation — two failures on two different models is evidence
-  the *slice* is wrong, not the model, and no third model fixes that.
 - **Concerns are printed under approvals.** They did not stop the commit, and
   they are the half of a review a human can still act on.
 - **When a reviewer runs, its model and elapsed time are shown.** They are the
   only evidence you have about how much reading actually happened. A
   `NO_OTHER_VENDOR` skip has no reviewer identity to show.
-- **A skipped review says so, with its reason**, and never renders as a pass.
+- **Every attempt is kept, not overwritten.** The rejected attempt above is the
+  evidence that justified the retry's escalation.
 
-A dry run prints the same attempt lines under a `dry run <slug>:` heading, with
-each routed slice reading `would run` and the integration branch reading
-`(none: a dry run writes no ref)`. A slice that failed to route during a dry run
-still reads `failed`, because a refusal is the answer you asked for and
-labelling it "would run" would report it as a plan.
+Under `--verbose` a dry run prints the same attempt lines under a
+`dry run <slug>:` heading, with each routed slice reading `would run` and the
+integration branch reading `(none: a dry run writes no ref)`. A slice that failed
+to route during a dry run still reads `failed`, because a refusal is the answer
+you asked for and labelling it "would run" would report it as a plan. The
+compact form of a dry run reads `dry run <slug>: N slices, … → (none)`, annotates
+each routed slice `not reviewed: dry run`, and states that the `tests_pass` gate
+will be skipped when the plan carries no `verify.command`.
 
-`interrupted:`, `cleanup failures:`, `plan issues:` and `run failed:` lines
-appear only when they have something to say. The clean interruption wording is a
-claim about cancellation, worktree removal and ref release all having succeeded,
-and it is printed only when they did.
+`interrupted:`, `plan issues:` and `run failed:` lines appear in both forms only
+when they have something to say, as do cleanup failures — grouped under
+`cleanup failures:` with `--verbose`, one `cleanup failure:` line each without
+it. The clean interruption wording is a claim about cancellation, worktree
+removal and ref release all having succeeded, and it is printed only when they
+did.
 
 ## Exit codes
 

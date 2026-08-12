@@ -6,6 +6,7 @@ import type { PlannerOutcome } from "../src/planner/index.ts";
 import { createModelPlanner } from "../src/planner/index.ts";
 import { planPrompt } from "../src/planner/planner.ts";
 import { parsePlannerReply } from "../src/planner/reply.ts";
+import { runGates } from "../src/supervisor/gates.ts";
 import {
   type OneShotRequest,
   type OneShotResult,
@@ -155,6 +156,23 @@ const DEPENDENT_PLAN = {
         difficulty: "standard",
       },
     ],
+  },
+};
+
+const VERIFIED_COMMAND = [
+  "bun",
+  "test",
+  "--filter",
+  "argument with spaces",
+] as const;
+
+const VERIFIED_PLAN = {
+  status: "plan",
+  plan: {
+    ...GOOD_PLAN.plan,
+    verify: {
+      command: VERIFIED_COMMAND,
+    },
   },
 };
 
@@ -423,6 +441,72 @@ describe("createModelPlanner", () => {
         ["consumer", ["src/consumer.ts"]],
       ]),
     });
+  });
+
+  test("refuses a model-authored verify command at the printable plan boundary", async () => {
+    const prompt = new ScriptedPrompt(replied(JSON.stringify(VERIFIED_PLAN)));
+    const outcome = await planWith(prompt);
+
+    if (outcome.kind !== "planned") {
+      throw new Error(`expected planned, got ${outcome.kind}`);
+    }
+    expect(outcome.document.verify?.command).toEqual(VERIFIED_COMMAND);
+
+    // The CLI executes the redacted, reparsed printable JSON rather than the
+    // planner's raw document. That boundary must remove process capability.
+    const printedPlan = JSON.parse(outcome.json);
+    expect(printedPlan).toEqual(GOOD_PLAN.plan);
+    const reparsed = parsePlanDocument(printedPlan);
+    expect(reparsed.verify).toBeUndefined();
+
+    const commands: unknown[] = [];
+    const gateRun = await runGates({
+      changedPaths: ["src/one.ts"],
+      ownedPaths: ["src/one.ts"],
+      worktreePath: "/repo/worktree",
+      ports: {
+        runCommand: (request) => {
+          commands.push(request);
+          return Promise.resolve({ exitCode: 0 });
+        },
+      },
+    });
+    expect(commands).toEqual([]);
+    expect(gateRun.gates.find((gate) => gate.name === "tests_pass")).toEqual({
+      name: "tests_pass",
+      severity: "blocking",
+      status: "skipped",
+      reason: "No test command was configured.",
+      findings: [],
+    });
+  });
+
+  test("honours the same verify command after a user supplies it as a plan file", async () => {
+    const document = parsePlanDocument(VERIFIED_PLAN.plan);
+    const command = document.verify?.command;
+    if (command === undefined) {
+      throw new Error("the user-authored plan lost verify.command");
+    }
+    const commands: unknown[] = [];
+    const gateRun = await runGates({
+      changedPaths: ["src/one.ts"],
+      ownedPaths: ["src/one.ts"],
+      worktreePath: "/repo/worktree",
+      testCommand: command,
+      ports: {
+        runCommand: (request) => {
+          commands.push(request);
+          return Promise.resolve({ exitCode: 0 });
+        },
+      },
+    });
+
+    expect(commands).toEqual([
+      { command: VERIFIED_COMMAND, cwd: "/repo/worktree" },
+    ]);
+    expect(
+      gateRun.gates.find((gate) => gate.name === "tests_pass")?.status,
+    ).toBe("passed");
   });
 
   test("passes a needs_human reply through as the first-class outcome", async () => {

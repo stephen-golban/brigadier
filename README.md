@@ -84,8 +84,8 @@ slice worker, and writing no commit. Every option and every exit code is in
   process group, attempts cleanup, and exits `130`; slices that already
   committed keep their commits and are still merged.
 - **Cleanup it could not finish is reported**, not assumed. A worker that will
-  not die or a worktree that will not go is named under `cleanup failures:`
-  rather than counted as tidy.
+  not die or a worktree that will not go is named on its own `cleanup failure:`
+  line rather than counted as tidy.
 - **Inventoried secret values are redacted** from commit messages, the diffs
   reviewers see, and reported paths. Redaction defeats verbatim leaks only, and
   planning runs before the inventory exists: **do not put a secret in a task
@@ -102,15 +102,21 @@ scope.
 
 The review fails open. **On a single-vendor install, nothing adversarially
 reviews anything.** A slice that otherwise succeeds commits unreviewed, with
-`review: not run (NO_OTHER_VENDOR)` on its line — and so does one whose
+`not reviewed: NO_OTHER_VENDOR` on its line — and so does one whose
 adapter is missing, whose reviewer failed on quota, auth or a crash, or whose
 reply could not be parsed. A skipped review always commits; cancellation is
 the exception, and fails the attempt instead. That is the most important
 caveat on this page for a new user. If you want the gate, install both CLIs.
 
-**The gate does not run your tests, your linter, or your build** — a slice can
-pass it and still be wrong. The full design is in
-[docs/REVIEW-GATE.md](docs/REVIEW-GATE.md).
+**The model reviewer does not run your tests, your linter, or your build.** If a
+plan supplies `verify.command`, the deterministic `tests_pass` gate runs it
+before model review and a non-zero exit rejects the attempt; a command that
+cannot be started is a blocking failure rather than a skip. brigadier never
+invents that command, so without one nothing is run and a slice can pass and
+still be wrong. `verify.command` executes a process under your own permissions
+and the grant follows the file passed to `--plan`, not whoever authored it —
+[docs/PLAN-FORMAT.md](docs/PLAN-FORMAT.md) states the rule in full. The full
+design is in [docs/REVIEW-GATE.md](docs/REVIEW-GATE.md).
 
 ## Why cross-vendor
 
@@ -141,7 +147,9 @@ ranking input.
 
 ## Limits worth knowing
 
-- **The gate does not run anything.** No tests, no linter, no build.
+- **The model reviewer does not run anything.** No tests, no linter, no build.
+  A plan's optional `verify.command` is the deterministic `tests_pass` gate;
+  brigadier does not invent one, so without it no command runs.
 - **A Claude worker cannot run commands.** `Bash` is withheld entirely; it gets
   `Read`, `Glob`, `Grep`, `Edit`, `Write` and nothing else.
 - **Slice worktrees have no `node_modules/`**, so dependency-backed verification

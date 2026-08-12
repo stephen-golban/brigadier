@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrigadierConfig } from "../src/config/index.ts";
@@ -519,6 +526,9 @@ function footprint(inputs: readonly SliceRunInput[]): unknown {
     session: input.session,
     attemptSlots: input.attemptSlots,
     unsafeInPlace: input.unsafeInPlace,
+    ...(input.testCommand === undefined
+      ? {}
+      : { testCommand: input.testCommand }),
     config: input.routing.config,
     capabilities: input.routing.capabilities,
   }));
@@ -549,7 +559,14 @@ describe("brigadier run: the plan source", () => {
 
       expect(fromFile.code).toBe(0);
       expect(fromStdin.code).toBe(0);
-      expect(fromFile.stdout).toBe(fromStdin.stdout);
+      const normalizeRunId = (stdout: string): string =>
+        stdout.replace(
+          /demo-plan-[0-9a-f-]{36}\.json/g,
+          "demo-plan-<run-id>.json",
+        );
+      expect(normalizeRunId(fromFile.stdout)).toBe(
+        normalizeRunId(fromStdin.stdout),
+      );
 
       // The whole request, observed where it lands: the session spec carries
       // `repositoryPath` and `slug`, and each `SliceRunInput` carries the parsed
@@ -583,6 +600,35 @@ describe("brigadier run: the plan source", () => {
       ]);
       expect(inputs[1]?.attemptSlots.map((slot) => slot.sliceNumber)).toEqual([
         3, 4,
+      ]);
+    });
+  });
+
+  test("parses verify.command from the plan and forwards the original argv to every slice", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const command = [
+        "bun",
+        "test",
+        "--filter",
+        "argument with spaces",
+      ] as const;
+      await writeFile(
+        plan,
+        `${JSON.stringify({ ...PLAN, verify: { command } }, null, 2)}\n`,
+      );
+
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+      });
+
+      expect(result.code).toBe(0);
+      const inputs = result.runner?.inputs ?? [];
+      expect(inputs).toHaveLength(2);
+      expect(inputs.map((input) => input.testCommand)).toEqual([
+        command,
+        command,
       ]);
     });
   });
@@ -794,6 +840,9 @@ describe("brigadier run: options", () => {
         expect(result.stdout).toContain(
           "--plan <file>    the plan JSON to run",
         );
+        expect(result.stdout).toContain(
+          "--verbose        print the full per-attempt report",
+        );
       }
     });
   });
@@ -901,6 +950,32 @@ describe("brigadier run: the task positional", () => {
     });
   });
 
+  test("a model-authored verify command is not forwarded to slice execution", async () => {
+    await withScratchHome(async ({ scratchHome, cwd }) => {
+      const command = [process.execPath, "-e", "process.exit(0)"] as const;
+      const plan = { ...PLAN, verify: { command } };
+      const planner = new RecordingPlanner({
+        kind: "planned",
+        document: parsePlanDocument(plan),
+        json: JSON.stringify(plan, null, 2),
+        planner: { vendor: "claude", model: "claude-opus-5", effort: "high" },
+      });
+      const result = await invoke({
+        argv: ["run", "fix the parser"],
+        cwd,
+        scratchHome,
+        planner,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('"verify"');
+      expect(result.runner?.inputs.map((input) => input.testCommand)).toEqual([
+        undefined,
+        undefined,
+      ]);
+    });
+  });
+
   test("--max-workers raises the planner's fan-out budget", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
       const planner = new RecordingPlanner(plannedOutcome());
@@ -997,7 +1072,10 @@ describe("brigadier run: the task positional", () => {
         "\nplanned by claude/claude-opus-5 at high effort:\n",
       );
       expect(result.stdout).toContain(
-        "\ndry run demo-plan: 2 slice(s) in 0ms\n",
+        "\ndry run demo-plan: 2 slices, 0s → (none)\n",
+      );
+      expect(result.stdout).toContain(
+        "  no verify command; the tests_pass gate will be skipped\n",
       );
       expect(result.engine.prepared).toEqual([]);
       expect(result.engine.created).toEqual([]);
@@ -1269,7 +1347,7 @@ describe("brigadier run: --dry-run", () => {
     await withScratchHome(async ({ scratchHome, cwd, plan }) => {
       const runner = new RecordingSliceRunner(succeed);
       const result = await invoke({
-        argv: ["run", "--plan", plan, "--dry-run"],
+        argv: ["run", "--plan", plan, "--dry-run", "--verbose"],
         cwd,
         scratchHome,
         runner,
@@ -1293,6 +1371,9 @@ describe("brigadier run: --dry-run", () => {
         "\ndry run demo-plan: 2 slice(s) in 0ms\n",
       );
       expect(result.stdout).toContain(
+        "  no verify command; the tests_pass gate will be skipped\n",
+      );
+      expect(result.stdout).toContain(
         "  s1  would run\n      attempt 1  claude/claude-opus-5 effort=high  routed\n",
       );
       expect(result.stdout).toContain(
@@ -1302,6 +1383,37 @@ describe("brigadier run: --dry-run", () => {
         "  integration branch: (none: a dry run writes no ref)\n",
       );
       expect(result.stdout).toContain("  merges: (none)\n");
+      expect(result.stdout).not.toContain("full detail:");
+      expect(await readdir(scratchHome)).toEqual(["config.json"]);
+    });
+  });
+
+  test("prints the verification argv as a list in quiet and verbose output", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const command = ["bun", "test", "--filter", "argument with spaces"];
+      await writeFile(
+        plan,
+        `${JSON.stringify({ ...PLAN, verify: { command } }, null, 2)}\n`,
+      );
+
+      const quiet = await invoke({
+        argv: ["run", "--plan", plan, "--dry-run"],
+        cwd,
+        scratchHome,
+      });
+      const verbose = await invoke({
+        argv: ["run", "--plan", plan, "--dry-run", "--verbose"],
+        cwd,
+        scratchHome,
+      });
+
+      const rendered = `  verify command: ${JSON.stringify(command)}\n`;
+      expect(quiet.code).toBe(0);
+      expect(verbose.code).toBe(0);
+      expect(quiet.stdout).toContain(rendered);
+      expect(verbose.stdout).toContain(rendered);
+      expect(quiet.stdout).not.toContain(command.join(" "));
+      expect(verbose.stdout).not.toContain(command.join(" "));
     });
   });
 
@@ -1336,7 +1448,7 @@ describe("brigadier run: --dry-run", () => {
       );
 
       const result = await invoke({
-        argv: ["run", "--plan", hardOnly, "--dry-run"],
+        argv: ["run", "--plan", hardOnly, "--dry-run", "--verbose"],
         cwd,
         scratchHome,
         config: weakOnly,
@@ -1364,7 +1476,7 @@ describe("brigadier run: exit codes", () => {
   test("exits 0 and reports every merge on a successful run", async () => {
     await withScratchHome(async ({ scratchHome, cwd, plan }) => {
       const result = await invoke({
-        argv: ["run", "--plan", plan],
+        argv: ["run", "--plan", plan, "--verbose"],
         cwd,
         scratchHome,
       });
@@ -1392,7 +1504,7 @@ describe("brigadier run: exit codes", () => {
         input.slice.id === "s1" ? succeed(input) : failWorker(input),
       );
       const result = await invoke({
-        argv: ["run", "--plan", plan],
+        argv: ["run", "--plan", plan, "--verbose"],
         cwd,
         scratchHome,
         runner,
@@ -1408,6 +1520,137 @@ describe("brigadier run: exit codes", () => {
       // The half that worked is still merged and still reported.
       expect(result.stdout).toContain(
         "  merges:\n    s1: merged merged-brigadier/demo-plan/slice-1\n",
+      );
+    });
+  });
+
+  test("distinguishes deterministic gate findings in the verbose review", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const runner = new RecordingSliceRunner((input) => {
+        const review = {
+          verdict: "rejected" as const,
+          reviewer: {
+            vendor: "deterministic" as const,
+            model: "gates",
+            effort: null,
+          },
+          findings: [
+            {
+              source: "gate" as const,
+              gate: "paths_owned" as const,
+              severity: "blocking" as const,
+              path: "src/hard.ts",
+              line: null,
+              summary: "changed outside the slice's ownership",
+            },
+            {
+              source: "model" as const,
+              severity: "concern" as const,
+              path: "src/model.ts",
+              line: 17,
+              summary: "model opinion",
+            },
+          ],
+          durationMs: 4,
+        };
+        return Promise.resolve({
+          sliceId: input.slice.id,
+          ok: false,
+          branch: null,
+          commit: null,
+          worktree: null,
+          attempts: [
+            {
+              attempt: 1,
+              routed: {
+                vendor: "claude",
+                model: "claude-opus-5",
+                effort: "high",
+                rationale: ["fixture"],
+                waivedDifficultyFloor: false,
+              },
+              outcome: null,
+              commit: null,
+              review,
+              failure: {
+                kind: "REVIEW_REJECTED",
+                message: "deterministic gate rejected the change",
+                review,
+              },
+              durationMs: 4,
+            },
+          ],
+        });
+      });
+      const result = await invoke({
+        argv: ["run", "--plan", plan, "--verbose"],
+        cwd,
+        scratchHome,
+        runner,
+      });
+
+      expect(result.code).toBe(3);
+      expect(result.stdout).toContain(
+        "        review: rejected by deterministic/gates in 4ms\n",
+      );
+      expect(result.stdout).not.toContain("effort=null");
+      expect(result.stdout).toContain(
+        "          blocking [paths_owned] src/hard.ts: changed outside the slice's ownership\n",
+      );
+      expect(result.stdout).toContain(
+        "          concern src/model.ts:17: model opinion\n",
+      );
+    });
+  });
+
+  test("defaults to the quiet report and writes its full detail record", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "\nrun demo-plan: 2 slices, 0s → brigadier/demo-plan/integration\n",
+      );
+      expect(result.stdout).toContain(
+        "  s1  ok  commit-s1  (approved by codex)\n",
+      );
+      expect(result.stdout).not.toContain(
+        "slice s1 attempt 1: routed to claude/claude-opus-5 at high effort",
+      );
+      expect(result.stdout).not.toContain("      attempt 1  ");
+
+      const detail = result.stdout.match(/ {2}full detail: (.+\.json)\n$/);
+      expect(detail).not.toBeNull();
+      const path = detail?.[1] ?? "";
+      const record = JSON.parse(await readFile(path, "utf8")) as {
+        readonly version: number;
+        readonly runId: string;
+        readonly report: { readonly slug: string };
+      };
+      expect(record.version).toBe(1);
+      expect(record.runId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+      expect(record.report.slug).toBe("demo-plan");
+      expect(await readdir(join(scratchHome, "runs"))).toHaveLength(1);
+    });
+  });
+
+  test("a run-record write failure stays visible without changing the exit code", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      await writeFile(join(scratchHome, "runs"), "not a directory");
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout.match(/full detail: unavailable/g)?.length).toBe(1);
+      expect(result.stdout).toContain(
+        "full detail: unavailable (could not write run record:",
       );
     });
   });
@@ -1652,7 +1895,7 @@ test("the configured executable reaches the real spawn", async () => {
 
     // `runner: null` keeps the REAL slice runner, so the spawn is real too.
     const result = await invoke({
-      argv: ["run", "--plan", hardOnly],
+      argv: ["run", "--plan", hardOnly, "--verbose"],
       cwd,
       scratchHome,
       config,
@@ -1661,6 +1904,9 @@ test("the configured executable reaches the real spawn", async () => {
 
     expect(result.code).toBe(3);
     expect(result.stdout).toContain(configuredClaude);
+    expect(result.stdout).toContain(
+      "slice s1 attempt 1: routed to claude/claude-opus-5 at high effort",
+    );
     expect(result.stdout).toContain(
       "  s1  failed  WORKER_FAILED\n      attempt 1  claude/claude-opus-5 effort=high  WORKER_FAILED: slice s1 attempt 1: claude/claude-opus-5 failed with LAUNCH_FAILURE:",
     );
@@ -1673,6 +1919,18 @@ test("the configured executable reaches the real spawn", async () => {
     // The failed attempt's worktree was removed, and nothing was committed.
     expect(result.engine.removed).toHaveLength(1);
     expect(result.engine.committed).toEqual([]);
+
+    const quiet = await invoke({
+      argv: ["run", "--plan", hardOnly],
+      cwd,
+      scratchHome,
+      config,
+      runner: null,
+    });
+    expect(quiet.code).toBe(3);
+    expect(quiet.stdout).not.toContain(
+      "slice s1 attempt 1: routed to claude/claude-opus-5 at high effort",
+    );
   });
 }, 30_000);
 
@@ -1991,9 +2249,7 @@ describe("brigadier run: the cleanup lines of the report", () => {
       .filter(
         (line) =>
           line.startsWith("  interrupted:") ||
-          line.startsWith("  cleanup failures:") ||
-          line.startsWith("    cleanup ") ||
-          line.startsWith("    release "),
+          line.startsWith("  cleanup failure:"),
       );
 
   test("an interrupt whose cleanup succeeded says so and says nothing else", async () => {
@@ -2040,9 +2296,8 @@ describe("brigadier run: the cleanup lines of the report", () => {
       expect(result.code).toBe(130);
       expect(cleanupLines(result.stdout)).toEqual([
         "  interrupted: cleanup did not finish; a worker may still be running and a worktree may still exist — see cleanup failures below",
-        "  cleanup failures:",
-        "    cleanup s1: worktree is busy",
-        "    release demo-plan: a worktree is still active",
+        "  cleanup failure: cleanup s1: worktree is busy",
+        "  cleanup failure: release demo-plan: a worktree is still active",
       ]);
     });
   });
@@ -2062,8 +2317,7 @@ describe("brigadier run: the cleanup lines of the report", () => {
       // not turn an uninterrupted run into an interrupted one either.
       expect(result.code).toBe(0);
       expect(cleanupLines(result.stdout)).toEqual([
-        "  cleanup failures:",
-        "    release demo-plan: a worktree is still active",
+        "  cleanup failure: release demo-plan: a worktree is still active",
       ]);
     });
   });

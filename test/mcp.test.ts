@@ -26,7 +26,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import packageJson from "../package.json";
@@ -976,8 +976,8 @@ describe("the MCP server over stdio", () => {
         type: response.result.content[0].type,
         isError: response.result.isError,
         text: response.result.content[0].text.replace(
-          /in \d+ms/,
-          "in <duration>ms",
+          /dry run add-retry: 2 slices, \S+ →/,
+          "dry run add-retry: 2 slices, <duration> →",
         ),
       }).toEqual({
         jsonrpc: "2.0",
@@ -985,15 +985,14 @@ describe("the MCP server over stdio", () => {
         type: "text",
         isError: false,
         text: [
-          "dry run add-retry: 2 slice(s) in <duration>ms",
-          "  retry-core  would run",
-          "      attempt 1  claude/claude-opus-5 effort=high  routed",
-          "  retry-docs  would run",
-          "      attempt 1  claude/claude-opus-5 effort=medium  routed",
-          "  integration branch: (none)",
+          "dry run add-retry: 2 slices, <duration> → (none)",
+          "  no verify command; the tests_pass gate will be skipped",
+          "  retry-core  would run  (none)  (not reviewed: dry run)",
+          "  retry-docs  would run  (none)  (not reviewed: dry run)",
           "  log: run add-retry: 2 slice(s) in 1 wave(s)",
         ].join("\n"),
       });
+      expect(await readdir(home)).not.toContain("runs");
       expect(session.stderr).toBe("");
       expect(session.exitCode).toBe(0);
     } finally {

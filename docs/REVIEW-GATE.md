@@ -138,8 +138,31 @@ to be read as *re-slice this*, not as *the models failed*.
   At best it appears as a non-blocking concern.
 - **Nothing outside the diff and its surrounding files is examined.** This gate
   reviews the change; it does not audit the codebase.
-- **It does not run your tests, your linter, or your build.** A slice can pass
-  it and still be wrong.
+- **The model reviewer does not run your tests, your linter, or your build.** If
+  a plan document passed as a file to `brigadier run --plan <file>` supplies
+  `verify.command`, the deterministic `tests_pass` gate runs it before model
+  review and a non-zero exit rejects the attempt. Without such a command the
+  gate runs nothing and is reported as skipped. A slice can still be wrong.
+- **A verify command that cannot be started is a blocking failure, not a skip.**
+  A skip means brigadier decided the gate did not apply — for `tests_pass`, that
+  the plan configured no command at all. Once a command is configured the gate is
+  required to run, so a command that cannot even be spawned (a misspelled
+  executable, one that is not on `PATH`, one that is not executable) is recorded
+  as `status: "failed"` with a blocking finding reading
+  `The gate could not run: <error>`, and the attempt is rejected exactly as a
+  non-zero exit would be. **A typo in `verify.command` therefore rejects every
+  slice in the plan**, twice each, until both attempts are spent. It is loud on
+  purpose: the alternative is a gate that silently verifies nothing while the
+  report says the run was reviewed. Read a run where every slice failed
+  `tests_pass` with `could not run` as a broken command, not as broken code.
+- **The gate is not a sandbox for the verify command.** `tests_pass` spawns that
+  argv in the slice's worktree with your permissions. The in-process planner's
+  own output cannot carry one — a `verify.command` it proposes is discarded —
+  but the grant is keyed on the plan arriving via `--plan <file>`, not on who
+  authored the file. **An agent that writes the plan file and composes the argv
+  is granting itself command execution**, which is precisely the workflow the
+  bundled skills describe. Every run that has a verification command prints it
+  as argv in its report.
 
 ## The adjudication rule
 
@@ -167,8 +190,9 @@ Each of these is a real limit, not a hypothetical.
   a full re-route.
 - **A clean slice from a reviewer that did not look.** `{"findings":[]}` from a
   model that read the whole diff and `{"findings":[]}` from one that skimmed it
-  are byte-identical. There is no proof-of-work check. The report prints the
-  reviewer's model and elapsed time precisely so a human can form their own view.
+  are byte-identical. There is no proof-of-work check. The verbose report and
+  full run record print the reviewer's model and elapsed time precisely so a
+  human can form their own view.
 - **Correctness from taste.** The prompt forbids style findings; nothing
   enforces it. A reviewer that marks a naming preference blocking fails the
   slice.
@@ -215,21 +239,27 @@ have nothing to do with the user's code.
 
 **The price, stated plainly: on a single-vendor install, nothing adversarially
 reviews anything.** A slice that otherwise succeeds commits with
-`review: not run (NO_OTHER_VENDOR)` on its line.
+`not reviewed: NO_OTHER_VENDOR` on its compact-report line. `--verbose` uses the
+full per-attempt form, where the same state appears as
+`review: not run (NO_OTHER_VENDOR)`.
 
 The obligation that comes with failing open is that a skipped gate must be
 impossible to mistake for a passing one. That is why the verdict has three arms
 rather than being a boolean, why the report prints the gate's outcome on
 successful slices too, and why a skip always prints its reason.
 
-## A cost that remains
+## A cost that no longer remains
 
-The gate runs before the commit step can discover that the worker changed
-nothing, so a slice heading for `NO_CHANGES` still pays for one reviewer run.
-The reviewer is told the change is empty rather than being handed a diff that
-does not exist.
+The gate now checks the changed-path list before model review. A slice heading
+for `NO_CHANGES` receives a blocking `diff_non_empty` finding and no model
+reviewer is launched. This resolves the former cost of asking a reviewer to
+assess a change that does not exist.
 
 ## Reading the verdict in a report
+
+The default compact report keeps the gate outcome on each slice line, but not
+the per-attempt findings. The detailed form below is printed by `brigadier run
+--verbose`.
 
 ```text
       attempt 1  codex/gpt-5.6-terra effort=high  REVIEW_REJECTED: …
@@ -240,14 +270,15 @@ does not exist.
           concern src/csv.ts:12: writeCsv allocates the whole table before writing
 ```
 
-A skip looks like this, and is never rendered as an approval:
+A skip in that verbose form looks like this, and is never rendered as an
+approval:
 
 ```text
         review: not run (NO_OTHER_VENDOR) — slice writer was built by claude and no other vendor is configured, so no cross-vendor review was possible
 ```
 
-Silence under an attempt means the attempt never reached the gate — routing
-failed, the worktree failed, or the worker itself did.
+Silence under an attempt in the verbose report means the attempt never reached
+the gate — routing failed, the worktree failed, or the worker itself did.
 
 The `path` and `line` on a finding are the **reviewer's claim**, not brigadier's
 measurement. Nothing here verifies that the file exists or that the line number

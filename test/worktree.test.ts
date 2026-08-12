@@ -12,6 +12,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { writeRunRecordDetail } from "../src/report/render.ts";
+import type { RunReport } from "../src/supervisor/contracts.ts";
 import { createSecretRedactor, redactText } from "../src/worktree/engine.ts";
 import {
   type CreatedWorktree,
@@ -656,6 +658,51 @@ describe("GitWorktreeEngine", () => {
   );
 
   test(
+    "adds a live session's inventory to the current file rather than replacing it",
+    async () => {
+      await withFixture(async (fixture) => {
+        // Run A prepares while `.env` still holds SECRET. Its cumulative
+        // inventory — and, once the file moves on, nothing else — knows it.
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "inventory-union",
+        );
+
+        // The user then writes a NEW value. No session inventory anywhere has
+        // ever seen this one; it exists only in the file, which is exactly
+        // where an exception raised right now would have read it from.
+        const currentValue = "sk_live_written_after_prepare";
+        await writeFile(join(fixture.repository, ".env"), `${currentValue}\n`);
+
+        // Run B fails before its own `prepare()`, so it has no token and takes
+        // the tokenless lookup — which still matches run A's registration on
+        // repository path and linked paths alone.
+        const redact = await createSecretRedactor({
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+
+        // BOTH HALVES, because covering either one alone is the defect. A
+        // session-only redactor misses the value in the file now; a file-only
+        // redactor misses the value the session watched rotate away.
+        expect(redact(`git failed reading ${currentValue}`)).toBe(
+          "git failed reading [REDACTED]",
+        );
+        expect(redact(`git failed reading ${SECRET}`)).toBe(
+          "git failed reading [REDACTED]",
+        );
+        expect(redact(`old=${SECRET} new=${currentValue}`)).toBe(
+          "old=[REDACTED] new=[REDACTED]",
+        );
+
+        await fixture.engine.release(session);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     "keeps session-free multiline redaction work countable and bounded",
     async () => {
       await withFixture(async ({ repository }) => {
@@ -680,6 +727,449 @@ describe("GitWorktreeEngine", () => {
           redact("unique-line\n!not-a-prefix\n".repeat(1_000)),
         ).toThrow("redaction exceeded 16 scan operations");
         expect(operations).toBe(17);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "keeps a rotated worker secret out of the record after removal and release",
+    async () => {
+      await withFixture(async (fixture) => {
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "rotated-record-secret",
+        );
+        const worktree = await createWorktree(fixture, session, 1);
+        const report: RunReport = {
+          ok: true,
+          slug: session.slug,
+          dryRun: false,
+          interrupted: false,
+          cleanupFailures: [],
+          integrationBranch: session.integrationBranch,
+          slices: [
+            {
+              sliceId: "worker",
+              ok: true,
+              branch: worktree.branch,
+              commit: "fixture-commit",
+              worktree,
+              attempts: [
+                {
+                  attempt: 1,
+                  routed: null,
+                  outcome: {
+                    ok: true,
+                    output: `worker emitted ${SECRET}`,
+                    usage: {
+                      input: {
+                        total: 0,
+                        uncached: 0,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                      },
+                      output: { total: 0, reasoning: null },
+                    },
+                    durationMs: 1,
+                    exitCode: 0,
+                    signal: null,
+                  },
+                  commit: "fixture-commit",
+                  failure: null,
+                  review: null,
+                  durationMs: 1,
+                },
+              ],
+            },
+          ],
+          merges: [],
+          planIssues: [],
+          failure: null,
+          ...(session.recordToken === undefined
+            ? {}
+            : { sessionToken: session.recordToken }),
+          durationMs: 1,
+        };
+
+        // The worker output above has already captured the old value. Rotate
+        // the linked file before the terminal cleanup and durable write.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_JSON_SECRET}\n`,
+        );
+        await fixture.engine.remove(worktree);
+        fixture.worktrees.splice(fixture.worktrees.indexOf(worktree), 1);
+        await fixture.engine.release(session);
+
+        const failureRedactor = await createSecretRedactor({
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+        expect(failureRedactor(`failure=${SECRET}`)).toBe("failure=[REDACTED]");
+
+        const scratchHome = join(fixture.root, "record-home");
+        await mkdir(scratchHome);
+        const detail = await writeRunRecordDetail(report, {
+          environment: { BRIGADIER_HOME: scratchHome },
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+        expect(detail).toMatch(/^ {2}full detail: .+\.json$/);
+        const recordPath = detail?.slice("  full detail: ".length) ?? "";
+        const contents = await readFile(recordPath, "utf8");
+        expect(contents).not.toContain(SECRET);
+        expect(contents).toContain("worker emitted [REDACTED]");
+        expect(contents).not.toContain(
+          "[OMITTED: cumulative linked-secret redaction unavailable]",
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "elides a rotated worker secret when no session inventory is reachable",
+    async () => {
+      await withFixture(async (fixture) => {
+        // No `prepare()` at all: this is the shape of a run whose session is
+        // gone — an engine that mints no token, a process that lost its
+        // registration, a report crossing a boundary. The linked file has since
+        // rotated, so a redactor built from current files cannot cover the value
+        // the worker actually emitted, and the record must elide rather than
+        // print it.
+        const report: RunReport = {
+          ok: false,
+          slug: "unreachable-inventory",
+          dryRun: false,
+          interrupted: false,
+          cleanupFailures: [],
+          integrationBranch: null,
+          slices: [
+            {
+              sliceId: "worker",
+              ok: false,
+              branch: null,
+              commit: null,
+              worktree: null,
+              attempts: [
+                {
+                  attempt: 1,
+                  routed: null,
+                  outcome: {
+                    ok: false,
+                    output: `worker stdout ${ROTATED_JSON_SECRET}`,
+                    usage: {
+                      input: {
+                        total: 0,
+                        uncached: 0,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                      },
+                      output: { total: 0, reasoning: null },
+                    },
+                    durationMs: 1,
+                    exitCode: 1,
+                    signal: null,
+                    failure: {
+                      kind: "UNKNOWN_FAILURE",
+                      message: `worker stderr ${ROTATED_JSON_SECRET}`,
+                      retryable: false,
+                      statusCode: null,
+                    },
+                  },
+                  commit: null,
+                  failure: {
+                    kind: "WORKER_FAILED",
+                    message: `slice worker attempt 1 failed with UNKNOWN_FAILURE: worker stderr ${ROTATED_JSON_SECRET}`,
+                    failure: {
+                      kind: "UNKNOWN_FAILURE",
+                      message: `worker stderr ${ROTATED_JSON_SECRET}`,
+                      retryable: false,
+                      statusCode: null,
+                    },
+                  },
+                  review: null,
+                  durationMs: 1,
+                },
+              ],
+            },
+          ],
+          merges: [],
+          planIssues: [],
+          failure: {
+            reason: "SLICE_FAILED",
+            message: "slice worker failed",
+          },
+          durationMs: 1,
+        };
+
+        // Rotate AFTER the worker "emitted" the value: the current inventory
+        // now holds a different secret entirely.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_YAML_SECRET}\n`,
+        );
+
+        const scratchHome = join(fixture.root, "elide-home");
+        await mkdir(scratchHome);
+        const detail = await writeRunRecordDetail(report, {
+          environment: { BRIGADIER_HOME: scratchHome },
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+        expect(detail).toMatch(/^ {2}full detail: .+\.json$/);
+        const contents = await readFile(
+          detail?.slice("  full detail: ".length) ?? "",
+          "utf8",
+        );
+
+        expect(contents).not.toContain(ROTATED_JSON_SECRET);
+        expect(contents).toContain(
+          "[OMITTED: cumulative linked-secret redaction unavailable]",
+        );
+        // The current inventory still applies to everything that is kept.
+        expect(contents).not.toContain(ROTATED_YAML_SECRET);
+        console.log(
+          `elide-decision proof: rotated worker value absent = ${!contents.includes(ROTATED_JSON_SECRET)}; omission marker present = ${contents.includes("[OMITTED: cumulative linked-secret redaction unavailable]")}`,
+        );
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "elides a rotated value carried by a failure on an attempt with no outcome",
+    async () => {
+      await withFixture(async (fixture) => {
+        // THE ATTEMPT NEVER PRODUCED AN OUTCOME. `runSlice` reports a worktree
+        // refusal as `outcome: null` with a `WORKTREE_FAILED` failure whose
+        // message interpolates git's stderr, so an elide decision that asks
+        // only about `outcome` reads this attempt as carrying no worker text
+        // and writes the interpolated value straight into the record.
+        const report: RunReport = {
+          ok: false,
+          slug: "outcomeless-failure",
+          dryRun: false,
+          interrupted: false,
+          cleanupFailures: [],
+          integrationBranch: null,
+          slices: [
+            {
+              sliceId: "worker",
+              ok: false,
+              branch: null,
+              commit: null,
+              worktree: null,
+              attempts: [
+                {
+                  attempt: 1,
+                  routed: null,
+                  outcome: null,
+                  commit: null,
+                  failure: {
+                    kind: "WORKTREE_FAILED",
+                    message: `slice worker could not take a worktree: git checkout failed (128): fatal: ${ROTATED_JSON_SECRET}`,
+                  },
+                  review: null,
+                  durationMs: 1,
+                },
+              ],
+            },
+          ],
+          merges: [],
+          planIssues: [],
+          failure: {
+            reason: "SLICE_FAILED",
+            message: "slice worker failed",
+          },
+          durationMs: 1,
+        };
+
+        // Rotate AFTER the message captured the old value, so the tokenless
+        // redactor built below cannot cover it. Only the elide decision can.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_YAML_SECRET}\n`,
+        );
+
+        const scratchHome = join(fixture.root, "outcomeless-home");
+        await mkdir(scratchHome);
+        const detail = await writeRunRecordDetail(report, {
+          environment: { BRIGADIER_HOME: scratchHome },
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+        expect(detail).toMatch(/^ {2}full detail: .+\.json$/);
+        const contents = await readFile(
+          detail?.slice("  full detail: ".length) ?? "",
+          "utf8",
+        );
+
+        expect(contents).not.toContain(ROTATED_JSON_SECRET);
+        expect(contents).toContain(
+          "[OMITTED: cumulative linked-secret redaction unavailable]",
+        );
+        expect(contents).not.toContain(ROTATED_YAML_SECRET);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "hands a session's cumulative inventory out by token, once, and to nobody else",
+    async () => {
+      await withFixture(async (fixture) => {
+        // The registry reached through `createSecretRedactor` is the mechanism
+        // — there is no engine method that hands an inventory out — so these
+        // are the three answers the mechanism must give.
+        const session = await prepare(
+          fixture.engine,
+          fixture.repository,
+          "inventory-seam",
+        );
+        const token = session.recordToken ?? "";
+        expect(token).toMatch(/^[0-9a-f-]{36}$/);
+        await fixture.engine.release(session);
+
+        // Rotate: only the session's cumulative inventory still covers SECRET.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_JSON_SECRET}\n`,
+        );
+
+        const redact = await createSecretRedactor({
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+          sessionToken: token,
+        });
+        expect(redact(`retained=${SECRET}`)).toBe("retained=[REDACTED]");
+
+        // Consumed by the first read: a second durable write for the same run
+        // has no inventory left and must fail closed rather than reuse one.
+        await expect(
+          createSecretRedactor({
+            repositoryPath: fixture.repository,
+            linkedSecretPaths: [".env"],
+            sessionToken: token,
+          }),
+        ).rejects.toThrow("session redaction inventory is unavailable");
+
+        // A token no session minted is not a near miss; it is unavailable.
+        await expect(
+          createSecretRedactor({
+            repositoryPath: fixture.repository,
+            linkedSecretPaths: [".env"],
+            sessionToken: "00000000-0000-4000-8000-000000000000",
+          }),
+        ).rejects.toThrow("session redaction inventory is unavailable");
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "refuses a previous run's inventory for a later run with the same slug",
+    async () => {
+      await withFixture(async (fixture) => {
+        // RUN A. Prepared and released, and its durable record never written —
+        // so its terminal registration is still sitting in the module registry
+        // under the slug both runs share.
+        const slug = "repeated-plan-id";
+        const sessionA = await prepare(
+          fixture.engine,
+          fixture.repository,
+          slug,
+        );
+        await fixture.engine.release(sessionA);
+        expect(sessionA.recordToken).toMatch(/^[0-9a-f-]{36}$/);
+
+        // RUN B's era: the linked value has rotated since run A inventoried it,
+        // and run B's worker emits the CURRENT value.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_JSON_SECRET}\n`,
+        );
+        const report: RunReport = {
+          ok: false,
+          // Same slug, same repository, same linked paths as run A — every
+          // field the old lookup keyed on. Run B never reached `prepare()`, so
+          // it carries no session token, and no session is its own.
+          slug,
+          dryRun: false,
+          interrupted: false,
+          cleanupFailures: [],
+          integrationBranch: null,
+          slices: [
+            {
+              sliceId: "worker",
+              ok: false,
+              branch: null,
+              commit: null,
+              worktree: null,
+              attempts: [
+                {
+                  attempt: 1,
+                  routed: null,
+                  outcome: {
+                    ok: true,
+                    output: `run B worker emitted ${ROTATED_JSON_SECRET}`,
+                    usage: {
+                      input: {
+                        total: 0,
+                        uncached: 0,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                      },
+                      output: { total: 0, reasoning: null },
+                    },
+                    durationMs: 1,
+                    exitCode: 0,
+                    signal: null,
+                  },
+                  commit: null,
+                  failure: { kind: "NO_CHANGES", message: "no changes" },
+                  review: null,
+                  durationMs: 1,
+                },
+              ],
+            },
+          ],
+          merges: [],
+          planIssues: [],
+          failure: { reason: "SLICE_FAILED", message: "slice worker failed" },
+          durationMs: 1,
+        };
+
+        // Rotate once more before the record is written, so NEITHER run A's
+        // inventory nor the current files contain run B's value. Only the
+        // elide can keep it out.
+        await writeFile(
+          join(fixture.repository, ".env"),
+          `${ROTATED_YAML_SECRET}\n`,
+        );
+
+        const scratchHome = join(fixture.root, "identity-home");
+        await mkdir(scratchHome);
+        const detail = await writeRunRecordDetail(report, {
+          environment: { BRIGADIER_HOME: scratchHome },
+          repositoryPath: fixture.repository,
+          linkedSecretPaths: [".env"],
+        });
+        expect(detail).toMatch(/^ {2}full detail: .+\.json$/);
+        const contents = await readFile(
+          detail?.slice("  full detail: ".length) ?? "",
+          "utf8",
+        );
+
+        expect(contents).not.toContain(ROTATED_JSON_SECRET);
+        expect(contents).toContain(
+          "[OMITTED: cumulative linked-secret redaction unavailable]",
+        );
+        console.log(
+          `session-identity proof: run A token = ${sessionA.recordToken}; run B carried none; run B value absent = ${!contents.includes(ROTATED_JSON_SECRET)}`,
+        );
       });
     },
     TEST_TIMEOUT_MS,

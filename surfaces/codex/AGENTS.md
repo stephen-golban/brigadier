@@ -34,8 +34,8 @@ and judgement; a worker session is disposable and starts clean.
    ```
 
 3. **Dry-run first:** `brigadier run --plan plan.json --dry-run` routes every
-   slice and prints which vendor, model, and effort would take it, creating no
-   worktree and spawning nothing.
+   slice and reports it, creating no worktree and spawning nothing. Add
+   `--verbose` to see which vendor, model, and effort would take each slice.
 4. **Run it:** `brigadier run --plan plan.json --max-workers 3`. Each slice gets
    its own worktree and branch; what lands is merged onto one integration branch.
 5. **Review the diffs yourself.** A worker's report is a claim, not evidence.

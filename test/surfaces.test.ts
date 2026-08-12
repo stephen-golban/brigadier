@@ -57,8 +57,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
-    bytes: 3993,
+    sha256: "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
+    bytes: 4052,
   },
   "claude-code/hooks/README.md": {
     sha256: "a8dc71a0a1efdcb504fa5448793695f45f6f7a0b8b85a9d8e827be8230773090",
@@ -81,8 +81,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 1597,
   },
   "codex/AGENTS.md": {
-    sha256: "eb9d52fe05e048b5d2a9124604b014959f4d8078aed501fc02c56fa841999a91",
-    bytes: 3127,
+    sha256: "25a4de39ff6fa3de58ae846ba581787a8e029682da7df0c39c861ac3ed93b2d8",
+    bytes: 3163,
   },
   "codex/hooks/README.md": {
     sha256: "dd26bd349600df8baca4642406e6ce3a75a4a2ccc48f303a383d8b65fe6473fa",
@@ -93,8 +93,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 5445,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
-    bytes: 3993,
+    sha256: "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
+    bytes: 4052,
   },
   "opencode/README.md": {
     sha256: "53feacbb72b7f667b7e280d815058e2753bf72f48e6f849fce54aa2604f1ed92",
@@ -364,7 +364,7 @@ describe("the surface templates", () => {
           "\n3. **Dry-run",
         ),
       ).toBe(
-        "   `id`, `title`, `prompt`, `ownedPaths` and `difficulty` are required on every\n   slice. `difficulty` is one of `routine`, `standard`, `hard`, and it has no\n   default: a plan that does not say how hard a slice is has not been planned.\n   `dependsOn` is optional and names prerequisite slice ids. brigadier runs\n   dependency waves in order and reconciles each non-final wave before creating\n   the next wave's worktrees, so dependent slices start from their prerequisites'\n   committed output. Unknown ids, self-dependencies, and cycles are refused.\n   `requires` is optional and takes `imageInput`, `webSearch`,\n   `structuredOutput`, and `minContextWindowTokens`.",
+        "   `id`, `title`, `prompt`, `ownedPaths` and `difficulty` are required on every\n   slice. `difficulty` is one of `routine`, `standard`, `hard`, and it has no\n   default: a plan that does not say how hard a slice is has not been planned.\n   `dependsOn` is optional and names prerequisite slice ids. brigadier runs\n   dependency waves in order and reconciles each non-final wave before creating\n   the next wave's worktrees, so dependent slices start from their prerequisites'\n   committed output. Unknown ids, self-dependencies, and cycles are refused.\n   `requires` is optional and takes `imageInput`, `webSearch`,\n   `structuredOutput`, `commandExecution`, and `minContextWindowTokens`.",
       );
       expect(
         textBetween(doctrine, "- Do not invent commands.", "\n\n## Before"),
@@ -627,7 +627,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
+        "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -654,7 +654,7 @@ describe("brigadier install", () => {
         `${skill}/hooks/hooks.json`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "25df026066bab9db3eb2c4072f37bfaf6200b6f3b3e141520d4559ae32c39baa",
+        "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
       );
     } finally {
       await rm(home, { recursive: true, force: true });

@@ -35,12 +35,14 @@ import type { InputStream, OutputStream } from "../init/prompt.js";
 // reader is transport plumbing, not prompt API, and there is exactly one correct
 // implementation of "split an async chunk stream into lines" in this repository.
 import { LineReader } from "../init/prompt.js";
-import type { RunReport, SliceResult } from "../supervisor/contracts.js";
+import {
+  renderQuietRunReport,
+  writeRunRecordDetail,
+} from "../report/render.js";
 import { interruptExitCode } from "../supervisor/contracts.js";
 import { createRunner } from "../supervisor/orchestrator.js";
 import { requireLaunchEnv } from "../supervisor/slice.js";
 import { ABORTED, raceAbort, settle } from "../supervisor/support.js";
-import type { MergeResult } from "../worktree/contracts.js";
 import { createDispatcher } from "./protocol.js";
 import type { LoadedConfig, McpRunRequest, ToolDependencies } from "./tools.js";
 import { createTools } from "./tools.js";
@@ -160,8 +162,10 @@ export function createRealDependencies(
         config,
         env: launchEnv,
         // NOT stdout. See the header: stdout is the protocol.
-        log: (line: string) => {
-          log.push(line);
+        log: (line: string, level = "normal") => {
+          if (level === "normal") {
+            log.push(line);
+          }
         },
       });
       try {
@@ -174,7 +178,18 @@ export function createRealDependencies(
           unsafeInPlace: request.unsafeInPlace,
           ...(control.signal === undefined ? {} : { signal: control.signal }),
         });
-        return { text: renderReport(report, log), isError: !report.ok };
+        const detailLine = await writeRunRecordDetail(report, {
+          environment: env,
+          repositoryPath: request.repositoryPath,
+          linkedSecretPaths: config.linkedSecretPaths,
+        });
+        // The CLI has already emitted these normal-level lines to its stream.
+        // MCP has nowhere else for them to go, so the shared renderer appends
+        // them to the tool result while the verbose progress stays discarded.
+        return {
+          text: renderQuietRunReport(report, { detailLine, log }),
+          isError: !report.ok,
+        };
       } finally {
         // A long-lived MCP server that leaked one oracle per run would hold a
         // vendor subprocess for the life of the client.
@@ -184,88 +199,6 @@ export function createRealDependencies(
       }
     },
   };
-}
-
-/**
- * The run report, as text a model can act on.
- *
- * One line per slice and one per attempt beneath it, for the reason the CLI
- * renders it that way: a slice that failed on one model and succeeded on a
- * stronger one is the most interesting outcome a run produces, and it is
- * invisible from the verdict alone. The captured log follows, because on this
- * transport there was nowhere else for it to go.
- */
-function renderReport(report: RunReport, log: readonly string[]): string {
-  const lines: string[] = [
-    `${report.dryRun ? "dry run" : "run"} ${report.slug}: ${report.slices.length} slice(s) in ${report.durationMs}ms`,
-  ];
-  if (report.interrupted) {
-    lines.push(
-      report.cleanupFailures.length === 0
-        ? "  interrupted: workers were cancelled and worktrees removed"
-        : "  interrupted: cleanup did not finish; a worker may still be running and a worktree may still exist",
-    );
-  }
-  for (const failure of report.cleanupFailures) {
-    lines.push(`  cleanup failure: ${failure}`);
-  }
-  for (const slice of report.slices) {
-    lines.push(`  ${slice.sliceId}  ${describeVerdict(report, slice)}`);
-    for (const attempt of slice.attempts) {
-      const who =
-        attempt.routed === null
-          ? "unrouted"
-          : `${attempt.routed.vendor}/${attempt.routed.model} effort=${attempt.routed.effort}`;
-      const what =
-        attempt.failure !== null
-          ? `${attempt.failure.kind}: ${attempt.failure.message}`
-          : attempt.commit === null
-            ? "routed"
-            : `ok ${attempt.commit}`;
-      lines.push(`      attempt ${attempt.attempt}  ${who}  ${what}`);
-    }
-  }
-  lines.push(`  integration branch: ${report.integrationBranch ?? "(none)"}`);
-  for (const merge of report.merges) {
-    lines.push(`  merge ${merge.sliceId}: ${describeMerge(merge.result)}`);
-  }
-  for (const issue of report.planIssues) {
-    lines.push(`  plan issue ${issue.code}: ${issue.message}`);
-  }
-  if (report.failure !== null) {
-    lines.push(
-      `  run failed: ${report.failure.reason} — ${report.failure.message}`,
-    );
-  }
-  for (const line of log) {
-    lines.push(`  log: ${line}`);
-  }
-  return lines.join("\n");
-}
-
-function describeVerdict(report: RunReport, slice: SliceResult): string {
-  if (slice.ok) {
-    return `ok  ${slice.branch}  ${slice.commit}`;
-  }
-  if (slice.cancelled === true) {
-    return slice.attempts.length === 0
-      ? "cancelled  (never started)"
-      : "cancelled";
-  }
-  const kind = slice.attempts.at(-1)?.failure?.kind;
-  if (kind !== undefined) {
-    return `failed  ${kind}`;
-  }
-  if (slice.attempts.length === 0) {
-    return "failed  (not attempted)";
-  }
-  return report.dryRun ? "would run" : "not run  (the run stopped first)";
-}
-
-function describeMerge(result: MergeResult): string {
-  return result.status === "conflicted"
-    ? `conflicted — ${result.details}`
-    : `${result.status} ${result.commit}`;
 }
 
 export type { ToolDefinition, ToolResult } from "./protocol.js";

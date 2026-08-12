@@ -158,19 +158,29 @@ export interface SliceDirective {
 }
 
 /**
- * A validated plan document: the shared `Plan` plus its side-channel directives.
+ * A validated plan document: the shared `Plan`, its side-channel directives,
+ * and the optional document-wide verification command.
  *
  * "Validated" here means *shaped*, not *schedulable*. This type asserts that
- * every field exists with the right type and that a directive accompanies every
- * slice. It asserts nothing about path conflicts, dependency cycles, or other
- * structural defects — those are `validatePlan`'s job, and the orchestrator
- * runs it separately so its `PlanIssue[]` reaches the report intact. Dependency
- * wave width is scheduling input; the supervisor's bounded pool limits how many
+ * every field exists with the right type, that a directive accompanies every
+ * slice, and that verification is an argv tuple rather than shell text. It
+ * asserts nothing about path conflicts, dependency cycles, or other structural
+ * defects — those are `validatePlan`'s job, and the orchestrator runs it
+ * separately so its `PlanIssue[]` reaches the report intact. Dependency wave
+ * width is scheduling input; the supervisor's bounded pool limits how many
  * members run concurrently.
  */
 export interface PlanDocument {
   readonly plan: Plan;
   readonly directives: readonly SliceDirective[];
+  /**
+   * One repository-owned verification command, shared by every slice attempt.
+   * It is argv rather than shell text so the plan cannot acquire interpolation,
+   * splitting, or any other shell semantics on its way to the gate runner.
+   */
+  readonly verify?: {
+    readonly command: readonly [executable: string, ...arguments_: string[]];
+  };
 }
 
 /**
@@ -184,6 +194,14 @@ export interface PlanDocument {
  */
 export interface RunRequest {
   readonly document: PlanDocument;
+  /**
+   * Explicit capability grant for `document.verify.command`.
+   *
+   * The CLI sets this only for a user-supplied `--plan` document. Model-authored
+   * plans and callers that omit the provenance fail closed: their command data
+   * may still be displayed or saved, but the supervisor will never execute it.
+   */
+  readonly verifyCommandAuthorized?: boolean;
   readonly repositoryPath: string;
   readonly slug: string;
   readonly maxWorkers: number;
@@ -267,6 +285,13 @@ export interface SupervisorPorts {
  */
 export type ReviewSeverity = "blocking" | "concern";
 
+/** The deterministic check that produced a gate finding or report entry. */
+export type DeterministicGateName =
+  | "paths_owned"
+  | "paths_touched"
+  | "diff_non_empty"
+  | "tests_pass";
+
 /**
  * One thing a reviewer says is wrong.
  *
@@ -277,17 +302,43 @@ export type ReviewSeverity = "blocking" | "concern";
  * it would be worse than rendering none.
  */
 export interface ReviewFinding {
+  /** A measured gate result and a model's opinion must never render alike. */
+  readonly source: "gate" | "model";
+  /** Present only for deterministic findings, naming the exact check. */
+  readonly gate?: DeterministicGateName;
   readonly severity: ReviewSeverity;
   readonly path: string | null;
   readonly line: number | null;
   readonly summary: string;
 }
 
-/** Which model formed the opinion. Always a different vendor than the builder. */
+/**
+ * One deterministic gate's outcome as it enters the review record.
+ *
+ * `skipped` is a separate state because missing diff metadata or a missing test
+ * command is absence of evidence, never evidence that the check passed.
+ */
+export type DeterministicGateResult =
+  | {
+      readonly name: DeterministicGateName;
+      readonly severity: ReviewSeverity;
+      readonly status: "passed" | "failed";
+      readonly findings: readonly ReviewFinding[];
+    }
+  | {
+      readonly name: DeterministicGateName;
+      readonly severity: ReviewSeverity;
+      readonly status: "skipped";
+      readonly reason: string;
+      readonly findings: readonly [];
+    };
+
+/** Which reviewer formed the verdict: another model, or deterministic gates. */
 export interface ReviewerIdentity {
-  readonly vendor: Vendor;
+  /** `deterministic` names a rejection reached before any model was launched. */
+  readonly vendor: Vendor | "deterministic";
   readonly model: string;
-  readonly effort: Effort;
+  readonly effort: Effort | null;
 }
 
 /**
@@ -331,6 +382,8 @@ export interface RejectedSliceReview {
    * makes a blocking finding believable or obviously wrong.
    */
   readonly findings: readonly ReviewFinding[];
+  /** Present for the production review path; optional for injected test seams. */
+  readonly gates?: readonly DeterministicGateResult[];
   readonly durationMs: number;
 }
 
@@ -355,6 +408,8 @@ export type SliceReview =
        * of a clean review.
        */
       readonly findings: readonly ReviewFinding[];
+      /** Present for the production review path; optional for injected seams. */
+      readonly gates?: readonly DeterministicGateResult[];
       readonly durationMs: number;
     }
   | RejectedSliceReview
@@ -364,6 +419,13 @@ export type SliceReview =
       readonly reviewer: ReviewerIdentity | null;
       readonly reason: ReviewSkipReason;
       readonly message: string;
+      /**
+       * Non-blocking deterministic findings survive even though no model
+       * formed a verdict. Their presence must not turn this arm into approval.
+       */
+      readonly findings?: readonly ReviewFinding[];
+      /** Present for the production review path; optional for injected seams. */
+      readonly gates?: readonly DeterministicGateResult[];
       /**
        * Present when cancelling the review did not confirm that its worker
        * exited. Carried separately so the run cannot claim cleanup succeeded
@@ -390,6 +452,11 @@ export interface SliceReviewRequest {
   /** The model whose work is being reviewed; the reviewer is never this one. */
   readonly builder: RoutedWorker;
   readonly routing: RoutingInput;
+  /**
+   * The project verification command, when the plan document declares one.
+   * Optional until that document field is wired by the composition root.
+   */
+  readonly testCommand?: readonly [executable: string, ...arguments_: string[]];
   readonly signal?: AbortSignal;
 }
 
@@ -433,9 +500,9 @@ export type SliceFailureKind =
  *
  * WHAT "FAILED" MEANS HERE, EXACTLY. A slice fails when it could not be routed,
  * when its worktree could not be created, when its worker returned a failed
- * `WorkerOutcome`, when a cross-vendor reviewer found a blocking defect in what
- * the worker produced, when the worker changed no files, or when the commit did
- * not land. That is the complete list.
+ * `WorkerOutcome`, when a deterministic check or cross-vendor reviewer found a
+ * blocking defect in what the worker produced, when the worker changed no
+ * files, or when the commit did not land. That is the complete list.
  *
  * `REVIEW_REJECTED` IS THE CROSS-VENDOR REVIEW GATE, AND UNTIL IT
  * EXISTED THE ESCALATION HERE WAS DRIVEN ONLY BY WORKERS THAT DID NOT FINISH.
@@ -445,10 +512,12 @@ export type SliceFailureKind =
  * re-routes it — with the failing model on `excluded` — to a different one.
  *
  * WHAT THE GATE STILL DOES NOT DO, so `ATTEMPT_LIMIT`'s meaning stays honest:
- * it does not run the repository's tests, its linter, or its build. The verdict
- * is one model's reading of the code, not a green suite, and `review.ts` states
- * at length what that verdict can and cannot distinguish. A slice can pass this
- * gate and still be wrong.
+ * it does not invent a repository test, lint, or build command. When the plan
+ * supplies one verification command the deterministic layer runs it; otherwise
+ * `tests_pass` is explicitly skipped. The model verdict remains one model's
+ * reading of the code, not a green suite, and `review.ts` states at length what
+ * that verdict can and cannot distinguish. A slice can pass this gate and still
+ * be wrong.
  *
  * IT ALSO FAILS OPEN. A reviewer that could not be chosen, could not be
  * launched, or answered unreadably yields `verdict: "skipped"` and the slice
@@ -799,6 +868,11 @@ export interface RunReport {
   readonly slug: string;
   readonly dryRun: boolean;
   /**
+   * The plan's verification argv, retained so a dry-run renderer can disclose
+   * exactly what would execute without rejoining it into shell-shaped text.
+   */
+  readonly testCommand?: readonly [executable: string, ...arguments_: string[]];
+  /**
    * Whether this run's `RunRequest.signal` had been aborted by the time the
    * report was built.
    *
@@ -836,6 +910,24 @@ export interface RunReport {
     readonly reason: RunFailureReason;
     readonly message: string;
   } | null;
+  /**
+   * `WorktreeSession.recordToken` for the session this run prepared, and the
+   * only handle a later caller has on this run's cumulative secret inventory.
+   *
+   * ABSENT MEANS "NO SESSION OF THIS RUN'S IS REACHABLE", which is the truth on
+   * every report built before `prepare()` succeeded and on every report an
+   * engine without `recordToken` support produced. It is never a neutral
+   * default: the durable-record writer reads its absence as "fail closed" and
+   * elides every worker-derived string rather than redacting it against files
+   * that may have been rotated since the worker ran.
+   *
+   * IT IS THE TOKEN AND NOT THE SLUG BECAUSE THE SLUG IS NOT AN IDENTITY. A
+   * long-lived MCP server runs the same plan id repeatedly; a slug lookup can
+   * match a previous run's leftover registration, and writing run B's worker
+   * output through run A's inventory is exactly the leak the elide exists to
+   * prevent.
+   */
+  readonly sessionToken?: string;
   readonly durationMs: number;
 }
 
@@ -893,6 +985,11 @@ export interface SliceRunInput {
     | readonly [AttemptSlot, AttemptSlot];
   readonly routing: RoutingInput;
   readonly unsafeInPlace: boolean;
+  /**
+   * Forwarded to the deterministic `tests_pass` gate. The orchestrator leaves
+   * it absent until the plan's optional verification command is available.
+   */
+  readonly testCommand?: readonly [executable: string, ...arguments_: string[]];
   /**
    * The run's abort signal, forwarded unchanged.
    *
