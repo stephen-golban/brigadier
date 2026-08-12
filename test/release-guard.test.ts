@@ -18,7 +18,13 @@ const workflowPath = join(
   "workflows",
   "release.yml",
 );
+const notarizeScriptPath = join(repositoryRoot, "scripts", "notarize.sh");
 const GUARD_STEP_NAME = "Verify tag matches package version";
+const AD_HOC_CONTROL_STEP_NAME =
+  "Prove notarization requirement rejects ad-hoc binary";
+const NOTARIZED_BINARY_GATE_STEP_NAME =
+  "Verify release binary is Developer ID signed and notarized";
+const ASSEMBLY_STEP_NAME = "Assemble release archive and platform npm package";
 
 /**
  * The guard's whole output is one line of a few dozen bytes, so this is three
@@ -45,6 +51,97 @@ const guardStepScript = extractStepRun(
   readFileSync(workflowPath, "utf8"),
   GUARD_STEP_NAME,
 );
+
+// This is a static text-order assertion. Execution order cannot be recovered
+// from static text; the real execution-order guarantee is
+// `codesign --verify -R "=notarized"` against a genuinely built artifact.
+test("the notarization script text places disk-image signing and verification before submission", () => {
+  const script = readFileSync(notarizeScriptPath, "utf8");
+  const signDmg = `codesign --sign "\${DEVELOPER_ID_IDENTITY}" --timestamp "\${NOTARIZED_DMG_PATH}"`;
+  const verifyDmg = `codesign --verify --strict --verbose=2 "\${NOTARIZED_DMG_PATH}"`;
+  const submitDmg = `xcrun notarytool submit "\${NOTARIZED_DMG_PATH}"`;
+
+  const signIndex = script.indexOf(signDmg);
+  const verifyIndex = script.indexOf(verifyDmg);
+  const submitIndex = script.indexOf(submitDmg);
+
+  expect(signIndex).toBeGreaterThan(-1);
+  expect(verifyIndex).toBeGreaterThan(signIndex);
+  expect(submitIndex).toBeGreaterThan(verifyIndex);
+});
+
+test("the notarization script copies the signed payload binary back after signing", () => {
+  const script = readFileSync(notarizeScriptPath, "utf8");
+  const signBinary = `--sign "\${DEVELOPER_ID_IDENTITY}" \\`;
+  const copyBack = `cp "\${payload_directory}/brigadier" "\${ARTIFACT_PATH}"`;
+
+  const signIndex = script.indexOf(signBinary);
+  const copyBackIndex = script.indexOf(copyBack);
+
+  // Keep both presence checks unconditional: indexOf returns -1 for a missing
+  // target, and guarding either assertion with `if (index >= 0)` would fail open.
+  expect(signIndex).toBeGreaterThan(-1);
+  expect(copyBackIndex).toBeGreaterThan(signIndex);
+});
+
+// Note for a future maintainer: the workflow tests below pin each new runtime
+// check's exact `run:` text, but never assert its `if:` condition or the
+// ad-hoc sign → rejection check → notarization → positive gate ordering.
+// Setting both checks to `if: false` would leave all four notarization tests
+// green while the runtime checks are skipped. Deleting the ad-hoc-sign step
+// would leave them green without guaranteeing that the negative control's input
+// was deliberately ad-hoc signed.
+// The conditions are correct as shipped, so this was adjudicated non-blocking
+// for `v0.1.1`. Closing the gap means asserting the `if:` conditions and the
+// ad-hoc sign → rejection check → notarization → positive gate ordering.
+test("the release workflow proves the notarization requirement rejects the ad-hoc binary", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const stepIndex = workflow.indexOf(`- name: ${AD_HOC_CONTROL_STEP_NAME}`);
+
+  // Missing targets must fail, never skip the assertion behind a conditional.
+  expect(stepIndex).toBeGreaterThan(-1);
+  expect(extractStepRun(workflow, AD_HOC_CONTROL_STEP_NAME)).toBe(
+    [
+      `codesign --verify --strict "\${GITHUB_WORKSPACE}/release-bin/brigadier"`,
+      `if codesign --verify -R "=notarized" "\${GITHUB_WORKSPACE}/release-bin/brigadier"; then`,
+      '  echo "The freshly ad-hoc-signed binary unexpectedly satisfied the notarization requirement" >&2',
+      "  exit 1",
+      "fi",
+    ].join("\n"),
+  );
+});
+
+test("the release workflow gates assembly on the notarized release binary", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const notarizeIndex = workflow.indexOf(
+    "- name: Developer ID sign and notarize",
+  );
+  const gateIndex = workflow.indexOf(
+    `- name: ${NOTARIZED_BINARY_GATE_STEP_NAME}`,
+  );
+  const assemblyIndex = workflow.indexOf(`- name: ${ASSEMBLY_STEP_NAME}`);
+
+  // These separate presence checks are load-bearing: -1 must never participate
+  // in an ordering comparison that could make an absent step look correctly placed.
+  expect(notarizeIndex).toBeGreaterThan(-1);
+  expect(gateIndex).toBeGreaterThan(-1);
+  expect(assemblyIndex).toBeGreaterThan(-1);
+  expect(gateIndex).toBeGreaterThan(notarizeIndex);
+  expect(assemblyIndex).toBeGreaterThan(gateIndex);
+  expect(extractStepRun(workflow, NOTARIZED_BINARY_GATE_STEP_NAME)).toBe(
+    [
+      `if codesign --verify -R "=notarized" "\${GITHUB_WORKSPACE}/release-bin/brigadier"; then`,
+      "  exit 0",
+      "fi",
+      `if codesign -dv "\${GITHUB_WORKSPACE}/release-bin/brigadier" 2>&1 | grep -qF 'Signature=adhoc'; then`,
+      '  echo "Release binary is ad-hoc signed instead of Developer ID signed" >&2',
+      "else",
+      '  echo "Release binary did not satisfy the notarization requirement and is not ad-hoc signed" >&2',
+      "fi",
+      "exit 1",
+    ].join("\n"),
+  );
+});
 
 interface GuardResult {
   readonly exitCode: number | null;

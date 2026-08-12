@@ -54,11 +54,12 @@ Which steps announce that they are disabled, and which merely vanish:
 - **GitHub release** — the job `Publish GitHub release` runs and its step
   `Publication disabled` prints `RELEASE_PUBLISH_ENABLED is not true; GitHub
   release publication is disabled`. The job is green. No release was created.
-- **Apple** — the two steps `Install Developer ID certificate` and
-  `Developer ID sign and notarize` are **skipped silently**. Unlike the two
-  cases above there is no else-branch and no message; they show as grey skipped
-  steps and that is the only signal. No `.dmg` is produced, and none is attached
-  anywhere.
+- **Apple** — the four steps `Prove notarization requirement rejects ad-hoc
+  binary`, `Install Developer ID certificate`, `Developer ID sign and notarize`,
+  and `Verify release binary is Developer ID signed and notarized` are **skipped
+  silently**. Unlike the two cases above there is no else-branch and no message;
+  they show as grey skipped steps and that is the only signal. No `.dmg` is
+  produced, and none is attached anywhere.
 
 The Darwin executables are still signed, but only **ad-hoc** (`codesign --force
 --sign -`). That satisfies the arm64 requirement that a Mach-O binary carry some
@@ -137,8 +138,8 @@ so no personal access token is involved.
 
 ### The seven Apple secrets — enable Developer ID signing and notarization
 
-All seven must be present. If even one is empty, both Apple steps skip and you
-get the ad-hoc-signed binary described above.
+All seven must be present. If even one is empty, all four Apple steps skip
+and you get the ad-hoc-signed binary described above.
 
 **You very likely already have the certificate. Do not create a new one.**
 Check first:
@@ -214,11 +215,12 @@ Now the seven values:
 
 What the workflow then does with them: decodes the `.p12`, imports it into a
 temporary keychain, signs the executable with the Developer ID identity using a
-hardened runtime and a secure timestamp, wraps it in a disk image, submits the
-disk image with `xcrun notarytool submit --wait`, and staples the ticket to the
-disk image. A bare Mach-O command-line executable cannot itself carry a stapled
-ticket, which is why the DMG exists at all: the release tarball gets the signed
-executable, and the notarized DMG rides along as evidence.
+hardened runtime and a secure timestamp, wraps it in a disk image, signs the disk
+image with the Developer ID identity and a secure timestamp, submits it with
+`xcrun notarytool submit --wait`, and staples the ticket to the disk image. A
+bare Mach-O command-line executable cannot itself carry a stapled ticket, which
+is why the DMG exists at all: the release tarball gets the signed executable,
+and the notarized DMG rides along as evidence.
 
 ---
 
@@ -483,7 +485,8 @@ ls "${scratch}/node_modules/@stephen-golban/"
 
 ## What has been exercised
 
-These release-path steps have executed:
+These release-path measurements have been made, and their limits are recorded
+here:
 
 - **The tag guard has been exercised in both directions.** Against the bumped
   `0.1.1` tree, the guard returned rc `0` for
@@ -502,10 +505,111 @@ These release-path steps have executed:
   `Publication disabled`. Afterwards, `gh release list` returned zero releases
   and `npm view @stephen-golban/brigadier` returned `E404`. This measures the
   secret-less-tag behaviour; it does not prove either publication path.
+- **Notarization rehearsal 1 ran locally on 2026-08-11, mirroring the workflow's
+  steps.** `xcrun notarytool submit --wait` returned **Accepted** for submission
+  `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` on the first attempt, with no warnings,
+  in roughly four minutes. This proved that Apple accepts a bare Mach-O
+  command-line executable inside a DMG. It also proved that the three
+  `notarytool` credentials authenticate, that the `.p12` base64 round-trips
+  byte-identically through the workflow's `base64 --decode`, and that the
+  `.p12` → throwaway-keychain import path works. The import was checked by
+  asking the throwaway keychain by name with
+  `security find-identity -v -p codesigning <throwaway>`, so the machine's own
+  copy of the same certificate could not mask a silently failed import. This
+  rehearsal also found the unsigned-DMG defect: `xcrun stapler staple` and
+  `xcrun stapler validate` both succeeded, but
+  `spctl -a -t open --context context:primary-signature` rejected the disk image
+  with `source=no usable signature`, and `codesign -dv` confirmed that the DMG
+  carried no signature of its own.
+- **Notarization rehearsal 2 ran on 2026-08-12 at commit `bb8305e`.** It invoked
+  the real, unmodified `scripts/notarize.sh` against a real build, not a
+  reimplementation. The working-tree and `HEAD` copies of that script are
+  byte-identical, with SHA-256
+  `d452cdc1d1ae68618f8c3f172f84007c05b6685d72732ef3b034e5337e46f3da`, and
+  rehearsal 2 invoked that file at `bb8305e`, the same commit that would be
+  tagged. `xcrun notarytool submit --wait` returned **Accepted** for submission
+  `3b415bcb-3068-48a2-8f9e-4a884797a6c6`. The first decisive check,
+  `spctl -a -t open --context context:primary-signature`, accepted the disk
+  image with rc `0`; before the signing fix it rejected the image. The binary
+  notarized inside the DMG is the same file that the copy-back at the end of
+  `scripts/notarize.sh` writes to `ARTIFACT_PATH`, so the cdhash Apple notarized
+  is the cdhash that ships. Losing that copy-back destroys this identity, which
+  is why the workflow gates on it. Both decisive checks were then reproduced
+  as fresh invocations against the produced artifacts, outside the rehearsal
+  harness:
+  `spctl -a -t open --context context:primary-signature` returned rc `0` for the
+  disk image, and `codesign --verify -R "=notarized"` returned rc `0` for the
+  binary. The binary is not ad-hoc. An ad-hoc baseline was checked first and
+  rejected with rc `3`, so none of these passes are vacuous. Rehearsal 2 ran in
+  reduced mode, which disabled both the `.p12` → throwaway-keychain import and
+  the by-name keychain isolation check; signing deliberately used an ambient
+  certificate already in the login keychain. It therefore proves neither the
+  `.p12` import nor that signing consumed an imported artifact rather than an
+  ambient one. It mirrored only the signing and notarization path once a
+  certificate is present. Rehearsal 1 alone proves the runner-mirroring
+  credential path.
+- **Apple retains both submissions, but the history is not the discriminating
+  evidence.** On the release owner's machine,
+  `xcrun notarytool history --keychain-profile "brigadier-local-proof"` returns
+  both as **Accepted**:
+  `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` for
+  `brigadier-v0.1.1-darwin-arm64.dmg` at `2026-08-11T17:38:33.469Z`
+  (rehearsal 1), and `3b415bcb-3068-48a2-8f9e-4a884797a6c6` for the same filename
+  at `2026-08-12T14:23:57.957Z` (rehearsal 2). The `brigadier-local-proof`
+  keychain profile exists only on that machine, so an arbitrary reader on other
+  hardware cannot retrieve this history. Apple records that a submission with
+  that filename was Accepted on that date; the history does not establish which
+  bytes were submitted and says nothing about whether the disk image was
+  signed. Rehearsal 1 was also **Accepted**, yet its DMG failed `spctl`.
+  **Accepted** was never the property in doubt. The discriminating evidence is
+  the rehearsal 2 disk image's rc `0` from `spctl` against rehearsal 1's
+  rejection. The rehearsal artifacts were deliberately not preserved, so this
+  document is now the record of that evidence; the history remains available to
+  the release owner without spending another Apple submission or re-entering an
+  app-specific password.
+- **The `=notarized` gate has been measured against the kind of bare executable
+  Brigadier ships.** Without making another Apple submission,
+  `codesign --verify -R "=notarized"` returned rc `0` for a third-party
+  notarized command-line executable already on the machine, even though
+  `xcrun stapler validate` reported that it had no stapled ticket. The same
+  command returned rc `3` for Brigadier's own ad-hoc-signed binary. A bare
+  executable cannot carry a stapled ticket, so this proves that the workflow's
+  `=notarized` gate is valid for the release artifact itself, not only for the
+  DMG.
+- **Whether the `=notarized` check requires network access remains unsettled.**
+  The rehearsal script's check 4 produced the invalid probes
+  `0.163 / 0.161 / 0.165s` (all invalid): an earlier check in the same run had
+  already executed `codesign --verify -R "=notarized"` against that same binary
+  moments before, so every probe was warm and the cold case was never sampled.
+  The cold first call of a clean re-measurement on a notarized binary that
+  nothing had previously queried measured `0.3152s`. Its four warm repeats on
+  the same file measured `0.3362 / 0.3222 / 0.3093 / 0.3272s`, and a second cold
+  call on a different never-queried notarized binary measured `0.2779s`. The
+  repeats were flat, with no cold/warm signature. That argues against a cached
+  network result but is not conclusive without an offline test. The workflow
+  comment therefore remains deliberately hedged: the check *may* consult Apple.
+- **The workflow's wiring remains unexercised with the publication secrets
+  present.** `gh run list --workflow release.yml` returns exactly one run ever:
+  `31513095322`, for tag `v0.1.0`, with no secrets set. On a real runner, the
+  seven-secret `if:` conditions have therefore never evaluated true, and the
+  `.p12` `security import`, `scripts/notarize.sh`, and the two verification steps
+  added in `bb8305e` have never run. Their first workflow execution will be the
+  real release. Rehearsal 2 proved the script's behaviour. The workflow's wiring
+  is a separate thing and remains unexercised. This is an acceptable risk rather
+  than a blocker: `publish-npm` declares
+  `needs: [build-platform, package-root]`, and `publish-github` declares
+  `needs: build-platform`, so any `build-platform` failure blocks both publish
+  jobs. Nothing reaches npm or Releases, the version stays free on the registry,
+  and the git tag can be deleted and re-pushed. The unrecoverable act is an npm
+  publish, and it cannot happen if the build gate fires.
 
 ---
 
 ## What had never been proven before 0.1.1
+
+This is a baseline scoped to before the release. Its statements were true when
+written; they do not describe the current state. Later evidence is recorded in
+[What has been exercised](#what-has-been-exercised).
 
 These were unproven when the `0.1.1` release began:
 

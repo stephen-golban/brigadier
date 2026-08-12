@@ -52,6 +52,9 @@ hdiutil create \
   -ov \
   "${NOTARIZED_DMG_PATH}"
 
+codesign --sign "${DEVELOPER_ID_IDENTITY}" --timestamp "${NOTARIZED_DMG_PATH}"
+codesign --verify --strict --verbose=2 "${NOTARIZED_DMG_PATH}"
+
 xcrun notarytool submit "${NOTARIZED_DMG_PATH}" \
   --apple-id "${APPLE_ID}" \
   --team-id "${APPLE_TEAM_ID}" \
