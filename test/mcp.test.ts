@@ -986,6 +986,7 @@ describe("the MCP server over stdio", () => {
         isError: false,
         text: [
           "dry run add-retry: 2 slices, <duration> → (none)",
+          "  no verify command; the tests_pass gate will be skipped",
           "  retry-core  would run  (none)  (not reviewed: dry run)",
           "  retry-docs  would run  (none)  (not reviewed: dry run)",
           "  log: run add-retry: 2 slice(s) in 1 wave(s)",

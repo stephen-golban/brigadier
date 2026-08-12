@@ -256,11 +256,17 @@ function planFromReply(
  * `document.plan` straight out would emit a plan file that the parser then
  * rejects for a missing `difficulty`. The directives are documented to be one
  * per slice in slice order, which is what makes the rejoin below exact.
+ * `verify` likewise lives beside `plan`; it must be re-emitted because the CLI
+ * redacts and re-parses this JSON before executing it, so omitting the field
+ * here would silently turn a configured deterministic gate into a skipped one.
  */
 function planDocumentAsFile(document: PlanDocument): unknown {
   return {
     id: document.plan.id,
     goal: document.plan.goal,
+    ...(document.verify === undefined
+      ? {}
+      : { verify: { command: [...document.verify.command] } }),
     slices: document.plan.slices.map((slice, index) => {
       const directive = document.directives[index];
       return {

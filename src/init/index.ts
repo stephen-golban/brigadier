@@ -33,6 +33,7 @@ import type { Planner, PlannerOutcome } from "../planner/index.js";
 import { createModelPlanner } from "../planner/index.js";
 import { createClaudeQuotaOracle } from "../quota/index.js";
 import {
+  describeDryRunVerifyCommand,
   renderQuietRunReport,
   writeRunRecordDetail,
 } from "../report/render.js";
@@ -1774,6 +1775,9 @@ function renderRunReport(out: OutputStream, report: RunReport): void {
   out.write(
     `\n${report.dryRun ? "dry run" : "run"} ${report.slug}: ${report.slices.length} slice(s) in ${report.durationMs}ms\n`,
   );
+  if (report.dryRun) {
+    out.write(`${describeDryRunVerifyCommand(report)}\n`);
+  }
   // Printed before the slice lines rather than with the failure at the bottom,
   // because it changes how every line below it should be read: "cancelled" on a
   // slice means something different when the user knows they caused it.

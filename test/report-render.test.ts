@@ -211,6 +211,29 @@ describe("the quiet run report", () => {
       ),
     ).toContain("  interrupted: workers were cancelled and worktrees removed");
   });
+
+  test("a dry run discloses verification as argv and makes an absent command explicit", () => {
+    const command = [
+      "bun",
+      "test",
+      "--filter",
+      "argument with spaces",
+    ] as const;
+    expect(
+      renderQuietRunReport(
+        baseReport({
+          dryRun: true,
+          integrationBranch: null,
+          testCommand: command,
+        }),
+      ),
+    ).toContain(`  verify command: ${JSON.stringify(command)}\n`);
+    expect(
+      renderQuietRunReport(
+        baseReport({ dryRun: true, integrationBranch: null }),
+      ),
+    ).toContain("  no verify command; the tests_pass gate will be skipped\n");
+  });
 });
 
 describe("the shared run-record step", () => {

@@ -10,8 +10,9 @@
  * The on-disk document is one object per slice — `difficulty` and `requires`
  * sit beside `id`, `title`, and `prompt`, because that is how a human writes a
  * plan. In memory they are two aligned sequences: the frozen `Slice`/`Plan`
- * shapes from `src/contracts.ts`, and the `SliceDirective[]` side channel that
- * exists because `Slice` is frozen and carries no difficulty. Splitting them is
+ * shapes from `src/contracts.ts`, the `SliceDirective[]` side channel that
+ * exists because `Slice` is frozen and carries no difficulty, and one optional
+ * document-wide verification argv. Splitting and validating those values is
  * this module's entire job. It emits one directive per slice, in slice order,
  * which is the invariant every consumer of `PlanDocument` relies on and the
  * reason a `PlanDocument` should never be assembled by hand.
@@ -93,11 +94,20 @@ type _DifficultiesAreExhaustive = Assert<
   Exactly<(typeof SLICE_DIFFICULTIES)[number], SliceDifficulty>
 >;
 
-const DOCUMENT_KEY_LIST = ["id", "goal", "slices"] as const;
+const DOCUMENT_KEY_LIST = ["id", "goal", "slices", "verify"] as const;
 type _DocumentKeysAreExact = Assert<
-  Exactly<(typeof DOCUMENT_KEY_LIST)[number], keyof Plan>
+  Exactly<(typeof DOCUMENT_KEY_LIST)[number], keyof Plan | "verify">
 >;
 const DOCUMENT_KEYS: ReadonlySet<string> = new Set(DOCUMENT_KEY_LIST);
+
+const VERIFY_KEY_LIST = ["command"] as const;
+type _VerifyKeysAreExact = Assert<
+  Exactly<
+    (typeof VERIFY_KEY_LIST)[number],
+    keyof NonNullable<PlanDocument["verify"]>
+  >
+>;
+const VERIFY_KEYS: ReadonlySet<string> = new Set(VERIFY_KEY_LIST);
 
 /**
  * The frozen `Slice` fields plus the side-channel fields a directive carries.
@@ -172,9 +182,14 @@ export function parsePlanDocument(value: unknown): PlanDocument {
   const issues: string[] = [];
   rejectUnknownKeys(root, DOCUMENT_KEYS, "plan", issues);
 
-  const { id, goal, slices: rawSlices } = root;
+  const { id, goal, slices: rawSlices, verify: rawVerify } = root;
   const parsedId = requireNonEmptyString(id, "plan id", issues);
   const parsedGoal = requireNonEmptyString(goal, "plan goal", issues);
+  const parsedVerify = parseVerify(
+    rawVerify,
+    Object.hasOwn(root, "verify"),
+    issues,
+  );
 
   // Nothing after this point means anything without a list to walk, so an
   // unusable `slices` ends the parse rather than producing invented per-slice
@@ -206,7 +221,94 @@ export function parsePlanDocument(value: unknown): PlanDocument {
     goal: parsedGoal,
     slices: Object.freeze(slices),
   });
-  return Object.freeze({ plan, directives: Object.freeze(directives) });
+  return Object.freeze({
+    plan,
+    directives: Object.freeze(directives),
+    ...(parsedVerify === undefined ? {} : { verify: parsedVerify }),
+  });
+}
+
+/**
+ * Parses the document-wide deterministic verification command.
+ *
+ * A string is refused with a purpose-built diagnostic rather than the generic
+ * array error because accepting or splitting shell-shaped text here would turn
+ * a data-only argv boundary into a command-injection surface. Every element is
+ * copied and frozen so a caller cannot mutate the executable after validation.
+ * A whitespace-only executable and a NUL byte anywhere are refused here because
+ * the process runner cannot spawn either shape; argument whitespace remains
+ * untouched because argv is data, not shell text.
+ */
+function parseVerify(
+  value: unknown,
+  present: boolean,
+  issues: string[],
+): PlanDocument["verify"] | undefined {
+  if (!present) {
+    return undefined;
+  }
+  const record = asRecord(value);
+  if (record === null) {
+    issues.push("plan.verify must be an object");
+    return undefined;
+  }
+
+  rejectUnknownKeys(record, VERIFY_KEYS, "plan.verify", issues);
+  const { command } = record;
+  if (typeof command === "string") {
+    issues.push(
+      'plan.verify.command must use array form such as ["bun", "test"]; shell strings are not accepted',
+    );
+    return undefined;
+  }
+  if (!Array.isArray(command)) {
+    issues.push("plan.verify.command is required and must be an array");
+    return undefined;
+  }
+  if (command.length === 0) {
+    issues.push("plan.verify.command must not be empty");
+    return undefined;
+  }
+
+  const parsed: string[] = [];
+  for (const [index, entry] of command.entries()) {
+    if (typeof entry !== "string") {
+      issues.push(`plan.verify.command[${index}] must be a non-empty string`);
+      continue;
+    }
+    // The executable must be launchable; arguments are opaque data passed through untouched.
+    if (index === 0 && entry.length === 0) {
+      issues.push(`plan.verify.command[${index}] must be a non-empty string`);
+      continue;
+    }
+    if (index === 0 && entry.trim().length === 0) {
+      issues.push(
+        "plan.verify.command[0] must name an executable, not only whitespace",
+      );
+      continue;
+    }
+    if (entry.includes("\0")) {
+      issues.push(`plan.verify.command[${index}] must not contain a NUL byte`);
+      continue;
+    }
+    parsed.push(entry);
+  }
+  if (parsed.length !== command.length) {
+    return undefined;
+  }
+
+  // The executable checks above establish the tuple's executable.
+  const [executable, ...arguments_] = parsed;
+  if (executable === undefined) {
+    return undefined;
+  }
+  const parsedCommand: [executable: string, ...arguments_: string[]] = [
+    executable,
+    ...arguments_,
+  ];
+  return Object.freeze({
+    command: Object.freeze(parsedCommand),
+  });
 }
 
 interface ParsedSlice {

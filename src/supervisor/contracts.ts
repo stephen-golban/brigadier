@@ -158,19 +158,29 @@ export interface SliceDirective {
 }
 
 /**
- * A validated plan document: the frozen `Plan` plus its side-channel directives.
+ * A validated plan document: the frozen `Plan`, its side-channel directives,
+ * and the optional document-wide verification command.
  *
  * "Validated" here means *shaped*, not *schedulable*. This type asserts that
- * every field exists with the right type and that a directive accompanies every
- * slice. It asserts nothing about path conflicts, dependency cycles, or other
- * structural defects — those are `validatePlan`'s job, and the orchestrator
- * runs it separately so its `PlanIssue[]` reaches the report intact. Dependency
- * wave width is scheduling input; the supervisor's bounded pool limits how many
+ * every field exists with the right type, that a directive accompanies every
+ * slice, and that verification is an argv tuple rather than shell text. It
+ * asserts nothing about path conflicts, dependency cycles, or other structural
+ * defects — those are `validatePlan`'s job, and the orchestrator runs it
+ * separately so its `PlanIssue[]` reaches the report intact. Dependency wave
+ * width is scheduling input; the supervisor's bounded pool limits how many
  * members run concurrently.
  */
 export interface PlanDocument {
   readonly plan: Plan;
   readonly directives: readonly SliceDirective[];
+  /**
+   * One repository-owned verification command, shared by every slice attempt.
+   * It is argv rather than shell text so the plan cannot acquire interpolation,
+   * splitting, or any other shell semantics on its way to the gate runner.
+   */
+  readonly verify?: {
+    readonly command: readonly [executable: string, ...arguments_: string[]];
+  };
 }
 
 /**
@@ -849,6 +859,11 @@ export interface RunReport {
   readonly ok: boolean;
   readonly slug: string;
   readonly dryRun: boolean;
+  /**
+   * The plan's verification argv, retained so a dry-run renderer can disclose
+   * exactly what would execute without rejoining it into shell-shaped text.
+   */
+  readonly testCommand?: readonly [executable: string, ...arguments_: string[]];
   /**
    * Whether this run's `RunRequest.signal` had been aborted by the time the
    * report was built.

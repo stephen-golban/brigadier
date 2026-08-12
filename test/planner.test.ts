@@ -6,6 +6,7 @@ import type { PlannerOutcome } from "../src/planner/index.ts";
 import { createModelPlanner } from "../src/planner/index.ts";
 import { planPrompt } from "../src/planner/planner.ts";
 import { parsePlannerReply } from "../src/planner/reply.ts";
+import { runGates } from "../src/supervisor/gates.ts";
 import {
   type OneShotRequest,
   type OneShotResult,
@@ -155,6 +156,23 @@ const DEPENDENT_PLAN = {
         difficulty: "standard",
       },
     ],
+  },
+};
+
+const VERIFIED_COMMAND = [
+  "bun",
+  "test",
+  "--filter",
+  "argument with spaces",
+] as const;
+
+const VERIFIED_PLAN = {
+  status: "plan",
+  plan: {
+    ...GOOD_PLAN.plan,
+    verify: {
+      command: VERIFIED_COMMAND,
+    },
   },
 };
 
@@ -422,6 +440,55 @@ describe("createModelPlanner", () => {
         ["producer", ["src/helper.ts"]],
         ["consumer", ["src/consumer.ts"]],
       ]),
+    });
+  });
+
+  test("preserves a model-authored verify command through the plan-file round trip and runs tests_pass", async () => {
+    const prompt = new ScriptedPrompt(replied(JSON.stringify(VERIFIED_PLAN)));
+    const outcome = await planWith(prompt);
+
+    if (outcome.kind !== "planned") {
+      throw new Error(`expected planned, got ${outcome.kind}`);
+    }
+    expect(outcome.document.verify?.command).toEqual(VERIFIED_COMMAND);
+
+    // The CLI redacts the planner's serialized JSON and deliberately parses it
+    // again before starting a run. Drive that same boundary here: asserting
+    // only against `outcome.document` would miss a field dropped by the
+    // serializer, which is the regression this test exists to catch.
+    const printedPlan = JSON.parse(outcome.json);
+    expect(printedPlan).toEqual(VERIFIED_PLAN.plan);
+    const reparsed = parsePlanDocument(printedPlan);
+    const command = reparsed.verify?.command;
+    if (command === undefined) {
+      throw new Error("the reparsed planner output dropped verify.command");
+    }
+    expect(command).toEqual(VERIFIED_COMMAND);
+
+    const commands: unknown[] = [];
+    const gateRun = await runGates({
+      changedPaths: ["src/one.ts"],
+      ownedPaths: ["src/one.ts"],
+      worktreePath: "/repo/worktree",
+      testCommand: command,
+      ports: {
+        runCommand: (request) => {
+          commands.push(request);
+          return Promise.resolve({ exitCode: 0 });
+        },
+      },
+    });
+    expect(commands).toEqual([
+      {
+        command: VERIFIED_COMMAND,
+        cwd: "/repo/worktree",
+      },
+    ]);
+    expect(gateRun.gates.find((gate) => gate.name === "tests_pass")).toEqual({
+      name: "tests_pass",
+      severity: "blocking",
+      status: "passed",
+      findings: [],
     });
   });
 

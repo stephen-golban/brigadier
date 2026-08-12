@@ -86,6 +86,10 @@ export function renderQuietRunReport(
     `${report.dryRun ? "dry run" : "run"} ${report.slug}: ${count} ${count === 1 ? "slice" : "slices"}, ${humanizeDuration(report.durationMs)} → ${report.integrationBranch ?? "(none)"}`,
   ];
 
+  if (report.dryRun) {
+    lines.push(describeDryRunVerifyCommand(report));
+  }
+
   if (report.interrupted) {
     lines.push(
       report.cleanupFailures.length === 0
@@ -122,6 +126,17 @@ export function renderQuietRunReport(
     lines.push(options.detailLine);
   }
   return lines.join("\n");
+}
+
+/**
+ * JSON is used as an argv notation, not as a command builder. Rejoining the
+ * elements with spaces would falsely suggest shell parsing and make arguments
+ * containing whitespace impossible to distinguish in the preview.
+ */
+export function describeDryRunVerifyCommand(report: RunReport): string {
+  return report.testCommand === undefined
+    ? "  no verify command; the tests_pass gate will be skipped"
+    : `  verify command: ${JSON.stringify(report.testCommand)}`;
 }
 
 export function humanizeDuration(durationMs: number): string {

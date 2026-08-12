@@ -285,6 +285,9 @@ async function executeRun(
       ok: false,
       slug: request.slug,
       dryRun: request.dryRun === true,
+      ...(request.document.verify === undefined
+        ? {}
+        : { testCommand: request.document.verify.command }),
       integrationBranch: null,
       slices: [],
       merges: [],
@@ -347,6 +350,9 @@ async function executeRun(
     ok: fields.ok,
     slug: request.slug,
     dryRun,
+    ...(request.document.verify === undefined
+      ? {}
+      : { testCommand: request.document.verify.command }),
     integrationBranch: fields.integrationBranch,
     slices: fields.slices,
     merges: fields.merges,
@@ -608,6 +614,9 @@ async function executeRun(
               ),
               routing: routingInput,
               unsafeInPlace: request.unsafeInPlace === true,
+              ...(request.document.verify === undefined
+                ? {}
+                : { testCommand: request.document.verify.command }),
               ...(request.signal === undefined
                 ? {}
                 : { signal: request.signal }),

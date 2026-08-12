@@ -26,6 +26,9 @@ reaches these checks.
 {
   "id": "csv-export",
   "goal": "Add CSV export to the report command",
+  "verify": {
+    "command": ["bun", "test"]
+  },
   "slices": [
     {
       "id": "writer",
@@ -49,8 +52,27 @@ reaches these checks.
 | `id` | string | yes | non-empty. Names every branch the run creates unless `--slug` overrides it |
 | `goal` | string | yes | non-empty. One sentence |
 | `slices` | array | yes | non-empty |
+| `verify` | object | no | one repository-wide deterministic verification command; see below |
 
-No other key is permitted at the top level.
+No top-level key other than `id`, `goal`, `slices`, or `verify` is permitted.
+
+### `verify`
+
+`verify.command` is a non-empty argv array whose first element is the executable
+and whose remaining elements are its arguments. Array form is the only accepted
+form: `["bun", "test"]` is valid, while the shell string `"bun test"` is not.
+Brigadier passes the array directly to the process runner without a shell,
+interpolation, or splitting. The executable must be a non-empty,
+non-whitespace string. Arguments may be any string, including an empty string.
+No element may contain a NUL byte; those shapes cannot be passed to the process
+runner. Argument whitespace is otherwise preserved exactly.
+
+The command belongs to the whole plan, not to an individual slice, and brigadier
+does not auto-detect or invent it. Each slice attempt that reaches review runs
+the same command in its worktree as the `tests_pass` deterministic gate, before
+the cross-vendor model review. A failing project test therefore rejects the
+slice without spending a reviewer. When `verify` is absent, `tests_pass` is
+reported as skipped rather than passed.
 
 ### Slice fields
 

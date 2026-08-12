@@ -526,6 +526,9 @@ function footprint(inputs: readonly SliceRunInput[]): unknown {
     session: input.session,
     attemptSlots: input.attemptSlots,
     unsafeInPlace: input.unsafeInPlace,
+    ...(input.testCommand === undefined
+      ? {}
+      : { testCommand: input.testCommand }),
     config: input.routing.config,
     capabilities: input.routing.capabilities,
   }));
@@ -597,6 +600,35 @@ describe("brigadier run: the plan source", () => {
       ]);
       expect(inputs[1]?.attemptSlots.map((slot) => slot.sliceNumber)).toEqual([
         3, 4,
+      ]);
+    });
+  });
+
+  test("parses verify.command from the plan and forwards the original argv to every slice", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const command = [
+        "bun",
+        "test",
+        "--filter",
+        "argument with spaces",
+      ] as const;
+      await writeFile(
+        plan,
+        `${JSON.stringify({ ...PLAN, verify: { command } }, null, 2)}\n`,
+      );
+
+      const result = await invoke({
+        argv: ["run", "--plan", plan],
+        cwd,
+        scratchHome,
+      });
+
+      expect(result.code).toBe(0);
+      const inputs = result.runner?.inputs ?? [];
+      expect(inputs).toHaveLength(2);
+      expect(inputs.map((input) => input.testCommand)).toEqual([
+        command,
+        command,
       ]);
     });
   });
@@ -1015,6 +1047,9 @@ describe("brigadier run: the task positional", () => {
       expect(result.stdout).toContain(
         "\ndry run demo-plan: 2 slices, 0s → (none)\n",
       );
+      expect(result.stdout).toContain(
+        "  no verify command; the tests_pass gate will be skipped\n",
+      );
       expect(result.engine.prepared).toEqual([]);
       expect(result.engine.created).toEqual([]);
       expect(result.runner?.inputs).toEqual([]);
@@ -1309,6 +1344,9 @@ describe("brigadier run: --dry-run", () => {
         "\ndry run demo-plan: 2 slice(s) in 0ms\n",
       );
       expect(result.stdout).toContain(
+        "  no verify command; the tests_pass gate will be skipped\n",
+      );
+      expect(result.stdout).toContain(
         "  s1  would run\n      attempt 1  claude/claude-opus-5 effort=high  routed\n",
       );
       expect(result.stdout).toContain(
@@ -1320,6 +1358,35 @@ describe("brigadier run: --dry-run", () => {
       expect(result.stdout).toContain("  merges: (none)\n");
       expect(result.stdout).not.toContain("full detail:");
       expect(await readdir(scratchHome)).toEqual(["config.json"]);
+    });
+  });
+
+  test("prints the verification argv as a list in quiet and verbose output", async () => {
+    await withScratchHome(async ({ scratchHome, cwd, plan }) => {
+      const command = ["bun", "test", "--filter", "argument with spaces"];
+      await writeFile(
+        plan,
+        `${JSON.stringify({ ...PLAN, verify: { command } }, null, 2)}\n`,
+      );
+
+      const quiet = await invoke({
+        argv: ["run", "--plan", plan, "--dry-run"],
+        cwd,
+        scratchHome,
+      });
+      const verbose = await invoke({
+        argv: ["run", "--plan", plan, "--dry-run", "--verbose"],
+        cwd,
+        scratchHome,
+      });
+
+      const rendered = `  verify command: ${JSON.stringify(command)}\n`;
+      expect(quiet.code).toBe(0);
+      expect(verbose.code).toBe(0);
+      expect(quiet.stdout).toContain(rendered);
+      expect(verbose.stdout).toContain(rendered);
+      expect(quiet.stdout).not.toContain(command.join(" "));
+      expect(verbose.stdout).not.toContain(command.join(" "));
     });
   });
 

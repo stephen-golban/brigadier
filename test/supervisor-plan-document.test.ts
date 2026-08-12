@@ -62,12 +62,13 @@ const FAILED: SliceResult = {
  * Splitting this into a `Plan` plus a `SliceDirective[]` is the whole job.
  *
  * The second slice omits `dependsOn` and `requires` on purpose: those are the
- * only two optional fields, and the default for one (`[]`) and the absence of
+ * two optional slice fields, and the default for one (`[]`) and the absence of
  * the other (no key at all) are both pinned below.
  */
 const ON_DISK = {
   id: "add-rate-limiting",
   goal: "Add rate limiting to the public API",
+  verify: { command: ["bun", "test", "--timeout", "5000"] },
   slices: [
     {
       id: "limiter",
@@ -117,6 +118,7 @@ const PARSED: PlanDocument = {
     },
     { sliceId: "wire", difficulty: "hard" },
   ],
+  verify: { command: ["bun", "test", "--timeout", "5000"] },
 };
 
 /** A minimal slice with every required field, for one-defect fixtures. */
@@ -186,7 +188,7 @@ describe("parsePlanDocument: the accepted document", () => {
 
   test("emits canonical key order at every level", () => {
     const parsed = parsePlanDocument(structuredClone(ON_DISK));
-    expect(Object.keys(parsed)).toEqual(["plan", "directives"]);
+    expect(Object.keys(parsed)).toEqual(["plan", "directives", "verify"]);
     expect(Object.keys(parsed.plan)).toEqual(["id", "goal", "slices"]);
     expect(Object.keys(parsed.plan.slices[0] ?? {})).toEqual([
       "id",
@@ -200,6 +202,31 @@ describe("parsePlanDocument: the accepted document", () => {
       "difficulty",
       "requires",
     ]);
+    expect(Object.keys(parsed.verify ?? {})).toEqual(["command"]);
+  });
+
+  test("omits verify entirely when no command was declared", () => {
+    const parsed = parsePlanDocument(document([slice()]));
+    expect(Object.keys(parsed)).toEqual(["plan", "directives"]);
+    expect("verify" in parsed).toBe(false);
+  });
+
+  test("preserves argument whitespace without treating it as shell text", () => {
+    const parsed = parsePlanDocument(
+      document([slice()], {
+        verify: { command: ["node", "-e", "  "] },
+      }),
+    );
+    expect(parsed.verify?.command).toEqual(["node", "-e", "  "]);
+  });
+
+  test("preserves empty arguments without treating them as executable names", () => {
+    const parsed = parsePlanDocument(
+      document([slice()], {
+        verify: { command: ["node", "-e", ""] },
+      }),
+    );
+    expect(parsed.verify?.command).toEqual(["node", "-e", ""]);
   });
 
   test("omits the requires key entirely when the slice declared none", () => {
@@ -310,15 +337,25 @@ describe("parsePlanDocument: the accepted document", () => {
     expect(Object.isFrozen(parsed.directives)).toBe(true);
     expect(Object.isFrozen(parsed.directives[0])).toBe(true);
     expect(Object.isFrozen(parsed.directives[0]?.requires)).toBe(true);
+    expect(Object.isFrozen(parsed.verify)).toBe(true);
+    expect(Object.isFrozen(parsed.verify?.command)).toBe(true);
   });
 
   test("copies rather than aliases the caller's arrays", () => {
     const source = structuredClone(ON_DISK) as unknown as {
+      verify: { command: string[] };
       slices: { ownedPaths: string[]; dependsOn: string[] }[];
     };
     const parsed = parsePlanDocument(source);
+    source.verify.command[0] = "hijacked";
     source.slices[0]?.ownedPaths.push("src/hijacked.ts");
     source.slices[0]?.dependsOn.push("hijacked");
+    expect(parsed.verify?.command).toEqual([
+      "bun",
+      "test",
+      "--timeout",
+      "5000",
+    ]);
     expect(parsed.plan.slices[0]?.ownedPaths).toEqual(["src/limit.ts"]);
     expect(parsed.plan.slices[0]?.dependsOn).toEqual([]);
   });
@@ -411,6 +448,84 @@ describe("parsePlanDocument: document-level rejection", () => {
         document([slice()], { maxWorkers: 4, apiKey: "sk-live-secret" }),
       ),
     ).toEqual(['plan: unknown key "maxWorkers"', 'plan: unknown key "apiKey"']);
+  });
+});
+
+describe("parsePlanDocument: verify rejection", () => {
+  test("rejects verify when it is present but not an object", () => {
+    for (const verify of [undefined, null, [], true, "bun test"]) {
+      expect(rejectionIssues(document([slice()], { verify }))).toEqual([
+        "plan.verify must be an object",
+      ]);
+    }
+  });
+
+  test("rejects a shell string with the required array shape in the message", () => {
+    expect(
+      rejectionIssues(document([slice()], { verify: { command: "bun test" } })),
+    ).toEqual([
+      'plan.verify.command must use array form such as ["bun", "test"]; shell strings are not accepted',
+    ]);
+  });
+
+  test("rejects a missing, non-array, or empty command", () => {
+    expect(rejectionIssues(document([slice()], { verify: {} }))).toEqual([
+      "plan.verify.command is required and must be an array",
+    ]);
+    expect(
+      rejectionIssues(document([slice()], { verify: { command: 7 } })),
+    ).toEqual(["plan.verify.command is required and must be an array"]);
+    expect(
+      rejectionIssues(document([slice()], { verify: { command: [] } })),
+    ).toEqual(["plan.verify.command must not be empty"]);
+  });
+
+  test("rejects every non-string or empty argv element by index", () => {
+    expect(
+      rejectionIssues(
+        document([slice()], {
+          verify: { command: ["", "test", 5, null] },
+        }),
+      ),
+    ).toEqual([
+      "plan.verify.command[0] must be a non-empty string",
+      "plan.verify.command[2] must be a non-empty string",
+      "plan.verify.command[3] must be a non-empty string",
+    ]);
+  });
+
+  test("rejects commands the process runner cannot spawn statically", () => {
+    expect(
+      rejectionIssues(
+        document([slice()], {
+          verify: { command: ["   ", "argument\0with-nul"] },
+        }),
+      ),
+    ).toEqual([
+      "plan.verify.command[0] must name an executable, not only whitespace",
+      "plan.verify.command[1] must not contain a NUL byte",
+    ]);
+    expect(
+      rejectionIssues(
+        document([slice()], {
+          verify: { command: ["node\0other", "-e", "process.exit(0)"] },
+        }),
+      ),
+    ).toEqual(["plan.verify.command[0] must not contain a NUL byte"]);
+  });
+
+  test("rejects unknown verify keys while still checking the command", () => {
+    expect(
+      rejectionIssues(
+        document([slice()], {
+          verify: { command: ["bun", 7], cwd: "/tmp", shell: true },
+        }),
+      ),
+    ).toEqual([
+      'plan.verify: unknown key "cwd"',
+      'plan.verify: unknown key "shell"',
+      "plan.verify.command[1] must be a non-empty string",
+    ]);
   });
 });
 

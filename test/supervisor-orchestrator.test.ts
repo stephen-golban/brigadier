@@ -553,10 +553,32 @@ describe("attempt slot allocation", () => {
     ]);
     expect(inputs[0]?.session).toBe(SESSION);
     expect(inputs[0]?.unsafeInPlace).toBe(false);
+    expect("testCommand" in (inputs[0] ?? {})).toBe(false);
     expect(inputs[0]?.directive).toEqual({
       sliceId: "a",
       difficulty: "routine",
     });
+  });
+
+  test("forwards the plan verification argv unchanged and retains it for reporting", async () => {
+    const command = [
+      process.execPath,
+      "-e",
+      'process.stdout.write("argument with spaces")',
+    ] as const;
+    const document: PlanDocument = {
+      ...planDocument([slice("a")]),
+      verify: { command },
+    };
+    const harness = await execute(
+      runRequest(document, 1),
+      fakeEngine(),
+      fakeRunner(),
+    );
+
+    expect(harness.runner.inputs()).toHaveLength(1);
+    expect(harness.runner.inputs()[0]?.testCommand).toBe(command);
+    expect(harness.report.testCommand).toBe(command);
   });
 });
 
@@ -2368,6 +2390,12 @@ describe("real repository dependency and redaction proof", () => {
       ...slice("consumer", ["producer"]),
       ownedPaths: ["consumer-observed.txt"],
     };
+    const verifyMarker = join(root, "verify-command-ran.txt");
+    const verifyCommand = [
+      process.execPath,
+      "-e",
+      `require("node:fs").appendFileSync(${JSON.stringify(verifyMarker)}, process.cwd() + "\\n")`,
+    ] as const;
     const worker = repositorySubprocessWorker();
     const ports: SupervisorPorts = {
       engine,
@@ -2390,7 +2418,10 @@ describe("real repository dependency and redaction proof", () => {
           },
         }),
       }).run({
-        document: planDocument([producer, consumer]),
+        document: {
+          ...planDocument([producer, consumer]),
+          verify: { command: verifyCommand },
+        },
         repositoryPath,
         slug: "real-waves",
         maxWorkers: 2,
@@ -2404,6 +2435,29 @@ describe("real repository dependency and redaction proof", () => {
       "producer",
       "consumer",
     ]);
+    expect(
+      report.slices.map((result) =>
+        result.attempts[0]?.review?.gates?.find(
+          (gate) => gate.name === "tests_pass",
+        ),
+      ),
+    ).toEqual([
+      {
+        name: "tests_pass",
+        severity: "blocking",
+        status: "passed",
+        findings: [],
+      },
+      {
+        name: "tests_pass",
+        severity: "blocking",
+        status: "passed",
+        findings: [],
+      },
+    ]);
+    expect(
+      (await readFile(verifyMarker, "utf8")).trim().split("\n"),
+    ).toHaveLength(2);
     expect(report.merges.map((record) => record.result.status)).toEqual([
       "already-integrated",
       "merged",
