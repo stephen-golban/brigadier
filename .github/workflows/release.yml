@@ -55,6 +55,20 @@ jobs:
         run: |
           codesign --force --sign - ./release-bin/brigadier
           codesign --verify --strict ./release-bin/brigadier
+      - name: Prove notarization requirement rejects ad-hoc binary
+        if: >-
+          runner.os == 'macOS' && env.APPLE_ID != '' &&
+          env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' &&
+          env.DEVELOPER_ID_IDENTITY != '' &&
+          env.APPLE_CERTIFICATE_P12 != '' &&
+          env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != ''
+        shell: bash
+        run: |
+          codesign --verify --strict "${GITHUB_WORKSPACE}/release-bin/brigadier"
+          if codesign --verify -R "=notarized" "${GITHUB_WORKSPACE}/release-bin/brigadier"; then
+            echo "The freshly ad-hoc-signed binary unexpectedly satisfied the notarization requirement" >&2
+            exit 1
+          fi
       - name: Install Developer ID certificate
         if: >-
           runner.os == 'macOS' && env.APPLE_ID != '' &&
@@ -84,6 +98,28 @@ jobs:
           ARTIFACT_PATH: ${{ github.workspace }}/release-bin/brigadier
           NOTARIZED_DMG_PATH: ${{ github.workspace }}/release-bin/brigadier-${{ github.ref_name }}-${{ matrix.platform }}.dmg
         run: ./scripts/notarize.sh
+      # Do not "simplify" this to a codesign -dv grep: that can accept a
+      # Developer ID-signed but unnotarized binary and can expose signer identity.
+      # A bare Mach-O cannot carry a stapled ticket (which is why the DMG exists),
+      # so this check may consult Apple and an Apple outage must fail the release.
+      - name: Verify release binary is Developer ID signed and notarized
+        if: >-
+          runner.os == 'macOS' && env.APPLE_ID != '' &&
+          env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' &&
+          env.DEVELOPER_ID_IDENTITY != '' &&
+          env.APPLE_CERTIFICATE_P12 != '' &&
+          env.APPLE_CERTIFICATE_PASSWORD != '' && env.KEYCHAIN_PASSWORD != ''
+        shell: bash
+        run: |
+          if codesign --verify -R "=notarized" "${GITHUB_WORKSPACE}/release-bin/brigadier"; then
+            exit 0
+          fi
+          if codesign -dv "${GITHUB_WORKSPACE}/release-bin/brigadier" 2>&1 | grep -qF 'Signature=adhoc'; then
+            echo "Release binary is ad-hoc signed instead of Developer ID signed" >&2
+          else
+            echo "Release binary did not satisfy the notarization requirement and is not ad-hoc signed" >&2
+          fi
+          exit 1
       - name: Assemble release archive and platform npm package
         shell: bash
         run: |

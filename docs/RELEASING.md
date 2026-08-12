@@ -54,11 +54,12 @@ Which steps announce that they are disabled, and which merely vanish:
 - **GitHub release** — the job `Publish GitHub release` runs and its step
   `Publication disabled` prints `RELEASE_PUBLISH_ENABLED is not true; GitHub
   release publication is disabled`. The job is green. No release was created.
-- **Apple** — the two steps `Install Developer ID certificate` and
-  `Developer ID sign and notarize` are **skipped silently**. Unlike the two
-  cases above there is no else-branch and no message; they show as grey skipped
-  steps and that is the only signal. No `.dmg` is produced, and none is attached
-  anywhere.
+- **Apple** — the four steps `Prove notarization requirement rejects ad-hoc
+  binary`, `Install Developer ID certificate`, `Developer ID sign and notarize`,
+  and `Verify release binary is Developer ID signed and notarized` are **skipped
+  silently**. Unlike the two cases above there is no else-branch and no message;
+  they show as grey skipped steps and that is the only signal. No `.dmg` is
+  produced, and none is attached anywhere.
 
 The Darwin executables are still signed, but only **ad-hoc** (`codesign --force
 --sign -`). That satisfies the arm64 requirement that a Mach-O binary carry some
@@ -137,8 +138,8 @@ so no personal access token is involved.
 
 ### The seven Apple secrets — enable Developer ID signing and notarization
 
-All seven must be present. If even one is empty, both Apple steps skip and you
-get the ad-hoc-signed binary described above.
+All seven must be present. If even one is empty, all four Apple steps skip
+and you get the ad-hoc-signed binary described above.
 
 **You very likely already have the certificate. Do not create a new one.**
 Check first:
@@ -214,11 +215,12 @@ Now the seven values:
 
 What the workflow then does with them: decodes the `.p12`, imports it into a
 temporary keychain, signs the executable with the Developer ID identity using a
-hardened runtime and a secure timestamp, wraps it in a disk image, submits the
-disk image with `xcrun notarytool submit --wait`, and staples the ticket to the
-disk image. A bare Mach-O command-line executable cannot itself carry a stapled
-ticket, which is why the DMG exists at all: the release tarball gets the signed
-executable, and the notarized DMG rides along as evidence.
+hardened runtime and a secure timestamp, wraps it in a disk image, signs the disk
+image with the Developer ID identity and a secure timestamp, submits it with
+`xcrun notarytool submit --wait`, and staples the ticket to the disk image. A
+bare Mach-O command-line executable cannot itself carry a stapled ticket, which
+is why the DMG exists at all: the release tarball gets the signed executable,
+and the notarized DMG rides along as evidence.
 
 ---
 
