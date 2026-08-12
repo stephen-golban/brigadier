@@ -149,7 +149,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     "ROUTER_NOTE",
     "DEGRADED_ROUTING_QUESTION",
     // Routing internals. `COMPETENCE_TABLE` and `DIFFICULTY_FLOORS` are API
-    // because decision #7 promises the ranking is auditable data; the scoring
+    // because the routing policy promises the ranking is auditable data; the scoring
     // path that reads them is how the router and `init` stay in agreement, and
     // exporting it would freeze the table's shape rather than its contents.
     "matchCompetenceRule",

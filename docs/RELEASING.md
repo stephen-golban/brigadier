@@ -222,6 +222,13 @@ bare Mach-O command-line executable cannot itself carry a stapled ticket, which
 is why the DMG exists at all: the release tarball gets the signed executable,
 and the notarized DMG rides along as evidence.
 
+The disk image must be signed before it is submitted for notarization, not
+just the executable inside it. An unsigned disk image fails
+`spctl -a -t open --context context:primary-signature` with
+`source=no usable signature` even after `xcrun stapler staple` and
+`xcrun stapler validate` both report success — a stapled ticket does not by
+itself prove the disk image will pass Gatekeeper.
+
 ---
 
 ## Moving the version, everywhere it lives

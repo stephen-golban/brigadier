@@ -1,52 +1,45 @@
 /**
- * FROZEN SHARED CORE (WO-000e).
+ * The shared core contract.
  *
- * This contract is shared by WO-001, WO-002, and WO-003. Amend it only through
- * a deliberate decision agreed by all three units, never as a side effect of
- * one unit's implementation. It owns the vendor, effort, and failure
- * vocabulary; token usage; worker spec and environment types; the event and
- * outcome unions; spawn and worker types; and the adapter registry.
+ * These types are published from the package's `./contracts` entry point, and
+ * they are shared internally by the worker adapters, the quota readers, and
+ * the worktree engine. Consumers depend on them, so renaming, widening, or
+ * restructuring anything here is a breaking change: amend this file only as a
+ * deliberate decision, never as a side effect of one module's implementation.
+ * It owns the vendor, effort, and failure vocabulary; token usage; worker spec
+ * and environment types; the event and outcome unions; spawn and worker types;
+ * and the adapter registry.
  *
- * AMENDED ONCE, IN WO-010, AND ONLY IN THE QUOTA TYPES.
- *
- * The freeze held byte-identical from WO-000e through nineteen work orders. It
- * was spent deliberately here because `QuotaWindow` could not represent a fact
- * both vendors put on the wire: quota is metered per *model tier* as well as
- * per account. R-11 (`docs/research/R-11-quota-metering.md`) verified that
- * Claude's `rateLimitType` enumerates `seven_day_opus` and `seven_day_sonnet`
- * beside the account-wide `five_hour` and `seven_day`, and that OpenAI returns
- * `rateLimitsByLimitId` — a map of independent buckets, one of which was
- * observed model-named and at 0% while the account bucket sat at 72%.
+ * The quota types carry a scope because `QuotaWindow` could not otherwise
+ * represent a fact both vendors put on the wire: quota is metered per *model
+ * tier* as well as per account. Claude's `rateLimitType` enumerates
+ * `seven_day_opus` and `seven_day_sonnet` beside the account-wide `five_hour`
+ * and `seven_day`, and OpenAI returns `rateLimitsByLimitId`, a map of
+ * independent buckets — one of which was observed model-named and at 0% while
+ * the account bucket sat at 72%.
  *
  * Without a scope on the window, an Opus-only limit had to be reported as
  * vendor-wide exhaustion, which told brigadier the whole Claude account was
  * dead while Sonnet and Haiku were still running. That is a correctness defect
- * in the type, not in a caller, so it could only be fixed here.
+ * in the type, not in a caller, so it could only be fixed here. `QuotaScope`
+ * is the fix: `QuotaWindow` carries a `scope` and its own `status`, and
+ * `QuotaSnapshot.status` is documented as account-derived.
  *
- * The amendment adds `QuotaScope`, gives `QuotaWindow` a `scope` and its own
- * `status`, and re-documents `QuotaSnapshot.status` as account-derived. Nothing
- * else in this file changed: not the worker contract, not the event union, not
- * the effort ladder, not `Capability`. The freeze is spent, not eroded.
+ * `SpawnedWorker.cancel` is documented narrowly on purpose. It once claimed to
+ * terminate "the entire process group, including descendants". That claim was
+ * measured false: a descendant that calls `setsid` creates its own process
+ * group and survives `kill(-pid)`, reproduced with real pids. No adapter can
+ * satisfy the promise, because group signalling has no mechanism that would,
+ * so the comment described behaviour that does not exist and cannot be built —
+ * and this repository treats a comment that contradicts its code as a defect
+ * rather than a nit, because a caller trusting that sentence would skip
+ * exactly the "a worker may still be running" reporting the supervisor now
+ * does. The comment states what is really guaranteed instead.
  *
- * AMENDED A SECOND TIME, IN WO-019, AND ONLY IN A COMMENT.
- *
- * `SpawnedWorker.cancel` was documented as terminating "the entire process
- * group, including descendants". That claim was measured false: a descendant
- * that calls `setsid` creates its own process group and survives `kill(-pid)`,
- * reproduced with real pids. No adapter can satisfy the promise, because group
- * signalling has no mechanism that would, so the comment described behaviour
- * that does not exist and cannot be built — and this repository treats a
- * comment that contradicts its code as a defect rather than a nit, because a
- * caller trusting that sentence would skip exactly the "a worker may still be
- * running" reporting the supervisor now does. The comment states what is really
- * guaranteed instead.
- *
- * NO TYPE CHANGED IN THIS AMENDMENT. The cross-vendor review gate WO-019 built
- * needed nothing from this file: its verdict vocabulary, its reviewer seam, and
- * its failure kind all live in `src/supervisor/contracts.ts`, and the one-shot
- * prompt primitive it introduced is expressed entirely in the worker contract
- * that was already here. Amendment was pre-authorized for that work and was
- * spent only on the false sentence.
+ * The cross-vendor review gate needs nothing from this file: its verdict
+ * vocabulary, its reviewer seam, and its failure kind all live in
+ * `src/supervisor/contracts.ts`, and the one-shot prompt primitive it uses is
+ * expressed entirely in the worker contract here.
  */
 
 /**
@@ -204,8 +197,8 @@ export const DEFAULT_IDLE_TIMEOUT_MS = createIdleTimeoutMs(900_000);
 
 /**
  * The only sanctioned constructor for an idle timeout used in a worker spec.
- * Because a cast can smuggle a sub-boundary value past the brand, WO-001
- * adapters must re-validate this value at the spawn boundary.
+ * Because a cast can smuggle a sub-boundary value past the brand, adapters
+ * must re-validate this value at the spawn boundary.
  */
 export function createIdleTimeoutMs(value: number): IdleTimeoutMs {
   if (!Number.isSafeInteger(value) || value <= IDLE_TIMEOUT_BOUNDARY_MS) {

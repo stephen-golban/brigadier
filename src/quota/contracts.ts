@@ -1,6 +1,7 @@
 /**
- * WO-002 owns this quota operation contract and may amend it freely within
- * this file. WO-002 must not add its members to the frozen `src/contracts.ts`.
+ * The quota operation contract. It is local to this module and may change
+ * freely within this file; its members deliberately stay out of the shared
+ * `src/contracts.ts`, which is published to consumers.
  *
  * Decision: QuotaOracle ingests Claude's push-based quota WorkerEvents.
  * Keeping the latest live signal in the oracle gives the supervisor one
@@ -9,10 +10,10 @@
  * `codex app-server --stdio` process. Claude's oracle owns no process; its
  * `dispose()` only closes the ingress and is therefore still idempotent.
  *
- * WO-010 added the two pure readers of the reshaped window contract,
- * `deriveAccountStatus` and `modelQuotaStatus`. They live here rather than in
- * the frozen `src/contracts.ts` because they are policy over the contract, not
- * part of it, and they are deliberately absent from `src/quota/index.ts`: that
+ * The two pure readers of the scoped window contract, `deriveAccountStatus`
+ * and `modelQuotaStatus`, live here rather than in the shared
+ * `src/contracts.ts` because they are policy over the contract, not part of
+ * it, and they are deliberately absent from `src/quota/index.ts`: that
  * barrel is re-exported wholesale by `src/index.ts`, so exporting them would
  * enlarge the package's public surface, which `test/public-api.test.ts` pins as
  * an exact set. Callers inside the repository import them from this module.
@@ -61,7 +62,7 @@ function mostCautious(statuses: readonly QuotaStatus[]): QuotaStatus {
 /**
  * A vendor's status, read from its ACCOUNT-scoped windows alone.
  *
- * The whole point of the WO-010 reshape: a drained `seven_day_opus` bucket says
+ * The whole point of scoping windows: a drained `seven_day_opus` bucket says
  * nothing about whether the account can run Sonnet, so it must not contribute
  * here. With no account-scoped window at all the answer is `"unknown"` rather
  * than `"available"` — brigadier has no evidence either way, and the router
@@ -160,14 +161,14 @@ const ALPHABETIC = /[a-z]/;
  * list, and the alphabetic-identity rule narrow the blast radius; they cannot
  * make an unreviewed string trustworthy. The structural fix — labels carrying
  * their provenance, so identifier-derived tokens and vendor prose can be
- * matched under different rules — needs a `QuotaScope` change, and
- * `src/contracts.ts` is frozen.
+ * matched under different rules — needs a `QuotaScope` change, which is a
+ * breaking change to the published `src/contracts.ts`.
  *
  * A label that matches nothing is not an error and is not a failure to map: it
  * simply constrains no model. Codex hands out opaque bucket codenames
- * (`codex_bengalfox` was observed in R-11 §2b) that brigadier refuses to guess a
- * model for, and the honest consequence of not guessing is a window that
- * restricts nobody. The alternative — treating an unmappable but admittedly
+ * (`codex_bengalfox` was one observed in the wild) that brigadier refuses to
+ * guess a model for, and the honest consequence of not guessing is a window
+ * that restricts nobody. The alternative — treating an unmappable but admittedly
  * model-scoped bucket as account-scoped — would reintroduce the exact defect
  * this function exists to remove.
  *

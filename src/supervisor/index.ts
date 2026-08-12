@@ -72,7 +72,7 @@
  * - `CAPABILITY_TABLE`, `CapabilityRule`, and `matchCapabilityRule`
  *   (`./capabilities.js`) are the pattern-matching implementation behind
  *   `buildCapabilities`. This is NOT the `COMPETENCE_TABLE` case: that table is
- *   API because decision #7 rests on the *ranking* being data a user can open
+ *   API because routing rests on the *ranking* being data a user can open
  *   and argue with, and no function derives a better artifact from it. Here the
  *   derived artifact is strictly more useful than its source — `Capability[]`
  *   states this machine's configured models, their surviving effort rungs, and

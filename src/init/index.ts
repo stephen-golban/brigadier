@@ -96,7 +96,7 @@ import {
 /**
  * The degraded-routing question, asked once for the whole config.
  *
- * The wording is the whole point of WO-010H. Its predecessor asked "When claude
+ * The wording is the whole point. An earlier version asked "When claude
  * quota drains, fall back to:" and offered a model list — a description of a
  * capability that no longer exists, since per-model quota metering means a
  * drained tier leaves its healthy siblings competing in the ordinary pipeline
@@ -106,15 +106,15 @@ import {
 export const DEGRADED_ROUTING_QUESTION =
   "If no model on this machine meets a slice's difficulty bar, run the slice on a weaker model instead of failing it?";
 
-/** Decision #20's documented warning, shown before any ceiling is raised. */
+/** The documented warning, shown before any ceiling is raised. */
 export const EFFORT_CEILING_WARNING =
   "Warning: above `high`, models take longer, burn more tokens, hallucinate more, and do worse work.";
 
-/** Decision #20: the ceiling is a cap, not a pin, and xhigh stays earned. */
+/** The ceiling is a cap, not a pin, and xhigh stays earned. */
 const EFFORT_CEILING_NOTE =
   "`xhigh` stays earned-on-retry regardless of this ceiling: brigadier reaches for it only after a routed model runs the slice and fails. A routing failure, where no model ran, does not earn it. Effort is never pinned per task tier.";
 
-/** Decision #19 and #7, said out loud so the config is not mistaken for a router. */
+/** The routing rules, said out loud so the config is not mistaken for a router. */
 const ROUTER_NOTE =
   "This config layers on top of brigadier's router: it records which models are permitted and how high their effort may go. Routing still filters by capability, ranks by competence, then weighs difficulty, effort, and cost. Vendor is never a routing input.";
 
@@ -426,7 +426,7 @@ async function confirmInteractively(
 
   // Asked once, after the per-vendor questions, because it is not a per-vendor
   // setting. Default No on a fresh config, matching the config default and
-  // decision #21's original spirit that brigadier never silently substitutes;
+  // the original spirit that brigadier never silently substitutes;
   // on a re-run the current value is the default, so an existing yes is not
   // discarded by pressing enter.
   const degraded = await confirmPrompt(
@@ -436,7 +436,7 @@ async function confirmInteractively(
   );
   config = withDegradedRouting(config, degraded);
 
-  // Decision #6: default No on a fresh config. On a re-run the current value is
+  // Default No on a fresh config. On a re-run the current value is
   // the default, so an existing yes is not silently discarded by pressing enter.
   const consent = await confirmPrompt(
     io,
@@ -706,10 +706,13 @@ Exit codes:
      brigadier refused to guess and printed the questions it needs answered.
      No slice worker, worktree, ref, or commit was created. This is not a
      failed slice run: answer the questions and run it again
-  130  the run was interrupted with SIGINT (Ctrl-C): every worker still running
-     was terminated along with its whole process group, its worktree was
-     removed, and the refs the run created were retired. Interrupt a second
-     time to skip that cleanup and exit at once
+  130  the run was interrupted with SIGINT (Ctrl-C): brigadier attempts to
+     terminate every worker still running along with its whole process group,
+     remove its worktree, and retire the refs the run created. Neither this
+     code nor 143 asserts that cleanup succeeded: whatever failed is listed
+     under "cleanup failures:" in the report, and a failure there means a
+     worker may still be running and spending quota, so read it. Interrupt a
+     second time to skip that cleanup and exit at once
   143  the run was interrupted with SIGTERM; identical to 130 in every respect
      but the signal
 `;
@@ -839,9 +842,9 @@ export async function runCli(options: CliOptions): Promise<number> {
 }
 
 /**
- * WIRING: WO-008A owns `src/discovery`. The factory name is the one wiring
- * point this unit could not verify against the frozen interface, which
- * declares only the `Discoverer` shape; confirm it at reconciliation.
+ * WIRING: the discovery contract declares only the `Discoverer` shape, not the
+ * name of the factory that produces one, so this is the single place that
+ * knows `src/discovery` exports `createDiscoverer`.
  */
 async function loadDiscoverer(): Promise<Discoverer> {
   const discovery = await import("../discovery/index.js");
@@ -893,7 +896,7 @@ const RUN_USAGE_ERROR = 2;
 const RUN_FAILED = 3;
 
 /**
- * DECISION #10's EXIT CODE: the task was too ambiguous to plan.
+ * THE `needs-human` EXIT CODE: the task was too ambiguous to plan.
  *
  * It needed a code of its own, and the three existing ones each say something
  * false about it. `0` would tell a `brigadier run … && deploy` that the work
@@ -1312,7 +1315,7 @@ async function resolvePlanFromTask(
 }
 
 /**
- * DECISION #10 ON SCREEN: questions, and an explicit account of what ran.
+ * `needs-human` ON SCREEN: questions, and an explicit account of what ran.
  *
  * The planner model has already run and cost tokens, while no slice worker,
  * worktree, ref, or commit exists. Both facts are printed because neither is

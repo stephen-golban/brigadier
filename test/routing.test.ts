@@ -232,10 +232,10 @@ describe("competence matrix", () => {
   /**
    * `readonly` is a compile-time claim and nothing more. Both of these are
    * exported through the package barrel and read live by the router on every
-   * call, so before WO-009E a consumer holding the same reference could set
+   * call, so without the freeze a consumer holding the same reference could set
    * `DIFFICULTY_FLOORS.hard = 0` between two identical `route` calls and get two
-   * different answers — which breaks `route`'s documented purity and decision
-   * #7's premise that the ranking is data that changes only in a diff.
+   * different answers — which breaks `route`'s documented purity and the routing
+   * policy's premise that the ranking is data that changes only in a diff.
    */
   test("the competence table and its rules are frozen at runtime", () => {
     expect(Object.isFrozen(COMPETENCE_TABLE)).toBe(true);
@@ -1066,7 +1066,7 @@ describe("capability filter", () => {
    * — "we do not know" — and the branch above already rules that answer is not
    * a yes.
    *
-   * This test asserted the opposite until WO-009E: it pinned an unknown window
+   * This test once asserted the opposite: it pinned an unknown window
    * *passing* a 150k floor with an apologetic note, which let a slice that
    * declared it needs 150k tokens be routed to a model brigadier cannot show
    * has them. The failure then lands inside a worker instead of at the filter
@@ -1227,7 +1227,8 @@ describe("quota", () => {
   });
 
   /**
-   * The defect this file was rewritten around, in its post-WO-010H form. The
+   * The defect this file was rewritten around, in the form it takes now that
+   * the per-vendor fallback is gone. The
    * router used to hand the slice to an exhausted vendor's configured fallback
    * the moment quota drained, which put a `hard` slice on a score-40 model
    * while a score-96 model from a healthy vendor sat idle.
@@ -1327,8 +1328,8 @@ describe("quota", () => {
   /**
    * The salvage pool holds only models quota left standing. A `hard` slice with
    * nothing at 90 must not reach a drained account's score-40 `claude-haiku-5`
-   * while a healthy score-70 `gpt-5.6-terra` sits idle — and after WO-010H the
-   * drained model is not merely outranked, it is not a candidate at all.
+   * while a healthy score-70 `gpt-5.6-terra` sits idle — and the drained model
+   * is not merely outranked, it is not a candidate at all.
    */
   test("a healthy below-floor model is salvaged and a drained one is not", () => {
     const config = makeConfig(
@@ -1937,7 +1938,7 @@ describe("quota", () => {
   });
 
   /**
-   * WO-010G's reproduction, kept because the wall it hit is still there.
+   * The original reproduction, kept because the wall it hit is still there.
    *
    * One vendor, one account-scoped weekly window reporting `exhausted`, and a
    * `routine` slice — the easiest work brigadier routes, so nothing but quota
@@ -2159,8 +2160,8 @@ describe("quota", () => {
 /* -------------------- stage 1: quota, scoped per model ------------------- */
 
 /**
- * WO-010B. WO-010A gave `QuotaWindow` a scope and made `QuotaSnapshot.status`
- * account-derived, which was right and which left the router reading the wrong
+ * Giving `QuotaWindow` a scope and making `QuotaSnapshot.status`
+ * account-derived was right, and it left the router reading the wrong
  * field: with only `snapshot.status` in hand, an Opus-only weekly limit was
  * invisible and a `hard` slice routed straight into the drained tier.
  *
@@ -2184,7 +2185,8 @@ describe("per-model quota", () => {
   }
 
   /**
-   * The flagship case of WO-010, and the one WO-010H must not regress.
+   * The flagship case for per-model quota metering, and the one nothing since
+   * may regress.
    *
    * `claude` is healthy as an account, `claude-opus-4-6` is drained, and
    * `claude-sonnet-5` is fine. Nothing special happens: Sonnet was never
@@ -2234,7 +2236,8 @@ describe("per-model quota", () => {
   /**
    * The same drained tier at a difficulty Sonnet cannot clear on its own:
    * Sonnet's 74 against the hard floor of 90 that Opus's 100 would have met.
-   * Before WO-010B this routed to `claude/claude-opus-4-6` — into the wall.
+   * Before the router read quota per model this routed to
+   * `claude/claude-opus-4-6` — into the wall.
    *
    * This one genuinely is a degraded run, so it needs consent and it says so.
    * The distinction between this test and the one above is the whole reason
@@ -2269,7 +2272,7 @@ describe("per-model quota", () => {
   /**
    * The consent gate survives per-model metering. The same drained Opus tier
    * without consent fails rather than quietly running the slice under the floor
-   * — decision #21's spirit, carried into the flag that replaced it.
+   * — the old consent rule's spirit, carried into the flag that replaced it.
    */
   test("a drained tier without degraded-routing consent leaves the floor in place", () => {
     const failure = expectFailure(
@@ -2420,7 +2423,7 @@ describe("per-model quota", () => {
   });
 
   /**
-   * R-11 §2b: Codex hands out opaque bucket codenames. Brigadier refuses to
+   * Codex hands out opaque bucket codenames. Brigadier refuses to
    * guess which model `codex_bengalfox` meters, and the honest consequence of
    * not guessing is a window that constrains nobody — never a window promoted
    * to account scope, which is the defect the reshape removed.
@@ -2579,7 +2582,7 @@ describe("per-model quota", () => {
   });
 
   /**
-   * WO-010G narrowed what disqualifies a salvage candidate to `exhausted` and
+   * What disqualifies a salvage candidate is `exhausted` and
    * nothing else. A `warning` says a window is close, not that it is spent, so a
    * model carrying one stays in the pool, stays eligible for the waived-floor
    * salvage pool, and can take the slice.

@@ -599,7 +599,7 @@ function otherVendor(
  * default model is the one the user told `brigadier init` they wanted from this
  * vendor, which is exactly the right answer to "who should read this".
  *
- * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. Decision #20 reserves
+ * EFFORT IS CAPPED AT `high`, WHATEVER THE CEILING SAYS. Brigadier reserves
  * `xhigh` for a slice worker re-routed after a prior routed model ran and
  * failed. A reviewer is not that re-routed slice worker, so it never receives
  * the rung. A model whose ceiling is `medium` reviews at `medium`.

@@ -3434,9 +3434,9 @@ describe("DefaultSliceRunner review gate", () => {
       "run",
     );
 
-    // DECISION #24, REACHED FOR THE FIRST TIME. Every previous route to a
-    // second attempt came from a worker that did not finish. This one comes
-    // from work that finished and was judged wrong, which is the case the
+    // GATE-FAILURE ESCALATION, REACHED FOR THE FIRST TIME. Every previous route
+    // to a second attempt came from a worker that did not finish. This one
+    // comes from work that finished and was judged wrong, which is the case the
     // escalation was designed for and which nothing could produce until the
     // gate existed.
     expect(result.ok).toBe(true);
