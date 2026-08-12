@@ -105,6 +105,7 @@ slice asks for none of these.
 | `imageInput` | boolean | when `true`, the worker must accept image input |
 | `webSearch` | boolean | when `true`, the worker must be able to search the web |
 | `structuredOutput` | boolean | when `true`, the worker must support structured output |
+| `commandExecution` | boolean | when `true`, the worker must be able to execute commands |
 | `minContextWindowTokens` | integer | non-negative; minimum context window |
 
 ## Owned paths

@@ -33,9 +33,9 @@ last four stages more tightly together. Its actual procedure is:
 3. Exclude an exact `(vendor, model)` pair that already failed this slice
    ([`src/routing/router.ts:285`](../src/routing/router.ts#L285)). This is retry
    history, not a preference.
-4. Filter on required image input, web search, structured output, and minimum
-   context window. A missing capability record passes only when the slice asks
-   for none of those things
+4. Filter on required image input, web search, structured output, command
+   execution, and minimum context window. A missing capability record passes
+   only when the slice asks for none of those things
    ([`src/routing/contracts.ts:43`](../src/routing/contracts.ts#L43) and
    [`src/routing/router.ts:895`](../src/routing/router.ts#L895)).
 5. Match each survivor's model ID against the competence table and split ranked

@@ -44,11 +44,12 @@ session is disposable and starts clean.
    the next wave's worktrees, so dependent slices start from their prerequisites'
    committed output. Unknown ids, self-dependencies, and cycles are refused.
    `requires` is optional and takes `imageInput`, `webSearch`,
-   `structuredOutput`, and `minContextWindowTokens`.
+   `structuredOutput`, `commandExecution`, and `minContextWindowTokens`.
 3. **Dry-run it first.** `brigadier run --plan plan.json --dry-run` routes every
-   slice and prints which vendor, model and effort would take it, without
-   creating a worktree or spawning anything. A slice that cannot route is worth
-   knowing about before a worker is spent on its siblings.
+   slice and reports it, without creating a worktree or spawning anything. Add
+   `--verbose` to see which vendor, model and effort would take each slice. A
+   slice that cannot route is worth knowing about before a worker is spent on
+   its siblings.
 4. **Run it.** `brigadier run --plan plan.json --max-workers 3`. Each slice gets
    its own git worktree and its own branch; what lands is merged onto one
    integration branch.

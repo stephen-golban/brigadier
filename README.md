@@ -105,19 +105,14 @@ with the answers folded in.
 
 `--dry-run` routes every slice and reports it, creating no worktree, spawning no
 slice worker, and writing no commit. With `--plan` it launches no model at all;
-with a task description it still launches the planner. This is real output from
-a two-slice plan:
+with a task description it still launches the planner. By default, its compact
+report for a two-slice plan looks like this:
 
 ```text
-run csv-export: 2 slice(s) in 2 wave(s)
-
-dry run csv-export: 2 slice(s) in 1ms
-  writer  would run
-      attempt 1  codex/gpt-5.6-terra effort=high  routed
-  writer-tests  would run
-      attempt 1  claude/claude-haiku-4-5-20251001 effort=medium  routed
-  integration branch: (none: a dry run writes no ref)
-  merges: (none)
+dry run csv-export: 2 slices, 1s → (none)
+  no verify command; the tests_pass gate will be skipped
+  writer        would run  (none)  (not reviewed: dry run)
+  writer-tests  would run  (none)  (not reviewed: dry run)
 ```
 
 Two different vendors, chosen by competence against each slice's declared
@@ -161,6 +156,7 @@ wrong.
 | `--max-workers <n>` | slices to run at once (default `1`). For a task description this is also the largest number of slices the planner may propose |
 | `--slug <name>` | names this run's branches (default: derived from the plan id) |
 | `--dry-run` | route every slice and report it; create no worktree, spawn no slice worker, write no commit. A task description still launches the planner |
+| `--verbose` | print the full per-attempt report and verbose progress log instead of the compact run summary |
 | `--unsafe-in-place` | run workers in this checkout instead of isolated worktrees |
 | `-h`, `--help` | print usage |
 
@@ -221,6 +217,10 @@ an ignored argument.
 `brigadier_route_plan` routes against an empty quota snapshot, so a drained
 model is not avoided there; it says so in its own output.
 
+`brigadier_run` always returns the compact report and has no verbose option.
+MCP output enters a host model's context window, so per-attempt detail would be
+a token cost on every run.
+
 ## The plan document
 
 A plan is JSON. Every slice is one unit of work handed to one worker running
@@ -275,46 +275,19 @@ validated by the function that validates them, before a single ref is written.
 
 ## Reading a run
 
-The report is one line per slice, then one line per attempt beneath it, then the
-gate's verdict beneath that. Printing only the last attempt would hide the
-escalation, which is the single most interesting thing a run produces.
+By default the report is one compact line per slice. It still names interrupts,
+cleanup failures, a run failure, plan issues, retries, and skipped reviews; a
+skipped review is rendered as `not reviewed: <reason>`, never as a pass.
 
-Running the same two-slice plan for real produces the progress log first and the
-report last. Slice numbers and durations differ every run; every line's shape is
-exactly what the logger and the report renderer emit.
+Running the same two-slice plan for real produces this compact report. The
+duration, commits, and record name are illustrative; every line's shape is what
+the report renderer emits.
 
 ```text
-run csv-export: 2 slice(s) in 2 wave(s)
-slice writer attempt 1: routed to codex/gpt-5.6-terra at high effort
-slice writer attempt 1: reviewing codex/gpt-5.6-terra's work with claude/claude-opus-5 at high effort
-slice writer attempt 1: review rejected by claude/claude-opus-5 (1 blocking, 0 concern(s)) in 41200ms
-slice writer attempt 2: routed to claude/claude-sonnet-5 at high effort
-slice writer attempt 2: reviewing claude/claude-sonnet-5's work with codex/gpt-5.6-sol at high effort
-slice writer attempt 2: review approved by codex/gpt-5.6-sol (0 blocking, 1 concern(s)) in 38400ms
-slice writer: ok brigadier/csv-export/slice-2 8f3c9a2 (review: approved by codex/gpt-5.6-sol)
-accumulate writer: merged
-slice writer-tests attempt 1: routed to claude/claude-haiku-4-5-20251001 at medium effort
-slice writer-tests attempt 1: reviewing claude/claude-haiku-4-5-20251001's work with codex/gpt-5.6-sol at high effort
-slice writer-tests attempt 1: review approved by codex/gpt-5.6-sol (0 blocking, 0 concern(s)) in 22100ms
-slice writer-tests: ok brigadier/csv-export/slice-3 1b77e05 (review: approved by codex/gpt-5.6-sol)
-merge writer: merged
-merge writer-tests: merged
-
-run csv-export: 2 slice(s) in 512300ms
-  writer  ok  brigadier/csv-export/slice-2  8f3c9a2
-      attempt 1  codex/gpt-5.6-terra effort=high  REVIEW_REJECTED: slice writer attempt 1: claude/claude-opus-5 found 1 blocking issue(s) in codex/gpt-5.6-terra's work: a field containing a quote is emitted unescaped
-        review: rejected by claude/claude-opus-5 effort=high in 41200ms
-          blocking src/csv.ts:31: a field containing a quote is emitted unescaped
-      attempt 2  claude/claude-sonnet-5 effort=high  ok 8f3c9a2
-        review: approved by codex/gpt-5.6-sol effort=high in 38400ms
-          concern src/csv.ts:12: writeCsv allocates the whole table before writing
-  writer-tests  ok  brigadier/csv-export/slice-3  1b77e05
-      attempt 1  claude/claude-haiku-4-5-20251001 effort=medium  ok 1b77e05
-        review: approved by codex/gpt-5.6-sol effort=high in 22100ms
-  integration branch: brigadier/csv-export
-  merges:
-    writer: merged 3d90f14
-    writer-tests: merged 6a2b881
+run csv-export: 2 slices, 8m32s → brigadier/csv-export
+  writer        ok  8f3c9a2  (retried once, approved by codex)
+  writer-tests  ok  1b77e05  (approved by codex)
+  full detail: /Users/you/.brigadier/runs/csv-export-<id>.json
 ```
 
 Things to notice, because each is a deliberate design decision:
@@ -323,11 +296,14 @@ Things to notice, because each is a deliberate design decision:
   exclusion list and the retry re-routes to a different one. Each slice gets
   exactly one such escalation — two failures on two different models is evidence
   the *slice* is wrong, not the model, and no third model fixes that.
-- **Concerns are printed under approvals.** They did not stop the commit, and
-  they are the half of a review a human can still act on.
-- **When a reviewer runs, its model and elapsed time are shown.** They are the
-  only evidence you have about how much reading actually happened. A
-  `NO_OTHER_VENDOR` skip has no reviewer identity to show.
+- **`--verbose` restores the full per-attempt report and verbose progress log.**
+  It shows rejected attempts, findings, concerns, reviewer models, and elapsed
+  time.
+- **Every completed non-dry run attempts to write a JSON record under
+  `$BRIGADIER_HOME/runs/`.** The compact report's `full detail:` line gives its
+  path on success. If redaction cannot be prepared or the write fails, that line
+  reports the failure and the run still succeeds; the work has already landed.
+  A dry run writes no record.
 - **A skipped review says so, with its reason**, and never renders as a pass.
 
 ## The cross-vendor gate
@@ -351,8 +327,11 @@ model. Style, naming and formatting are explicitly out of scope.
 
 > A pre-existing defect in a file a slice touches will not stop the commit; at
 > best it appears as a non-blocking concern. Nothing outside the diff and its
-> surrounding files is examined. **The gate does not run your tests, your
-> linter, or your build** — a slice can pass it and still be wrong.
+> surrounding files is examined. **The model reviewer does not run your tests,
+> your linter, or your build.** If a plan supplies `verify.command`, the
+> deterministic `tests_pass` gate runs it before model review and a non-zero
+> exit rejects the attempt. brigadier does not invent that command; without one,
+> the gate runs nothing and is skipped — a slice can still be wrong.
 
 ### It fails open
 
@@ -368,7 +347,7 @@ plainly rather than hidden:
 
 **On a single-vendor install, nothing adversarially reviews anything.** A slice
 that otherwise succeeds commits unreviewed, with
-`review: not run (NO_OTHER_VENDOR)` on its line. That is the most important
+`not reviewed: NO_OTHER_VENDOR` on its compact-report line. That is the most important
 caveat on this page for a new user. If you want the gate, install both CLIs.
 
 ### Nothing proves a reviewer looked
@@ -377,8 +356,8 @@ caveat on this page for a new user. If you want the gate, install both CLIs.
 one that glanced at it are byte-identical. There is no proof-of-work check,
 reviewer quality is not uniform, and a confident hallucination marked
 `blocking` costs a slice its escalation with nothing here able to catch it. The
-report shows the reviewer's model and elapsed time so you can form your own
-judgement.
+verbose report and full run record show the reviewer's model and elapsed time so
+you can form your own judgement.
 
 The full design — the scope policy and the measured failure that produced it,
 the adjudication rule, every skip reason, and the bounds on what a reviewer is
@@ -404,8 +383,9 @@ shown — is in [docs/REVIEW-GATE.md](docs/REVIEW-GATE.md).
   Slices that already committed keep their commits and are still merged —
   stopping a run is not a request to throw away finished work.
 - **Cleanup it could not finish is reported**, not assumed. If a worker will not
-  die or a worktree will not go, the report says so under `cleanup failures:`
-  rather than claiming everything was tidy.
+  die or a worktree will not go, the compact report prints a `cleanup failure:`
+  line for each problem; `--verbose` groups them under `cleanup failures:`.
+  Neither form claims everything was tidy.
 
 ## Secrets
 
@@ -451,7 +431,9 @@ at least one file was refused or could not be written, `2` usage error.
 
 ## Limits worth knowing before you rely on it
 
-- **The gate does not run anything.** No tests, no linter, no build. See above.
+- **The model reviewer does not run anything.** No tests, no linter, no build.
+  A plan's optional `verify.command` is the deterministic `tests_pass` gate;
+  brigadier does not invent one, so without it no command runs. See above.
 - **A Claude worker cannot run commands.** Its lane is enforced by `Edit` and
   `Write` tool rules rather than an OS sandbox, so `Bash` is withheld
   entirely — granting it would silently widen the lane to the whole filesystem.
