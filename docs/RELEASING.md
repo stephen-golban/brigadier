@@ -577,15 +577,17 @@ here:
   `=notarized` gate is valid for the release artifact itself, not only for the
   DMG.
 - **Whether the `=notarized` check requires network access remains unsettled.**
-  The first timing probe was invalid because it ran the same command on the same
-  artifact that an earlier check had already queried, so it measured its own
-  warm-up instead of a cold call; that invalid first probe measured `0.3152s`.
-  The clean series on a never-queried notarized binary measured
-  `0.3362 / 0.3222 / 0.3093 / 0.3272s`, and the second cold file measured
-  `0.2779s`. The repeats were flat, with no cold/warm signature. That argues
-  against a cached network result but is not conclusive without an offline test.
-  The workflow comment therefore remains deliberately hedged: the check *may*
-  consult Apple.
+  The rehearsal script's check 4 produced the invalid probes
+  `0.163 / 0.161 / 0.165s` (all invalid): an earlier check in the same run had
+  already executed `codesign --verify -R "=notarized"` against that same binary
+  moments before, so every probe was warm and the cold case was never sampled.
+  The cold first call of a clean re-measurement on a notarized binary that
+  nothing had previously queried measured `0.3152s`. Its four warm repeats on
+  the same file measured `0.3362 / 0.3222 / 0.3093 / 0.3272s`, and a second cold
+  call on a different never-queried notarized binary measured `0.2779s`. The
+  repeats were flat, with no cold/warm signature. That argues against a cached
+  network result but is not conclusive without an offline test. The workflow
+  comment therefore remains deliberately hedged: the check *may* consult Apple.
 - **The workflow's wiring remains unexercised with the publication secrets
   present.** `gh run list --workflow release.yml` returns exactly one run ever:
   `31513095322`, for tag `v0.1.0`, with no secrets set. On a real runner, the
