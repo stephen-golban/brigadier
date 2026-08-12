@@ -37,22 +37,22 @@ last four stages more tightly together. Its actual procedure is:
    context window. A missing capability record passes only when the slice asks
    for none of those things
    ([`src/routing/contracts.ts:44`](../src/routing/contracts.ts#L44) and
-   [`src/routing/router.ts:895`](../src/routing/router.ts#L895)).
+   [`src/routing/router.ts:909`](../src/routing/router.ts#L909)).
 5. Match each survivor's model ID against the competence table and split ranked
    from unranked models. Ranked models at or above the difficulty floor can enter
    ordinary eligibility. Ranked models below it and every unranked model are held
    for consented salvage
-   ([`src/routing/router.ts:709`](../src/routing/router.ts#L709) and
-   [`src/routing/router.ts:733`](../src/routing/router.ts#L733)).
+   ([`src/routing/router.ts:713`](../src/routing/router.ts#L713) and
+   [`src/routing/router.ts:735`](../src/routing/router.ts#L735)).
 6. Sort ranked models that clear the floor by ascending competence score, with
    configuration order breaking ties. That ascending sort is the entire cost
-   policy ([`src/routing/router.ts:717`](../src/routing/router.ts#L717)). It
+   policy ([`src/routing/router.ts:719`](../src/routing/router.ts#L719)). It
    reads no price, token rate, or latency estimate; it assumes the lower-scored
    adequate tier is the cheaper choice.
 7. In that order, resolve the first candidate to the highest supported effort
    no higher than the request's base effort or the configured ceiling
-   ([`src/routing/router.ts:758`](../src/routing/router.ts#L758) and
-   [`src/routing/router.ts:1012`](../src/routing/router.ts#L1012)). If a
+   ([`src/routing/router.ts:760`](../src/routing/router.ts#L760) and
+   [`src/routing/router.ts:1029`](../src/routing/router.ts#L1029)). If a
    candidate has no runnable effort, continue to the next candidate.
 8. If ordinary selection fails and degraded routing is allowed, consider ranked
    below-floor and unranked models that survived quota, exclusion, capability,
@@ -117,8 +117,8 @@ therefore unranked even though discovery can offer it.
 An unranked model is not proven weaker than a difficulty floor, but it is
 not proven to clear it either. It is therefore excluded from ordinary eligibility
 and enters the same consented salvage pool as a ranked model below the floor
-([`src/routing/router.ts:733`](../src/routing/router.ts#L733) and
-[`src/routing/router.ts:747`](../src/routing/router.ts#L747)). Without
+([`src/routing/router.ts:714`](../src/routing/router.ts#L714) and
+[`src/routing/router.ts:735`](../src/routing/router.ts#L735)). Without
 `allowDegradedRouting`, an unranked model cannot take the slice.
 
 ## Difficulty floors and cost inversion
@@ -178,7 +178,7 @@ of the current code. Retry does both: it excludes the failed model **and** sets
 the base effort to `xhigh`. The configured effort ceiling remains a real cap, as
 does the model's reported support. A `high` ceiling clamps an escalated request
 back to `high`; only a model permitted and reported to support `xhigh` can run at
-`xhigh` ([`src/routing/router.ts:1010`](../src/routing/router.ts#L1010)). The
+`xhigh` ([`src/routing/router.ts:1029`](../src/routing/router.ts#L1029)). The
 router also asserts before returning that `xhigh` was earned by an escalated
 request ([`src/routing/router.ts:1063`](../src/routing/router.ts#L1063)).
 

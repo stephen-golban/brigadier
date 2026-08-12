@@ -409,7 +409,7 @@ describe("the surface templates", () => {
       "utf8",
     );
     expect(paragraphContaining(methodology, "not proven to clear it")).toBe(
-      "An unranked model is not proven weaker than a difficulty floor, but it is\nnot proven to clear it either. It is therefore excluded from ordinary eligibility\nand enters the same consented salvage pool as a ranked model below the floor\n([`src/routing/router.ts:733`](../src/routing/router.ts#L733) and\n[`src/routing/router.ts:747`](../src/routing/router.ts#L747)). Without\n`allowDegradedRouting`, an unranked model cannot take the slice.",
+      "An unranked model is not proven weaker than a difficulty floor, but it is\nnot proven to clear it either. It is therefore excluded from ordinary eligibility\nand enters the same consented salvage pool as a ranked model below the floor\n([`src/routing/router.ts:714`](../src/routing/router.ts#L714) and\n[`src/routing/router.ts:735`](../src/routing/router.ts#L735)). Without\n`allowDegradedRouting`, an unranked model cannot take the slice.",
     );
     expect(paragraphContaining(methodology, "contains both kinds")).toBe(
       "With consent, the salvage pool contains both kinds of model that brigadier\ncould not prove meet the requested floor:",

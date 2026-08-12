@@ -51,11 +51,16 @@ Making secret files *visible* to workers at all is a separate, explicit
 consent recorded at `init`, defaulting to **No**. With consent off, no
 configured secret file is linked into any worktree.
 
-Consent governs *linking*, not visibility. Every file tracked in git is
-captured into the base commit each worktree is checked out from, whatever the
-consent setting says. A `.env` committed to your repository is therefore
-present in the worker's worktree; only the inventoried values inside it are
-replaced, under the verbatim-only limit above.
+Consent governs *linking*, not visibility. Every file in your working tree
+that git does not ignore — tracked or not — is captured into the base commit
+each worktree is checked out from, whatever the consent setting says. A
+`.env` committed to your repository, and an untracked `.env.local` you never
+added, are both therefore present in the worker's worktree, byte for byte.
+**The worker reads the real values.** Redaction replaces inventoried values
+only in brigadier's own artifacts — commit messages, the diff and the prompt
+the reviewer is given, the paths and summaries it returns, git output in
+error messages — never in the file contents a worker opens, and always under
+the verbatim-only limit above.
 
 `--unsafe-in-place` bypasses worktree isolation and the linked-file
 visibility boundary entirely: the worker runs in your own checkout, where

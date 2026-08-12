@@ -72,8 +72,10 @@ deliverable and could not see what the deliverable was. The diff closed that gap
 
 ### Bounds
 
-- At most **96 KiB** of diff, roughly 24k tokens. A reviewer handed a 400 KiB
-  patch does not read it more slowly, it reads it less carefully.
+- At most **98,304 characters** of diff (96 × 1024), roughly 24k tokens — a
+  character count, not a byte count, so a non-ASCII diff of that length is
+  larger than 96 KiB on disk. A reviewer handed a 400 KiB patch does not read
+  it more slowly, it reads it less carefully.
 - A truncated diff carries its **truncation notice inside the patch text**, so a
   reviewer cannot believe it saw the whole change. The run log says so too.
 - Binary files render as one `Binary files … differ` line rather than base64.

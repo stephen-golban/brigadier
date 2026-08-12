@@ -4,9 +4,10 @@
 
 You give it a task or a plan; it decomposes the work into slices, routes each
 slice to a vendor CLI by competence against that slice's declared difficulty,
-gives each one its own git worktree, and — when a second vendor is installed —
-runs a cross-vendor adversarial review before every slice commit. The resulting
-slice commits are merged onto one branch and reported together.
+gives each one its own git worktree, and runs a cross-vendor adversarial review
+before a slice commits whenever the second vendor's reviewer can be reached —
+[The cross-vendor gate](#the-cross-vendor-gate) is the list of times it cannot.
+The resulting slice commits are merged onto one branch and reported together.
 
 It is not a proxy and not a hosted service. It does not ask for or store model
 API credentials and never talks to a model API; it spawns `claude` and `codex`
@@ -93,10 +94,11 @@ slice worker, and writing no commit. Every option and every exit code is in
 ## The cross-vendor gate
 
 Before a slice commits, a model from the other vendor is shown the exact diff
-the commit would record — at most 96 KiB of it; a larger diff is truncated and
-says so inside the patch text — and asked whether it is correct. A blocking
-finding fails the attempt, removes the worktree, and re-routes the retry to a
-different model. Style, naming and formatting are explicitly out of scope.
+the commit would record — at most 98,304 characters of it; a larger diff is
+truncated and says so inside the patch text — and asked whether it is correct.
+A blocking finding fails the attempt, removes the worktree, and re-routes the
+retry to a different model. Style, naming and formatting are explicitly out of
+scope.
 
 The review fails open. **On a single-vendor install, nothing adversarially
 reviews anything.** A slice that otherwise succeeds commits unreviewed, with
@@ -135,6 +137,7 @@ ranking input.
 | [docs/METHODOLOGY.md](docs/METHODOLOGY.md) | the routing policy, published so it can be audited for vendor bias |
 | [docs/RELEASING.md](docs/RELEASING.md) | the release procedure |
 | [SECURITY.md](SECURITY.md) | what redaction covers, what it does not, and how to report a vulnerability |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each released version |
 
 ## Limits worth knowing
 

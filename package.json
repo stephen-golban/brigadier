@@ -2,6 +2,14 @@
   "name": "@stephen-golban/brigadier",
   "version": "0.1.1",
   "description": "Orchestrate AI coding work from the command line",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stephen-golban/brigadier.git"
+  },
+  "homepage": "https://github.com/stephen-golban/brigadier#readme",
+  "bugs": {
+    "url": "https://github.com/stephen-golban/brigadier/issues"
+  },
   "license": "MIT",
   "type": "module",
   "bin": {
