@@ -26,7 +26,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import packageJson from "../package.json";
@@ -138,7 +138,7 @@ async function drive(
   argv: readonly string[] = [],
 ): Promise<Session> {
   const proc = Bun.spawn({
-    cmd: ["bun", entry, ...argv],
+    cmd: [process.execPath, entry, ...argv],
     cwd: repositoryRoot,
     env,
     stdin: "pipe",
@@ -184,11 +184,12 @@ function responses(session: Session): readonly string[] {
 
 /**
  * The scratch home every session gets: no config, no worker CLI, nothing real.
- * `PATH` is carried through only so `bun` itself can be found.
+ * The subprocess is launched with this test runner's absolute executable path,
+ * so PATH can be empty and prove that lazy configuration sees no real worker.
  */
 function scratchEnv(scratchHome: string): Record<string, string> {
   return {
-    PATH: process.env.PATH ?? "",
+    PATH: "",
     HOME: scratchHome,
     BRIGADIER_HOME: scratchHome,
     USER: "brigadier-test",
@@ -210,6 +211,45 @@ function scratchEnv(scratchHome: string): Record<string, string> {
 const REAL_ENTRY = `import { runMcpServer } from ${JSON.stringify(`${repositoryRoot}/src/mcp/server.ts`)};
 process.exitCode = await runMcpServer();
 `;
+
+/** The real dependencies, with discovery injected only to make setup portable. */
+const LAZY_CONFIG_ENTRY = `import type { Discoverer } from ${JSON.stringify(`${repositoryRoot}/src/discovery/contracts.ts`)};
+import { createRealDependencies, serveMcp } from ${JSON.stringify(`${repositoryRoot}/src/mcp/server.ts`)};
+
+const discoverer: Discoverer = {
+  discover: async () => ({
+    vendors: [{
+      vendor: "claude",
+      executable: "/opt/brigadier-test/claude",
+      version: "2.0.14",
+      catalogSource: "static-table",
+      models: [{
+        id: "claude-opus-4-6",
+        displayName: "Claude Opus 4.6",
+        supportedEfforts: ["medium", "high"],
+        defaultEffort: "high",
+        selectable: true,
+      }],
+    }],
+    missing: ["codex"],
+    warnings: [],
+  }),
+};
+
+process.exitCode = await serveMcp({
+  stdin: process.stdin,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  version: ${JSON.stringify(VERSION)},
+  dependencies: createRealDependencies(process.env, {
+    stderr: process.stderr,
+    discoverer,
+  }),
+});
+`;
+
+const NO_WORKER_CLI_MESSAGE =
+  "no installed worker CLI reported a selectable model. Install Claude Code or Codex, then try again.";
 
 /**
  * The same server with the one impure dependency replaced.
@@ -409,14 +449,20 @@ describe("the MCP server over stdio", () => {
         "brigadier_route_plan",
         "brigadier_run",
       ]);
+      // THESE STRINGS ARE THE DOCTRINE, NOT DECORATION. Cursor, Windsurf,
+      // Antigravity, and Claude Desktop read no skill directory, so this
+      // metadata is the only thing brigadier ever says to their model: when to
+      // delegate, that the work goes here rather than inline, how to shape a
+      // plan, and that a worker must never call back in. They are pinned whole,
+      // and `test/surfaces.test.ts` holds the .mcpb manifest to the same bytes.
       expect(tools[0]?.description).toBe(
-        "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing.",
+        "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing. Draft a plan against this before brigadier_run: it names every defect at once, including two slices that claim the same path.",
       );
       expect(tools[1]?.description).toBe(
-        "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker.",
+        "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker. Worth a call before brigadier_run, because a slice no model can take is worth knowing about before a worker is spent on its siblings.",
       );
       expect(tools[2]?.description).toBe(
-        "Run a brigadier plan on a local repository: route every slice, spawn a worker for each, commit what it produced, and merge the lot.",
+        "Hand multi-part coding work to brigadier instead of doing it inline: it routes every slice, gives each its own git worktree and worker, commits what each produced, and merges the lot. Reach for this whenever the work has more than one independent piece — a feature, a cross-file refactor, a migration, a bug with several call sites, a batch of mechanical edits — and route that work here rather than editing the files yourself. Build the plan as the plan argument documents: one slice per independent piece, exclusive ownedPaths (no two slices may claim the same path, or a directory containing another's), and dependsOn naming any slice whose committed output another slice needs. Never call this if you are yourself a brigadier worker running one slice: re-entry spends the whole slice and lands nothing.",
       );
 
       // This MCP contract accepts plan documents. Task-to-plan is available on
@@ -853,7 +899,51 @@ describe("the MCP server over stdio", () => {
     }
   }, 40_000);
 
-  test("the real exported runMcpServer serves, and refuses to run with no config", async () => {
+  test("a tools call without config creates and uses one", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
+    const entry = join(home, "entry.ts");
+    await writeFile(entry, LAZY_CONFIG_ENTRY, "utf8");
+    try {
+      const session = await drive(
+        entry,
+        [call(3, "brigadier_route_plan", { plan: VALID_PLAN })],
+        scratchEnv(home),
+      );
+      const lines = responses(session);
+      expect(lines).toHaveLength(1);
+      const response = JSON.parse(lines[0] ?? "") as {
+        result: {
+          isError: boolean;
+          content: readonly { text: string; type: string }[];
+        };
+      };
+      expect(response.result).toEqual({
+        content: [
+          {
+            text: "plan add-retry: 2 slice(s) routed against this machine's config.\nno quota snapshot is read here, so a drained model is not avoided; a real run learns that from the worker and escalates.\n  retry-core  claude/claude-opus-4-6 effort=high\n  retry-docs  claude/claude-opus-4-6 effort=medium",
+            type: "text",
+          },
+        ],
+        isError: false,
+      });
+      expect(session.stderr).toContain(
+        `brigadier: wrote config to ${home}/config.json`,
+      );
+      expect(session.exitCode).toBe(0);
+
+      const persisted = JSON.parse(
+        await readFile(join(home, "config.json"), "utf8"),
+      ) as { version: number; vendors: readonly { vendor: string }[] };
+      expect(persisted.version).toBe(3);
+      expect(persisted.vendors.map((vendor) => vendor.vendor)).toEqual([
+        "claude",
+      ]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("the real exported runMcpServer reports why no worker CLI can be configured", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-mcp-"));
     const entry = join(home, "entry.ts");
     await writeFile(entry, REAL_ENTRY, "utf8");
@@ -883,9 +973,9 @@ describe("the MCP server over stdio", () => {
       expect(lines[1]).toBe(
         '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"plan add-retry is valid: 2 slice(s) in 1 wave(s).\\n  wave 1: retry-core, retry-docs"}],"isError":false}}',
       );
-      // Both impure tools refuse against an empty $BRIGADIER_HOME, which is what
-      // keeps this test from spawning a worker on the machine running it.
-      const configPath = `${home}/config.json`;
+      // Both impure tools use the real lazy configuration path. With PATH empty
+      // there is no worker to configure, so the fatal reason is returned in the
+      // ordinary ToolResult shape without ever starting a worker.
       expect(lines[2]).toBe(
         JSON.stringify({
           jsonrpc: "2.0",
@@ -894,7 +984,7 @@ describe("the MCP server over stdio", () => {
             content: [
               {
                 type: "text",
-                text: `no brigadier config was found at ${configPath}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one.`,
+                text: NO_WORKER_CLI_MESSAGE,
               },
             ],
             isError: true,
@@ -909,7 +999,7 @@ describe("the MCP server over stdio", () => {
             content: [
               {
                 type: "text",
-                text: `no brigadier config was found at ${configPath}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one.`,
+                text: NO_WORKER_CLI_MESSAGE,
               },
             ],
             isError: true,
@@ -956,7 +1046,7 @@ describe("the MCP server over stdio", () => {
             dryRun: true,
           }),
         ],
-        scratchEnv(home),
+        { ...scratchEnv(home), PATH: process.env.PATH ?? "" },
       );
       const lines = responses(session);
       expect(lines.length).toBe(1);

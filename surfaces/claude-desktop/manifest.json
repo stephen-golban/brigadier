@@ -19,15 +19,15 @@
   "tools": [
     {
       "name": "brigadier_validate_plan",
-      "description": "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing."
+      "description": "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing. Draft a plan against this before brigadier_run: it names every defect at once, including two slices that claim the same path."
     },
     {
       "name": "brigadier_route_plan",
-      "description": "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker."
+      "description": "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker. Worth a call before brigadier_run, because a slice no model can take is worth knowing about before a worker is spent on its siblings."
     },
     {
       "name": "brigadier_run",
-      "description": "Run a brigadier plan on a local repository: route every slice, spawn a worker for each, commit what it produced, and merge the lot."
+      "description": "Hand multi-part coding work to brigadier instead of doing it inline: it routes every slice, gives each its own git worktree and worker, commits what each produced, and merges the lot. Reach for this whenever the work has more than one independent piece — a feature, a cross-file refactor, a migration, a bug with several call sites, a batch of mechanical edits — and route that work here rather than editing the files yourself. Build the plan as the plan argument documents: one slice per independent piece, exclusive ownedPaths (no two slices may claim the same path, or a directory containing another's), and dependsOn naming any slice whose committed output another slice needs. Never call this if you are yourself a brigadier worker running one slice: re-entry spends the whole slice and lands nothing."
     }
   ],
   "tools_generated": false,

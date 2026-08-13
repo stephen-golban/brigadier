@@ -57,44 +57,48 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
-    bytes: 4052,
+    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+    bytes: 5396,
   },
   "claude-code/hooks/README.md": {
-    sha256: "a8dc71a0a1efdcb504fa5448793695f45f6f7a0b8b85a9d8e827be8230773090",
-    bytes: 1919,
+    sha256: "45a6b3f3cf3e3da1be8e3d654ac15d4867c5c01c9df70bea4421996764f6d92f",
+    bytes: 5352,
   },
   "claude-code/hooks/handoff.mjs": {
     sha256: "2726afa2525d3e609c6e0a390adcf336dcfd24e41a5eb34d5b61e03383ac10ff",
     bytes: 5445,
   },
   "claude-code/hooks/hooks.json": {
-    sha256: "896daf07fe5d2ca91b92f51a4de35d3f713395c6cc0b6ea610d0462b6f582992",
-    bytes: 236,
+    sha256: "491a1bf6c9f84cfd94f2fbd8c0d58dc9e8f18015d4e78e0e82d1c81c07f3a655",
+    bytes: 432,
+  },
+  "claude-code/hooks/nudge.mjs": {
+    sha256: "13b2eb97a3f65ad2053262ec444098b4f5bc65aa1fdd1daf89aafe9e8f02de7d",
+    bytes: 12147,
   },
   "claude-desktop/README.md": {
-    sha256: "e410fcf3ef50fe6882b579b49ded0f96c9fde2e817795ffb896b25f11c9ec6aa",
-    bytes: 3023,
+    sha256: "bb5a0937ed1fe91eba5b9e62389c99b538afef5e21a03cc9b67fcf3b0a79e4a3",
+    bytes: 3722,
   },
   "claude-desktop/manifest.json": {
-    sha256: "4df6c2afbd2252372ff7ead8ce203a5c3a3915a862067e6de066978ae4a2a203",
-    bytes: 1597,
+    sha256: "151d858963600f7c2cae06df761703c8bf7a3de5fab11350df1f1986497e91e9",
+    bytes: 2536,
   },
   "codex/AGENTS.md": {
-    sha256: "25a4de39ff6fa3de58ae846ba581787a8e029682da7df0c39c861ac3ed93b2d8",
-    bytes: 3163,
+    sha256: "5e7e861ee00bee3015160c018e6da36f466038f8e40058ba99f22cfad3dd917a",
+    bytes: 4490,
   },
   "codex/hooks/README.md": {
-    sha256: "dd26bd349600df8baca4642406e6ce3a75a4a2ccc48f303a383d8b65fe6473fa",
-    bytes: 3185,
+    sha256: "c30e3f94b875af45a988e063d692b7bb2ef17d45bd9ed75b32d0867eb1c4bb1a",
+    bytes: 3597,
   },
   "codex/hooks/handoff.mjs": {
     sha256: "2726afa2525d3e609c6e0a390adcf336dcfd24e41a5eb34d5b61e03383ac10ff",
     bytes: 5445,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
-    bytes: 4052,
+    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+    bytes: 5396,
   },
   "opencode/README.md": {
     sha256: "53feacbb72b7f667b7e280d815058e2753bf72f48e6f849fce54aa2604f1ed92",
@@ -259,18 +263,66 @@ function verdictLines(stdout: string): readonly string[] {
   return stdout
     .split("\n")
     .filter((line) =>
-      /^ {2}(created|updated|unchanged|refused|failed) /.test(line),
+      /^ {2}(created|updated|unchanged|skipped|refused|failed) /.test(line),
     );
 }
 
+/** A complete, valid config whose only interesting field is the consent. */
+function configBytes(guiRegistrationConsent: boolean): string {
+  return `${JSON.stringify(
+    {
+      version: 3,
+      vendors: [
+        {
+          vendor: "codex",
+          executable: "/opt/homebrew/bin/codex",
+          version: "0.145.0",
+          defaultModel: "gpt-5.6-sol",
+          models: [{ id: "gpt-5.6-sol", effortCeiling: "high" }],
+        },
+      ],
+      secretsConsent: false,
+      linkedSecretPaths: [],
+      guiRegistrationConsent,
+      allowDegradedRouting: false,
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+/** The four host configuration directories, as if all four were installed. */
+const GUI_HOST_DIRECTORIES = [
+  ".cursor",
+  ".codeium/windsurf",
+  ".gemini/config",
+  "Library/Application Support/Claude",
+] as const;
+
+async function makeGuiHostsPresent(home: string): Promise<void> {
+  for (const directory of GUI_HOST_DIRECTORIES) {
+    await mkdir(join(home, directory), { recursive: true });
+  }
+}
+
+function guiRegistrationPaths(home: string): readonly string[] {
+  return [
+    join(home, ".cursor/mcp.json"),
+    join(home, ".codeium/windsurf/mcp_config.json"),
+    join(home, ".gemini/config/mcp_config.json"),
+    join(home, "Library/Application Support/Claude/claude_desktop_config.json"),
+  ];
+}
+
 describe("the surface templates", () => {
-  test("the compiled templates are exactly these thirteen files", () => {
+  test("the compiled templates are exactly these fourteen files", () => {
     expect(Object.keys(SURFACE_TEMPLATES).sort()).toEqual([
       "claude-code/.claude-plugin/plugin.json",
       "claude-code/SKILL.md",
       "claude-code/hooks/README.md",
       "claude-code/hooks/handoff.mjs",
       "claude-code/hooks/hooks.json",
+      "claude-code/hooks/nudge.mjs",
       "claude-desktop/README.md",
       "claude-desktop/manifest.json",
       "codex/AGENTS.md",
@@ -316,7 +368,7 @@ describe("the surface templates", () => {
     // simply not have been in the commit. Every test in this file was green
     // while the deliverable was invisible to git.
     const files = walkSurfaces(surfacesRoot, "");
-    expect(files.length).toBe(14);
+    expect(files.length).toBe(15);
     for (const key of files) {
       const result = spawnSync("git", ["check-ignore", "-q", key], {
         cwd: surfacesRoot,
@@ -367,9 +419,13 @@ describe("the surface templates", () => {
         "   `id`, `title`, `prompt`, `ownedPaths` and `difficulty` are required on every\n   slice. `difficulty` is one of `routine`, `standard`, `hard`, and it has no\n   default: a plan that does not say how hard a slice is has not been planned.\n   `dependsOn` is optional and names prerequisite slice ids. brigadier runs\n   dependency waves in order and reconciles each non-final wave before creating\n   the next wave's worktrees, so dependent slices start from their prerequisites'\n   committed output. Unknown ids, self-dependencies, and cycles are refused.\n   `requires` is optional and takes `imageInput`, `webSearch`,\n   `structuredOutput`, `commandExecution`, and `minContextWindowTokens`.",
       );
       expect(
-        textBetween(doctrine, "- Do not invent commands.", "\n\n## Before"),
+        textBetween(
+          doctrine,
+          "- Do not invent commands.",
+          "\n\n## There is no setup step",
+        ),
       ).toBe(
-        '- Do not invent commands. brigadier has exactly four: `init`, `run`,\n  `install`, and `mcp`. `brigadier run "<task description>"` asks a model to\n  decompose the task, then sends the result through the same validator used for\n  `--plan`. On genuine ambiguity it exits 4 with `status: "needs_human"` and\n  structured questions; no worktree is created and no slice worker is spawned.',
+        '- Do not invent commands. brigadier has exactly four: `run`, `install`, `mcp`,\n  and `init`. `brigadier run "<task description>"` asks a model to decompose the\n  task, then sends the result through the same validator used for `--plan`. On\n  genuine ambiguity it exits 4 with `status: "needs_human"` and structured\n  questions; no worktree is created and no slice worker is spawned.',
       );
       expect(
         paragraphContaining(doctrine, "`1` setup or planning failed"),
@@ -397,9 +453,111 @@ describe("the surface templates", () => {
       "2. **Write a plan document** (JSON). Every slice needs `id`, `title`, `prompt`,\n   `ownedPaths`, and `difficulty` (`routine`, `standard`, or `hard` — there is no\n   default). `requires` is optional. `dependsOn` names prerequisite slice ids.\n   brigadier reconciles each non-final dependency wave before creating the next\n   wave's worktrees, so dependent slices start from their prerequisites' committed\n   output. Unknown ids, self-dependencies, and cycles are refused.",
     );
     expect(
-      textBetween(codexAgents, "- Invent commands.", "\n\n`brigadier init`"),
+      textBetween(
+        codexAgents,
+        "- Invent commands.",
+        "\n\nThere is no setup step.",
+      ),
     ).toBe(
-      '- Invent commands. brigadier has exactly four: `init`, `run`, `install`, and\n  `mcp`. `brigadier run "<task description>"` asks a model to decompose the task\n  and sends the result through the same validator used for `--plan`. On genuine\n  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no\n  worktree is created and no slice worker is spawned.',
+      '- Invent commands. brigadier has exactly four: `run`, `install`, `mcp`, and\n  `init`. `brigadier run "<task description>"` asks a model to decompose the task\n  and sends the result through the same validator used for `--plan`. On genuine\n  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no\n  worktree is created and no slice worker is spawned.',
+    );
+  });
+
+  test("every installed doctrine bans a worker from re-entering brigadier", () => {
+    // THE GUARD THAT DECIDES. `workerEnvironment` stamps BRIGADIER_WORKER=1 into
+    // every worker's environment, which keeps the nudge hook quiet inside a
+    // worker, but nothing in the product refuses a second run — so a worker that
+    // decides to orchestrate still spends its whole slice and lands nothing. It
+    // has happened once already. These paragraphs are the rest of the defence,
+    // which is why they are pinned rather than merely written, and why they must
+    // describe the marker honestly rather than claim there is nothing at all.
+    for (const doctrine of [
+      SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
+      SURFACE_TEMPLATES["codex/skills/brigadier/SKILL.md"] ?? "",
+      SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
+    ]) {
+      expect(doctrine).toContain(
+        "## If you are already a brigadier worker, stop here",
+      );
+      expect(
+        paragraphContaining(doctrine, "must never invoke brigadier"),
+      ).toContain(
+        "**A brigadier worker must never invoke brigadier.** If the prompt you were given\nis one slice of somebody else's plan — it names an `id`, the paths you own, and\nthe evidence you owe — then you are the worker, and the work in front of you is\nthe work you do. Spawning a second orchestrator from inside a slice spends the\nwhole slice and lands nothing. This has happened. brigadier stamps\n`BRIGADIER_WORKER=1` into every worker's environment, which is enough to keep the\nnudge hook quiet inside a worker but does not stop you: nothing in the product\nrefuses a second run, so this paragraph is what prevents it.",
+      );
+    }
+  });
+
+  test("every installed doctrine says configuration is automatic", () => {
+    // `brigadier init` stopped being a prerequisite when `ensureConfig` landed.
+    // A doctrine that still sends the host model to an init step sends it to a
+    // step that does nothing it needs.
+    //
+    // THE ONE CARVE-OUT IS PINNED TOO. `consentInstructions` in
+    // `src/surfaces/install.ts` — the only remedy offered when a GUI
+    // registration is skipped for want of consent — tells the reader to run
+    // interactive `brigadier init`. A doctrine that forbade that outright would
+    // forbid the single step consent recovery requires, so the exception is
+    // stated here rather than left to collide.
+    const skill = SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "";
+    expect(paragraphContaining(skill, "Configuration is automatic")).toBe(
+      "Configuration is automatic. `brigadier run` probes this machine for installed\nworker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by\ndefault — when none is there, and carries on. Never run `brigadier init` to make\na config appear: it has never been a prerequisite for a run, and a turn spent on\nit is a turn wasted. The one exception is not yours to take. Registering\nbrigadier's MCP server into a GUI application's own configuration takes a human's\nexplicit yes, and only the interactive question can ask for it — so if\n`brigadier install` reports a registration skipped for want of consent, pass that\nsentence to the user and let them run `brigadier init` once themselves.",
+    );
+    expect(
+      paragraphContaining(
+        SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
+        "There is no setup step",
+      ),
+    ).toBe(
+      "There is no setup step. Configuration is automatic: `brigadier run` probes this\nmachine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)\nwhen none is there, and carries on. Never run `brigadier init` to make a config\nappear; it is not a prerequisite. Its one real job belongs to a human: recording\nthe explicit yes that lets brigadier register its MCP server into a GUI\napplication's own configuration. If `brigadier install` reports a registration\nskipped for want of consent, pass that sentence to the user and let them run\n`brigadier init` once themselves.",
+    );
+    for (const doctrine of [
+      skill,
+      SURFACE_TEMPLATES["codex/skills/brigadier/SKILL.md"] ?? "",
+      SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
+    ]) {
+      expect(doctrine).not.toContain("must have been run once on this machine");
+      expect(doctrine).not.toContain("exits 1 and tells you to run `init`");
+    }
+  });
+
+  test("the Claude Code registration carries both hooks and no matcher on the nudge", () => {
+    // UserPromptSubmit takes no matcher on this host. A matcher there is not a
+    // harmless extra key; it is a registration the host may reject outright.
+    const hooks = JSON.parse(
+      SURFACE_TEMPLATES["claude-code/hooks/hooks.json"] ?? "",
+    ) as {
+      hooks: Record<
+        string,
+        readonly {
+          matcher?: string;
+          hooks: readonly Record<string, string>[];
+        }[]
+      >;
+    };
+    expect(Object.keys(hooks.hooks)).toEqual([
+      "PreCompact",
+      "UserPromptSubmit",
+    ]);
+    expect(hooks.hooks.PreCompact?.[0]?.matcher).toBe("*");
+    expect(hooks.hooks.UserPromptSubmit?.[0]?.matcher).toBeUndefined();
+    expect(hooks.hooks.UserPromptSubmit?.[0]?.hooks).toEqual([
+      {
+        type: "command",
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: Claude Code expands this, not JavaScript. It is a literal byte of the registration.
+        command: "${CLAUDE_PLUGIN_ROOT}/hooks/nudge.mjs",
+      },
+    ]);
+  });
+
+  test("the Codex registration deliberately stays a single event", () => {
+    // LANDMINE, STATED IN THE ARTIFACT. Codex binds hook approval to the
+    // registration — event, matcher, and command together — so registering the
+    // nudge there would disarm the already-approved handoff until the user
+    // approved again. The nudge is not worth that, and the README says so.
+    const codex = SURFACE_TEMPLATES["codex/hooks/README.md"] ?? "";
+    expect(codex).not.toContain("nudge.mjs");
+    expect(paragraphContaining(codex, "only event brigadier registers")).toBe(
+      "`PreCompact` is the only event brigadier registers here, and that is deliberate.\nClaude Code also gets a `UserPromptSubmit` nudge; Codex does not, because Codex\nbinds approval to the registration — event, matcher, and command together — so\nadding a second event would disarm the already-approved handoff until the user\napproved the new registration. A nudge is not worth silently switching off the\nhandoff.",
     );
   });
 
@@ -434,8 +592,37 @@ describe("the surface templates", () => {
       "- **opencode — event binding verified, with limits.** The plugin's event names\n  were verified against opencode 1.18.16, but no live compaction was triggered,\n  only that version was tested, and its event vocabulary is version-dependent.\n  See `opencode/plugin/brigadier.js` and `opencode/README.md`.",
     );
     expect(textBetween(index, "- **Codex", "\n- **Claude Desktop")).toBe(
-      "- **Codex — registered, then trust-gated.** `brigadier install codex` merges a\n  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only\n  after you approve the registration. Approval is bound to the registration, not\n  to the contents of `handoff.mjs`, so editing the script does not prompt again.\n  See `codex/hooks/`.",
+      "- **Codex — registered, then trust-gated.** `brigadier install codex` merges a\n  `PreCompact` registration into `$CODEX_HOME/hooks.json`, but Codex runs it only\n  after you approve the registration. Approval is bound to the registration, not\n  to the contents of `handoff.mjs`, so editing the script does not prompt again.\n  The nudge is deliberately not registered there, because adding an event would\n  disarm the approved handoff. See `codex/hooks/`.",
     );
+  });
+
+  test("the surface index cites each GUI host's own documentation for its path", () => {
+    // A registration written to a guessed path is silent breakage the user
+    // blames on their editor. The citation is what makes the path auditable.
+    const index = readFileSync(join(surfacesRoot, "README.md"), "utf8");
+    for (const [host, path, documentation] of [
+      ["Cursor", "`~/.cursor/mcp.json`", "https://cursor.com/docs/context/mcp"],
+      [
+        "Windsurf",
+        "`~/.codeium/windsurf/mcp_config.json`",
+        "https://docs.devin.ai/desktop/cascade/mcp",
+      ],
+      [
+        "Antigravity",
+        "`~/.gemini/config/mcp_config.json`",
+        "https://antigravity.google/docs/mcp",
+      ],
+      [
+        "Claude Desktop",
+        "`~/Library/Application Support/Claude/claude_desktop_config.json`",
+        "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
+      ],
+    ]) {
+      expect(`${host}: ${index.includes(path ?? "")}`).toBe(`${host}: true`);
+      expect(`${host}: ${index.includes(documentation ?? "")}`).toBe(
+        `${host}: true`,
+      );
+    }
   });
 
   test("the opencode README names both installed files", () => {
@@ -543,6 +730,7 @@ describe("brigadier install", () => {
         `  created    ${home}/.claude/skills/brigadier/.claude-plugin/plugin.json`,
         `  created    ${home}/.claude/skills/brigadier/hooks/hooks.json`,
         `  created    ${home}/.claude/skills/brigadier/hooks/handoff.mjs`,
+        `  created    ${home}/.claude/skills/brigadier/hooks/nudge.mjs`,
         `  created    ${home}/.claude/skills/brigadier/hooks/README.md`,
         `  created    ${home}/.agents/skills/brigadier/SKILL.md`,
         `  created    ${home}/.agents/skills/brigadier/hooks/handoff.mjs`,
@@ -551,12 +739,18 @@ describe("brigadier install", () => {
         `  created    ${home}/.codex/hooks.json`,
         `  created    ${home}/.config/opencode/plugin/brigadier.js`,
         `  created    ${home}/.config/opencode/brigadier.README.md`,
+        // Every GUI host is skipped: this scratch HOME has no config, and no
+        // config is not a yes.
+        `  skipped    ${home}/.cursor/mcp.json`,
+        `  skipped    ${home}/.codeium/windsurf/mcp_config.json`,
+        `  skipped    ${home}/.gemini/config/mcp_config.json`,
         `  created    ${home}/.brigadier/surfaces/claude-desktop/manifest.json`,
         `  created    ${home}/.brigadier/surfaces/claude-desktop/README.md`,
+        `  skipped    ${home}/Library/Application Support/Claude/claude_desktop_config.json`,
       ]);
       expect(
         result.stdout.endsWith(
-          "\ndry run: 14 written, 0 unchanged, 0 refused.\n",
+          "\ndry run: 15 written, 0 unchanged, 4 skipped, 0 refused.\n",
         ),
       ).toBe(true);
       // A dry run writes NOTHING, not even the manifest that records writes.
@@ -605,9 +799,33 @@ describe("brigadier install", () => {
       ).toBe(true);
       expect(
         notes.some((note) =>
-          note.includes("NOTHING WAS INSTALLED INTO CLAUDE DESKTOP."),
+          note.includes("THE .mcpb BUNDLE WAS ONLY STAGED, AT "),
         ),
       ).toBe(true);
+      // The four hosts that can only be reached over MCP say so, each naming
+      // its own file rather than borrowing a neighbour's.
+      for (const claim of [
+        `Cursor reads no skill directory. ${home}/.cursor/mcp.json is the user-scoped MCP configuration`,
+        `Windsurf reads no skill directory. ${home}/.codeium/windsurf/mcp_config.json is the only documented MCP configuration for Cascade`,
+        `Antigravity reads no skill directory. ${home}/.gemini/config/mcp_config.json is the global configuration shared by its IDE, CLI, and SDK.`,
+        `Desktop reads ${home}/Library/Application Support/Claude/claude_desktop_config.json only at startup.`,
+      ]) {
+        expect(
+          `${claim.slice(0, 24)}: ${notes.some((note) => note.includes(claim))}`,
+        ).toBe(`${claim.slice(0, 24)}: true`);
+      }
+      // Each registered path cites the host's own documentation, in the output
+      // the user actually reads rather than only in a source comment.
+      expect(
+        notes.filter((note) =>
+          note.startsWith("  note: that path and entry shape were read from "),
+        ),
+      ).toEqual([
+        "  note: that path and entry shape were read from https://cursor.com/docs/context/mcp",
+        "  note: that path and entry shape were read from https://docs.devin.ai/desktop/cascade/mcp",
+        "  note: that path and entry shape were read from https://antigravity.google/docs/mcp",
+        "  note: that path and entry shape were read from https://modelcontextprotocol.io/docs/develop/connect-local-servers",
+      ]);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -619,7 +837,9 @@ describe("brigadier install", () => {
       const result = await install(["claude-code"], { HOME: home });
       expect(result.code).toBe(0);
       expect(
-        result.stdout.endsWith("\n5 written, 0 unchanged, 0 refused.\n"),
+        result.stdout.endsWith(
+          "\n6 written, 0 unchanged, 0 skipped, 0 refused.\n",
+        ),
       ).toBe(true);
 
       const skill = join(home, ".claude/skills/brigadier");
@@ -627,7 +847,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
+        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -652,9 +872,10 @@ describe("brigadier install", () => {
         `${skill}/hooks/README.md`,
         `${skill}/hooks/handoff.mjs`,
         `${skill}/hooks/hooks.json`,
+        `${skill}/hooks/nudge.mjs`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "c57adda3b5f2681d68510b8290d03948a6f6fd6ced308bb105889f20a22aa06d",
+        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
       );
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -672,10 +893,13 @@ describe("brigadier install", () => {
         `  unchanged  ${home}/.claude/skills/brigadier/.claude-plugin/plugin.json`,
         `  unchanged  ${home}/.claude/skills/brigadier/hooks/hooks.json`,
         `  unchanged  ${home}/.claude/skills/brigadier/hooks/handoff.mjs`,
+        `  unchanged  ${home}/.claude/skills/brigadier/hooks/nudge.mjs`,
         `  unchanged  ${home}/.claude/skills/brigadier/hooks/README.md`,
       ]);
       expect(
-        second.stdout.endsWith("\n0 written, 5 unchanged, 0 refused.\n"),
+        second.stdout.endsWith(
+          "\n0 written, 6 unchanged, 0 skipped, 0 refused.\n",
+        ),
       ).toBe(true);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -698,7 +922,9 @@ describe("brigadier install", () => {
       // THE EDIT SURVIVED. This is the whole property.
       expect(await readFile(edited, "utf8")).toBe("our team's own wording\n");
       expect(
-        second.stdout.endsWith("\n0 written, 4 unchanged, 1 refused.\n"),
+        second.stdout.endsWith(
+          "\n0 written, 5 unchanged, 0 skipped, 1 refused.\n",
+        ),
       ).toBe(true);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -1090,6 +1316,7 @@ describe("brigadier install", () => {
         `  created    ${home}/elsewhere/claude/skills/brigadier/.claude-plugin/plugin.json`,
         `  created    ${home}/elsewhere/claude/skills/brigadier/hooks/hooks.json`,
         `  created    ${home}/elsewhere/claude/skills/brigadier/hooks/handoff.mjs`,
+        `  created    ${home}/elsewhere/claude/skills/brigadier/hooks/nudge.mjs`,
         `  created    ${home}/elsewhere/claude/skills/brigadier/hooks/README.md`,
         `  created    ${home}/.agents/skills/brigadier/SKILL.md`,
         `  created    ${home}/.agents/skills/brigadier/hooks/handoff.mjs`,
@@ -1098,13 +1325,344 @@ describe("brigadier install", () => {
         `  created    ${home}/elsewhere/codex/hooks.json`,
         `  created    ${home}/elsewhere/xdg/opencode/plugin/brigadier.js`,
         `  created    ${home}/elsewhere/xdg/opencode/brigadier.README.md`,
+        // The four GUI hosts read only their own documented location. None of
+        // them honours an override, so none is offered, and these paths stay
+        // anchored to HOME while every other root has moved.
+        `  skipped    ${home}/.cursor/mcp.json`,
+        `  skipped    ${home}/.codeium/windsurf/mcp_config.json`,
+        `  skipped    ${home}/.gemini/config/mcp_config.json`,
         `  created    ${home}/elsewhere/brigadier/surfaces/claude-desktop/manifest.json`,
         `  created    ${home}/elsewhere/brigadier/surfaces/claude-desktop/README.md`,
+        `  skipped    ${home}/Library/Application Support/Claude/claude_desktop_config.json`,
       ]);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  test("with no consent recorded, every GUI registration is skipped and named", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      // Every host present, every host installed, and still nothing is written:
+      // presence is not permission.
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false),
+        "utf8",
+      );
+
+      const result = await install(
+        ["cursor", "windsurf", "antigravity", "claude-desktop"],
+        { HOME: home },
+      );
+      expect(result.code).toBe(0);
+      const registrations = guiRegistrationPaths(home);
+      expect(
+        verdictLines(result.stdout).filter((line) => /skipped/.test(line)),
+      ).toEqual(registrations.map((path) => `  skipped    ${path}`));
+      // THE INSTRUCTIONS ARE PART OF THE GATE. A skip that does not say how to
+      // proceed is indistinguishable from a bug.
+      expect(result.stdout).toContain(
+        `brigadier writes into another application's configuration only on an explicit yes, and only a human can give it. Run \`brigadier init\` yourself — recording this consent is the one thing it is for — and answer yes to "Register brigadier's MCP server with detected GUI hosts", which records "guiRegistrationConsent": true in ${home}/.brigadier/config.json. Nothing else, including --force, grants it.`,
+      );
+      // NOTHING WAS REGISTERED, SO THERE IS NO COMMAND TO WARN ABOUT. The PATH
+      // note belongs to a registration that actually happened.
+      expect(result.stdout).not.toContain(
+        "THE REGISTRATION NAMES A BARE COMMAND",
+      );
+      // NOT ONE BYTE LANDED IN ANY OF THEM.
+      for (const path of registrations) {
+        expect(`${path} exists=${existsSync(path)}`).toBe(
+          `${path} exists=false`,
+        );
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("--force does not grant consent", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false),
+        "utf8",
+      );
+      const forced = await install(["cursor", "--force"], { HOME: home });
+      expect(forced.code).toBe(0);
+      expect(verdictLines(forced.stdout)).toEqual([
+        `  skipped    ${home}/.cursor/mcp.json`,
+      ]);
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a config that cannot be parsed is a no, not a yes", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        "{not json",
+        "utf8",
+      );
+      const result = await install(["cursor"], { HOME: home });
+      expect(verdictLines(result.stdout)).toEqual([
+        `  skipped    ${home}/.cursor/mcp.json`,
+      ]);
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("with consent, each host gets its own documented path and shape", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+
+      const result = await install(
+        ["cursor", "windsurf", "antigravity", "claude-desktop"],
+        { HOME: home, BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier" },
+      );
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      const [cursor, windsurf, antigravity, desktop] =
+        guiRegistrationPaths(home);
+      expect(verdictLines(result.stdout)).toEqual([
+        `  created    ${cursor}`,
+        `  created    ${windsurf}`,
+        `  created    ${antigravity}`,
+        `  created    ${home}/.brigadier/surfaces/claude-desktop/manifest.json`,
+        `  created    ${home}/.brigadier/surfaces/claude-desktop/README.md`,
+        `  created    ${desktop}`,
+      ]);
+
+      // ONE HOST'S SHAPE DOES NOT GENERALISE TO ANOTHER. Cursor's own field
+      // table marks `type` required for stdio servers; none of the other three
+      // documents the key at all, so none of the other three is given it.
+      expect(JSON.parse(await readFile(cursor ?? "", "utf8"))).toEqual({
+        mcpServers: {
+          brigadier: {
+            type: "stdio",
+            command: "/usr/local/bin/brigadier",
+            args: ["mcp"],
+          },
+        },
+      });
+      for (const path of [windsurf, antigravity, desktop]) {
+        expect(JSON.parse(await readFile(path ?? "", "utf8"))).toEqual({
+          mcpServers: {
+            brigadier: { command: "/usr/local/bin/brigadier", args: ["mcp"] },
+          },
+        });
+      }
+      // AN ABSOLUTE COMMAND NEEDS NO WARNING AND GETS NONE. The note below is
+      // for the bare-name case only; printing it here would train the reader to
+      // ignore it.
+      expect(result.stdout).not.toContain(
+        "THE REGISTRATION NAMES A BARE COMMAND",
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a bare command is registered with the note that the host must find it", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      // THE COMMENT'S PROMISE, ASSERTED. Installing from source under `bun` (or
+      // from `node dist/cli.js`) has no honest absolute path to offer, so the
+      // bare name goes into a GUI host's config — a registration that exits 0
+      // and may never start anything, because a Finder-launched application does
+      // not inherit a login shell's PATH. The install still succeeds; it just
+      // has to say so. `BRIGADIER_MCP_COMMAND` is deliberately unset here, which
+      // is what makes the command bare under the test runner.
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+      const target = join(home, ".cursor/mcp.json");
+
+      const result = await install(["cursor"], { HOME: home });
+      expect(result.code).toBe(0);
+      expect(verdictLines(result.stdout)).toEqual([`  created    ${target}`]);
+      expect(JSON.parse(await readFile(target, "utf8"))).toEqual({
+        mcpServers: {
+          brigadier: { type: "stdio", command: "brigadier", args: ["mcp"] },
+        },
+      });
+      expect(result.stdout).toContain(
+        `  note: THE REGISTRATION NAMES A BARE COMMAND, "brigadier". This host has to resolve it on its own PATH, and an application launched from Finder does not inherit a login shell's PATH — when it cannot find the command, the server never starts and nothing says so. Set BRIGADIER_MCP_COMMAND to an absolute path and run this again to write that instead.\n`,
+      );
+
+      // A WARNING, NOT A FAILURE: the second run is unchanged, still exits 0,
+      // and still says it, because the bare command is still in the file.
+      const again = await install(["cursor"], { HOME: home });
+      expect(again.code).toBe(0);
+      expect(verdictLines(again.stdout)).toEqual([`  unchanged  ${target}`]);
+      expect(again.stdout).toContain("THE REGISTRATION NAMES A BARE COMMAND");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a registration preserves every other server and key in the file", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+      const target = join(home, ".cursor/mcp.json");
+      // Deliberately not brigadier's formatting: compact arrays, an unknown
+      // top-level key, and a foreign server that must come back untouched.
+      const original = `{\n  "mcpServers": {\n    "someone-else": {\n      "command": "npx",\n      "args": ["-y", "other"]\n    }\n  },\n  "unknownTopLevel": 42\n}\n`;
+      await writeFile(target, original, "utf8");
+
+      const result = await install(["cursor"], {
+        HOME: home,
+        BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
+      });
+      expect(result.code).toBe(0);
+      expect(verdictLines(result.stdout)).toEqual([`  updated    ${target}`]);
+      const after = await readFile(target, "utf8");
+      // The foreign server's own bytes, including its compact array, survive.
+      expect(after).toContain(
+        `    "someone-else": {\n      "command": "npx",\n      "args": ["-y", "other"]\n    }`,
+      );
+      expect(after).toContain(`  "unknownTopLevel": 42`);
+      expect(JSON.parse(after)).toEqual({
+        mcpServers: {
+          "someone-else": { command: "npx", args: ["-y", "other"] },
+          brigadier: {
+            type: "stdio",
+            command: "/usr/local/bin/brigadier",
+            args: ["mcp"],
+          },
+        },
+        unknownTopLevel: 42,
+      });
+
+      // Idempotent: a second install changes nothing at all.
+      const second = await install(["cursor"], {
+        HOME: home,
+        BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
+      });
+      expect(verdictLines(second.stdout)).toEqual([`  unchanged  ${target}`]);
+      expect(await readFile(target, "utf8")).toBe(after);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a host that is not installed is skipped rather than conjured", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      // Consent given, but only Cursor is actually on this machine.
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+
+      const result = await install(["cursor", "windsurf"], {
+        HOME: home,
+        BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
+      });
+      expect(result.code).toBe(0);
+      expect(verdictLines(result.stdout)).toEqual([
+        `  created    ${home}/.cursor/mcp.json`,
+        `  skipped    ${home}/.codeium/windsurf/mcp_config.json`,
+      ]);
+      expect(result.stdout).toContain(
+        `${home}/.codeium/windsurf does not exist, so this host is not installed on this machine. brigadier does not create another product's configuration directory.`,
+      );
+      expect(existsSync(join(home, ".codeium"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed host JSON is refused and left byte-for-byte intact", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await makeGuiHostsPresent(home);
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+      const target = join(home, ".cursor/mcp.json");
+      const malformed = '{"mcpServers": {\nHAND EDIT\n';
+      await writeFile(target, malformed, "utf8");
+
+      const result = await install(["cursor"], { HOME: home });
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)).toEqual([`  refused    ${target}`]);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `could not parse ${target}. Fix the malformed JSON and re-run; brigadier left the file unchanged.`,
+      );
+      expect(await readFile(target, "utf8")).toBe(malformed);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a registration is never written through a destination symlink", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-install-link-"));
+    try {
+      const home = `${scratch}/home`;
+      await makeGuiHostsPresent(home);
+      await mkdir(`${home}/.brigadier`, { recursive: true });
+      await mkdir(`${scratch}/dotfiles`, { recursive: true });
+      await writeFile(
+        `${home}/.brigadier/config.json`,
+        configBytes(true),
+        "utf8",
+      );
+      const target = `${home}/.cursor/mcp.json`;
+      const outside = `${scratch}/dotfiles/mcp.json`;
+      const outsideBytes = "REGISTRATION OUTSIDE BYTES: do not overwrite\n";
+      await writeFile(outside, outsideBytes, "utf8");
+      await symlink(outside, target, "file");
+
+      const result = await installWithin(["cursor"], { HOME: home });
+      const realOutside = await realpath(outside);
+      expect(result.elapsedMs).toBeLessThan(5_000);
+      expect(result.code).toBe(1);
+      expect(verdictLines(result.stdout)).toEqual([`  refused    ${target}`]);
+      expect(outcomeDetail(result.stdout, target)).toBe(
+        `refusing to write ${target}: it is a symbolic link to ${outside} (real path ${realOutside}); brigadier never writes through a destination symlink. --force replaces edited files; it does not override this refusal.`,
+      );
+      expect(await readFile(outside, "utf8")).toBe(outsideBytes);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   test("no HOME is refused rather than guessed", async () => {
     const result = await install(["claude-code"], {});
@@ -1147,13 +1705,13 @@ describe("brigadier install", () => {
       const unknown = await install(["emacs"], { HOME: home });
       expect(unknown.code).toBe(2);
       expect(unknown.stderr.split("\n")[0]).toBe(
-        'brigadier install: unknown host "emacs"; known hosts are claude-code, codex, opencode, claude-desktop',
+        'brigadier install: unknown host "emacs"; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop',
       );
 
       const none = await install([], { HOME: home });
       expect(none.code).toBe(2);
       expect(none.stderr.split("\n")[0]).toBe(
-        "brigadier install: name at least one host, or pass --all; known hosts are claude-code, codex, opencode, claude-desktop",
+        "brigadier install: name at least one host, or pass --all; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop",
       );
 
       const badOption = await install(["--frobnicate"], { HOME: home });
@@ -1181,7 +1739,7 @@ describe("brigadier install", () => {
         { HOME: home },
       );
       expect(result.code).toBe(0);
-      expect(verdictLines(result.stdout).length).toBe(5);
+      expect(verdictLines(result.stdout).length).toBe(6);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -1563,6 +2121,366 @@ describe("the handoff hook", () => {
     expect(run.stdout).toBe(
       '{"systemMessage":"brigadier: this session is out of context. Do not carry the remaining work here — write it as a brigadier plan and run `brigadier run --plan <file>`. A fresh worker gets a clean context; you keep the review."}\n',
     );
+  }, 30_000);
+});
+
+describe("the nudge hook", () => {
+  const nudgePath = join(surfacesRoot, "claude-code/hooks/nudge.mjs");
+
+  /** One prompt, one scratch temp root, so once-per-session is observable. */
+  async function runNudge(
+    payload: unknown,
+    scratch: string,
+    env: Record<string, string> = {},
+  ): Promise<{ stdout: string; exitCode: number }> {
+    const proc = Bun.spawn({
+      cmd: ["node", nudgePath],
+      env: { PATH: process.env.PATH ?? "", TMPDIR: scratch, ...env },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new Response(proc.stdout).text();
+    proc.stdin.write(
+      typeof payload === "string" ? payload : JSON.stringify(payload),
+    );
+    await proc.stdin.end();
+    const exitCode = await proc.exited;
+    return { stdout: await stdout, exitCode };
+  }
+
+  function prompt(sessionId: string, text: string): Record<string, unknown> {
+    return {
+      hook_event_name: "UserPromptSubmit",
+      session_id: sessionId,
+      transcript_path: "/nonexistent/transcript.jsonl",
+      cwd: "/tmp",
+      user_input: text,
+    };
+  }
+
+  const MULTI_PART =
+    "Refactor the authentication module so the token refresh is shared, and update every call site across the codebase to use the new helper instead of the inline logic they each carry today.";
+
+  const EXPECTED_MESSAGE =
+    "brigadier: this looks like more than one independent piece of work. Load the brigadier skill, write it as a plan, and run `brigadier run` from here rather than doing it inline. If you are already a brigadier worker running one slice, ignore this and do your slice.";
+
+  /**
+   * THE WHOLE MATCHER, AS A TABLE, WITH ABSOLUTE EXPECTATIONS.
+   *
+   * A false positive costs far more than a false negative here: the hook has one
+   * nudge per session, and spending it on a bug report means the genuinely
+   * multi-part task three prompts later gets nothing. Every silent case below is
+   * a shape that fired, or nearly fired, before this table existed.
+   */
+  const MATCHER_CASES: readonly [string, boolean, string][] = [
+    // A QUESTION IS NEVER ENOUGH, however it is formatted. Three bullets of
+    // symptoms under an opening question is one bug, not three pieces of work.
+    [
+      "a question with three bullets of symptoms",
+      false,
+      "Why is the /orders endpoint returning 502 in staging but never locally, when the same build passes every check we have?\n- p95 latency triples about a minute before it starts\n- the pod restarts twice an hour with no OOM in the events\n- the upstream logs show a connection reset rather than a timeout",
+    ],
+    // ORDINARY ENGLISH ABOUT ONE FUNCTION. A structural verb beside a plural
+    // word is not a plan: this is one function in one file.
+    [
+      "a big verb about one function",
+      false,
+      "Refactor `parseCsv` to handle multiple delimiters across quoted fields, and keep the existing tests green so nothing that already parses today starts failing.",
+    ],
+    // A PASTE IS NOT AN ASSIGNMENT.
+    [
+      "a pasted stack trace",
+      false,
+      "TypeError: Cannot read properties of undefined (reading 'id')\n    at resolveOrder (/srv/app/src/orders/resolve.js:42:19)\n    at processTicksAndRejections (node:internal/process/task_queues:95:5)\n    at async invokeHandler (/srv/app/src/http/handler.js:18:3)",
+    ],
+    // A FENCE IS QUOTED MATERIAL. Those three bullets are the user's config,
+    // not three slices, and the breadth and scope words inside it are theirs.
+    [
+      "a fenced block whose contents are bulleted",
+      false,
+      "Here is the CI config we are using right now, and something in it makes the cache miss on the second run:\n\n```yaml\nsteps:\n  - build every package in the workspace\n  - migrate the database\n  - rename the outputs\n```\n\nTake a look and tell me what you find.",
+    ],
+    ["something short", false, "fix the typo in parser.ts"],
+    [
+      "one file, at length",
+      false,
+      "In src/http/client.ts the retry loop currently swallows the abort signal when the timeout fires, which makes a cancelled request look like a transient failure. Please fix that.",
+    ],
+    [
+      "a question that merely says each",
+      false,
+      "Can you walk me through how each of these middleware functions is invoked, and across which routes, so that I understand the ordering before I change anything?",
+    ],
+    [
+      "breadth with no scope verb",
+      false,
+      "Have a look at every one of the handlers in the routes directory and tell me which of them are still using the deprecated response helper, across the whole codebase.",
+    ],
+    // AND THE OTHER DIRECTION: genuinely independent pieces, which are what the
+    // session's one nudge is for.
+    [
+      "a shared helper and every call site",
+      true,
+      "Refactor the authentication module so the token refresh is shared, and update every call site across the codebase to use the new helper instead of the inline logic they each carry today.",
+    ],
+    [
+      "a migration naming three files",
+      true,
+      "Migrate the billing integration off the deprecated SDK across all the services that use it: src/billing/client.ts, src/billing/webhooks.ts and src/billing/reconcile.ts each need the new auth header, and their shared fixtures need updating too.",
+    ],
+    [
+      "a rename reaching every module that imports it",
+      true,
+      "Rename the legacy UserRecord type to Account and update every module that imports it, including the API handlers, the persistence layer and the seed scripts, then rewrite the fixtures that hard-code the old name.",
+    ],
+    [
+      "an enumerated plan of three items",
+      true,
+      "Please pick up the following work items today:\n1. Add a retry helper in src/http/retry.ts\n2. Wire it into the client in src/http/client.ts\n3. Backfill the tests in test/http.test.ts",
+    ],
+  ];
+
+  test("the matcher fires on independent pieces and on nothing else", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      for (const [label, shouldFire, text] of MATCHER_CASES) {
+        const run = await runNudge(prompt(`session-${label}`, text), scratch);
+        // The absolute expected value, per case: exit code and the exact bytes.
+        expect(`${label}: ${run.exitCode} ${JSON.stringify(run.stdout)}`).toBe(
+          `${label}: 0 ${JSON.stringify(
+            shouldFire
+              ? `${JSON.stringify({
+                  systemMessage: EXPECTED_MESSAGE,
+                  additionalContext: EXPECTED_MESSAGE,
+                })}\n`
+              : "",
+          )}`,
+        );
+      }
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a worker never hears the nudge, whatever its slice prompt says", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      // THE MECHANICAL HALF OF THE RE-ENTRY GUARD. `workerEnvironment` in
+      // src/worker/shared.ts stamps this marker at the spawn, so a slice prompt
+      // — long, enumerated, and full of exactly the words the matcher looks for
+      // — cannot make the hook tell a worker to run brigadier. The prompt used
+      // here is one the matcher demonstrably fires on above.
+      const [, , firing] = MATCHER_CASES[8] ?? ["", false, ""];
+      const run = await runNudge(prompt("session-worker", firing), scratch, {
+        BRIGADIER_WORKER: "1",
+      });
+      expect(`${run.exitCode} ${JSON.stringify(run.stdout)}`).toBe('0 ""');
+
+      // The same prompt, the same scratch root, without the marker: the marker
+      // is what silenced it, not the once-per-session claim.
+      const unmarked = await runNudge(
+        prompt("session-not-worker", firing),
+        scratch,
+      );
+      expect(JSON.parse(unmarked.stdout).systemMessage).toBe(EXPECTED_MESSAGE);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an ordinary prompt is met with silence", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      // THE PROPERTY THAT KEEPS THE HOOK INSTALLED. A hook that speaks every
+      // turn is uninstalled within a day, so each of these must be silent: too
+      // short, long but about one file, and a question that merely says "each".
+      const cases: readonly [string, string][] = [
+        ["short", "fix the typo in parser.ts"],
+        [
+          "one file, at length",
+          "In src/http/client.ts the retry loop currently swallows the abort signal when the timeout fires, which makes a cancelled request look like a transient failure. Please fix that.",
+        ],
+        [
+          "a question",
+          "Can you walk me through how each of these middleware functions is invoked, and across which routes, so that I understand the ordering before I change anything?",
+        ],
+        [
+          "breadth with no scope verb",
+          "Have a look at every one of the handlers in the routes directory and tell me which of them are still using the deprecated response helper, across the whole codebase.",
+        ],
+      ];
+      for (const [label, text] of cases) {
+        const run = await runNudge(prompt(`session-${label}`, text), scratch);
+        expect(`${label}: ${run.exitCode} ${JSON.stringify(run.stdout)}`).toBe(
+          `${label}: 0 ""`,
+        );
+      }
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("genuinely multi-part work is nudged exactly once per session", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      const first = await runNudge(prompt("session-a", MULTI_PART), scratch);
+      expect(first.exitCode).toBe(0);
+      expect(JSON.parse(first.stdout)).toEqual({
+        // Both keys carry the same line. `systemMessage` is what the user sees;
+        // `additionalContext` is what the model reads, and a nudge that reached
+        // only the human would not make the skill fire.
+        systemMessage: EXPECTED_MESSAGE,
+        additionalContext: EXPECTED_MESSAGE,
+      });
+
+      // ONCE. The second prompt in the same session, however multi-part, is met
+      // with silence.
+      const second = await runNudge(prompt("session-a", MULTI_PART), scratch);
+      expect(second.exitCode).toBe(0);
+      expect(second.stdout).toBe("");
+
+      // A different session is a different budget.
+      const other = await runNudge(prompt("session-b", MULTI_PART), scratch);
+      expect(other.stdout).toBe(first.stdout);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an enumerated plan of three or more items is nudged", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      const run = await runNudge(
+        prompt(
+          "session-list",
+          [
+            "Please pick up the following work items today:",
+            "1. Add a retry helper in src/http/retry.ts",
+            "2. Wire it into the client in src/http/client.ts",
+            "3. Backfill the tests in test/http.test.ts",
+          ].join("\n"),
+        ),
+        scratch,
+      );
+      expect(run.exitCode).toBe(0);
+      expect(JSON.parse(run.stdout).systemMessage).toBe(EXPECTED_MESSAGE);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unbounded or unrecognised call produces silence, never a failure", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      const cases: readonly [string, unknown][] = [
+        ["garbage", "this is not JSON at all"],
+        ["array", "[]"],
+        ["null", "null"],
+        // A session with no id cannot be bounded to one nudge, so it gets none.
+        [
+          "no session id",
+          {
+            hook_event_name: "UserPromptSubmit",
+            user_input: MULTI_PART,
+          },
+        ],
+        // Registered against the wrong event, the script is inert.
+        [
+          "wrong event",
+          {
+            hook_event_name: "PreCompact",
+            session_id: "session-wrong",
+            user_input: MULTI_PART,
+          },
+        ],
+        // No prompt text at all.
+        [
+          "no prompt",
+          { hook_event_name: "UserPromptSubmit", session_id: "session-empty" },
+        ],
+      ];
+      for (const [label, payload] of cases) {
+        const run = await runNudge(payload, scratch);
+        expect(`${label}: ${run.exitCode} ${JSON.stringify(run.stdout)}`).toBe(
+          `${label}: 0 ""`,
+        );
+      }
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("the older `prompt` field is read, and BRIGADIER_NUDGE=off silences it", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      const legacy = await runNudge(
+        {
+          hook_event_name: "UserPromptSubmit",
+          session_id: "session-legacy",
+          prompt: MULTI_PART,
+        },
+        scratch,
+      );
+      expect(JSON.parse(legacy.stdout).systemMessage).toBe(EXPECTED_MESSAGE);
+
+      const off = await runNudge(prompt("session-off", MULTI_PART), scratch, {
+        BRIGADIER_NUDGE: "off",
+      });
+      expect(off.exitCode).toBe(0);
+      expect(off.stdout).toBe("");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unwritable marker directory means silence, not a nudge every turn", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      // A temp root that is a regular file: the marker directory cannot be
+      // created, so once-per-session cannot be enforced, so nothing is said.
+      const blocked = join(scratch, "not-a-directory");
+      await writeFile(blocked, "", "utf8");
+      const run = await runNudge(
+        prompt("session-blocked", MULTI_PART),
+        blocked,
+      );
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toBe("");
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("stdin that never ends is abandoned rather than waited on forever", async () => {
+    const scratch = await mkdtemp(join(tmpdir(), "brigadier-nudge-"));
+    try {
+      const started = Date.now();
+      const proc = Bun.spawn({
+        cmd: ["node", nudgePath],
+        env: {
+          PATH: process.env.PATH ?? "",
+          TMPDIR: scratch,
+          BRIGADIER_HANDOFF_STDIN_TIMEOUT_MS: "150",
+        },
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = new Response(proc.stdout).text();
+      proc.stdin.write(JSON.stringify(prompt("session-open", MULTI_PART)));
+      await proc.stdin.flush();
+      const timer = setTimeout(() => proc.kill(9), 15_000);
+      const exitCode = await proc.exited;
+      clearTimeout(timer);
+      // BOUNDED, AND THE BOUND IS ASSERTED. The pipe is never closed; the hook
+      // still answers and exits.
+      expect(exitCode).toBe(0);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(JSON.parse(await stdout).systemMessage).toBe(EXPECTED_MESSAGE);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   }, 30_000);
 });
 

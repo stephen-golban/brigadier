@@ -75,8 +75,21 @@ export function elapsedMs(startedAtMs: number): number {
   return Math.max(0, Math.round(performance.now() - startedAtMs));
 }
 
+/**
+ * The environment every worker is spawned with.
+ *
+ * `BRIGADIER_WORKER` IS THE RE-ENTRY MARKER, and it is stamped HERE — at the
+ * spawn, after the spec's own environment is spread, so it cannot be argued away
+ * by a spec and cannot be inherited into a genuine top-level session from an
+ * ancestor process. A slice prompt is long, enumerated, and full of exactly the
+ * words the host-side nudge hook looks for, so without this marker the hook
+ * would fire inside a worker and tell it to start a second orchestrator from
+ * inside its own slice. This is the shared helper both adapters use, so the
+ * marker covers Codex workers as well as Claude ones. The doctrine paragraph in
+ * every installed SKILL.md is the other half; belt and braces is deliberate.
+ */
 export function workerEnvironment(spec: WorkerSpec): Record<string, string> {
-  return { ...spec.environment, SHELL: "/bin/sh" };
+  return { ...spec.environment, SHELL: "/bin/sh", BRIGADIER_WORKER: "1" };
 }
 
 export async function writePromptAndClose(

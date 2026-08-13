@@ -221,6 +221,29 @@ const SUPACODE_FIXTURE_BYTES = `${JSON.stringify(SUPACODE_FIXTURE, null, 2)
   .replaceAll("supacode/notify", "supacode\\/notify")}\n`;
 
 describe("Codex handoff-hook registration", () => {
+  test("brigadier registers exactly one Codex event, and it is PreCompact", async () => {
+    // A REGRESSION GUARD WITH A COST BEHIND IT. Codex binds hook approval to the
+    // registration — event, matcher, and command together — so adding a second
+    // event here does not merely add a hook: it invalidates the approval the
+    // user already gave, and the handoff goes silently dead until they approve
+    // again. Claude Code gets a `UserPromptSubmit` nudge for exactly this
+    // reason; Codex deliberately does not. Anyone adding an event here has to
+    // change this test, and changing it is where they should stop and read
+    // `surfaces/codex/hooks/README.md`.
+    const harness = await makeHarness();
+    try {
+      const result = await installCodex(harness);
+      expect(result.code).toBe(0);
+      const written = JSON.parse(await readFile(harness.hooksPath, "utf8")) as {
+        hooks: Record<string, unknown>;
+      };
+      expect(Object.keys(written.hooks)).toEqual(["PreCompact"]);
+      await assertHarnessSafe(harness);
+    } finally {
+      await rm(harness.scratch, { recursive: true, force: true });
+    }
+  });
+
   test("a fresh install creates the exact PreCompact registration with an absolute shell-quoted path", async () => {
     const harness = await makeHarness("home with a space");
     try {

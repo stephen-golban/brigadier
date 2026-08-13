@@ -41,17 +41,33 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, sep } from "node:path";
 import type { ConfigEnvironment } from "../config/store.js";
-import { resolveConfigHome } from "../config/store.js";
+import {
+  readConfig,
+  resolveConfigHome,
+  resolveConfigPath,
+} from "../config/store.js";
 import type { OutputStream } from "../init/prompt.js";
 import { SURFACE_TEMPLATES } from "./templates.js";
 
-/** Every host brigadier knows how to install into, in the order `--all` walks. */
+/**
+ * Every host brigadier knows how to install into, in the order `--all` walks.
+ *
+ * The order is the two groups, and the groups are the product. The first three
+ * read skill directories off disk, so their doctrine is a file. The last four
+ * read none of them: Cursor, Windsurf, Antigravity, and Claude Desktop reach
+ * brigadier only over MCP, so what gets written for them is a server
+ * registration in the host's own configuration file — and only ever with the
+ * user's recorded consent.
+ */
 export const SURFACE_HOSTS = [
   "claude-code",
   "codex",
   "opencode",
+  "cursor",
+  "windsurf",
+  "antigravity",
   "claude-desktop",
 ] as const;
 
@@ -308,6 +324,14 @@ interface Roots {
   readonly codexHome: string;
   /** `$BRIGADIER_HOME`, else `$HOME/.brigadier`. */
   readonly brigadierHome: string;
+  /** `$HOME/.cursor`, holding Cursor's user-scoped `mcp.json`. */
+  readonly cursorConfig: string;
+  /** `$HOME/.codeium/windsurf`, holding Windsurf's `mcp_config.json`. */
+  readonly windsurfConfig: string;
+  /** `$HOME/.gemini/config`, holding Antigravity's `mcp_config.json`. */
+  readonly antigravityConfig: string;
+  /** `$HOME/Library/Application Support/Claude`, Desktop's config directory. */
+  readonly claudeDesktopConfig: string;
 }
 
 interface Placement {
@@ -319,11 +343,83 @@ interface Placement {
   readonly executable?: true;
 }
 
+/**
+ * A host that reads no skill directory, and reaches brigadier only over MCP.
+ *
+ * These are not placements, and the difference is the whole reason for a second
+ * type. A placement owns its destination file outright; a registration is one
+ * key merged into a file the host owns and other products also write, so the
+ * write is a merge that preserves every other byte, and it happens only with
+ * `guiRegistrationConsent` recorded in the user's own config.
+ *
+ * `entry` differs per host because the hosts differ. Every one of the four
+ * documents a top-level `mcpServers` object, but only Cursor documents a
+ * required `"type": "stdio"`, and the file names and locations share nothing.
+ * Each was read from the host's own documentation, cited in `documentation`.
+ */
+interface McpRegistration {
+  /** Must already exist: brigadier never creates another product's config dir. */
+  readonly root: (roots: Roots) => string;
+  readonly path: (roots: Roots) => string;
+  /** The stdio server entry written under `mcpServers.brigadier`. */
+  readonly entry: (command: string) => Record<string, unknown>;
+  /** The host's own documentation this path and shape were read from. */
+  readonly documentation: string;
+}
+
 interface HostPlan {
   readonly host: SurfaceHost;
   readonly placements: readonly Placement[];
+  /** Present only for hosts whose sole door into the session is MCP. */
+  readonly mcp?: McpRegistration;
   /** Printed after the file list. The honest limitations live here. */
   readonly notes: (roots: Roots) => readonly string[];
+}
+
+/** The key brigadier owns inside every host's `mcpServers` object. */
+const MCP_SERVER_KEY = "brigadier";
+const MCP_SERVERS_KEY = "mcpServers";
+
+/** Overrides the command a GUI host is told to spawn. See `resolveMcpCommand`. */
+const MCP_COMMAND_VARIABLE = "BRIGADIER_MCP_COMMAND";
+
+/**
+ * The command a GUI host will spawn to reach brigadier's MCP server.
+ *
+ * A GUI application launched from Finder does not inherit a login shell's PATH,
+ * so an absolute path is worth a great deal here. When brigadier is running as
+ * its own compiled binary, `process.execPath` IS that absolute path and is used.
+ * Otherwise — running from source under `bun`, or from `node dist/cli.js` —
+ * there is no honest absolute path to offer, so the bare name is written and
+ * `bareCommandNote` is printed, saying plainly that the host must be able to
+ * find it. Setting `$BRIGADIER_MCP_COMMAND` overrides both.
+ */
+function resolveMcpCommand(env: ConfigEnvironment): string {
+  const explicit = trimmed(env[MCP_COMMAND_VARIABLE]);
+  if (explicit !== null) {
+    return explicit;
+  }
+  const running = process.execPath;
+  return basename(running) === "brigadier" ? running : "brigadier";
+}
+
+/**
+ * THE PROMISE ABOVE, ACTUALLY KEPT. A bare command in a GUI host's configuration
+ * is a registration that exits 0, reports success, and may never start anything:
+ * a Finder-launched application does not inherit a login shell's PATH, so the
+ * server is simply never spawned and the user blames their editor. That is worth
+ * a line on an otherwise successful install — a warning, not a failure, so the
+ * exit code does not move. An absolute path needs no note and gets none.
+ */
+function bareCommandNote(command: string): string {
+  return `THE REGISTRATION NAMES A BARE COMMAND, ${JSON.stringify(command)}. This host has to resolve it on its own PATH, and an application launched from Finder does not inherit a login shell's PATH — when it cannot find the command, the server never starts and nothing says so. Set ${MCP_COMMAND_VARIABLE} to an absolute path and run this again to write that instead.`;
+}
+
+/** Whether this outcome leaves the command sitting in the host's config. */
+function registrationCarriesCommand(verdict: Verdict): boolean {
+  return (
+    verdict === "created" || verdict === "updated" || verdict === "unchanged"
+  );
 }
 
 const CLAUDE_SKILL = (roots: Roots): string =>
@@ -362,6 +458,13 @@ const HOST_PLANS: readonly HostPlan[] = [
         executable: true,
       },
       {
+        template: "claude-code/hooks/nudge.mjs",
+        root: (roots) => roots.claudeConfig,
+        destination: (roots) =>
+          appendPath(CLAUDE_SKILL(roots), "hooks", "nudge.mjs"),
+        executable: true,
+      },
+      {
         template: "claude-code/hooks/README.md",
         root: (roots) => roots.claudeConfig,
         destination: (roots) =>
@@ -371,6 +474,7 @@ const HOST_PLANS: readonly HostPlan[] = [
     notes: (roots) => [
       `The skill auto-loads as the plugin \`brigadier@skills-dir\` in your next Claude Code session, because of the .claude-plugin/plugin.json beside it. No marketplace, and no consent dialog.`,
       `The handoff hook is registered against PreCompact in ${appendPath(CLAUDE_SKILL(roots), "hooks", "hooks.json")} and needs no approval on this host.`,
+      `The nudge hook is registered against UserPromptSubmit in the same file and also needs no approval. It stays silent unless a prompt describes work in more than one independent piece, and then says one line, once per session. Set BRIGADIER_NUDGE=off to silence it entirely.`,
     ],
   },
   {
@@ -428,7 +532,60 @@ const HOST_PLANS: readonly HostPlan[] = [
     ],
   },
   {
+    host: "cursor",
+    placements: [],
+    mcp: {
+      root: (roots) => roots.cursorConfig,
+      path: (roots) => appendPath(roots.cursorConfig, "mcp.json"),
+      // Cursor's field table marks `type` required for stdio servers while its
+      // own examples omit it. Writing it satisfies the table and contradicts
+      // nothing in the examples, so it is written.
+      entry: (command) => ({ type: "stdio", command, args: ["mcp"] }),
+      documentation: "https://cursor.com/docs/context/mcp",
+    },
+    notes: (roots) => [
+      `Cursor reads no skill directory. ${appendPath(roots.cursorConfig, "mcp.json")} is the user-scoped MCP configuration, and the tool descriptions brigadier's server advertises are the whole of the doctrine it can deliver here.`,
+      `There is no hook surface on Cursor. Nothing watches the transcript, and the server is invoked only when the model chooses to invoke it.`,
+    ],
+  },
+  {
+    host: "windsurf",
+    placements: [],
+    mcp: {
+      root: (roots) => roots.windsurfConfig,
+      path: (roots) => appendPath(roots.windsurfConfig, "mcp_config.json"),
+      entry: (command) => ({ command, args: ["mcp"] }),
+      documentation: "https://docs.devin.ai/desktop/cascade/mcp",
+    },
+    notes: (roots) => [
+      `Windsurf reads no skill directory. ${appendPath(roots.windsurfConfig, "mcp_config.json")} is the only documented MCP configuration for Cascade, and it is global; Windsurf documents no project-scoped file.`,
+      `Cognition folded Windsurf into Devin, and its own documentation now describes Cascade as the legacy agent while the Devin Local agent configures MCP through the Devin CLI instead. This path is correct for Cascade today and is a shrinking surface.`,
+    ],
+  },
+  {
+    host: "antigravity",
+    placements: [],
+    mcp: {
+      root: (roots) => roots.antigravityConfig,
+      path: (roots) => appendPath(roots.antigravityConfig, "mcp_config.json"),
+      entry: (command) => ({ command, args: ["mcp"] }),
+      documentation: "https://antigravity.google/docs/mcp",
+    },
+    notes: (roots) => [
+      `Antigravity reads no skill directory. ${appendPath(roots.antigravityConfig, "mcp_config.json")} is the global configuration shared by its IDE, CLI, and SDK.`,
+      `Third-party guides name ~/.gemini/antigravity/mcp_config.json instead. That path is wrong: Antigravity's own documentation puts only mcp_oauth_tokens.json under ~/.gemini/antigravity.`,
+    ],
+  },
+  {
     host: "claude-desktop",
+    mcp: {
+      root: (roots) => roots.claudeDesktopConfig,
+      path: (roots) =>
+        appendPath(roots.claudeDesktopConfig, "claude_desktop_config.json"),
+      entry: (command) => ({ command, args: ["mcp"] }),
+      documentation:
+        "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
+    },
     placements: [
       {
         template: "claude-desktop/manifest.json",
@@ -443,8 +600,9 @@ const HOST_PLANS: readonly HostPlan[] = [
       },
     ],
     notes: (roots) => [
-      `NOTHING WAS INSTALLED INTO CLAUDE DESKTOP. Desktop installs a bundle by an explicit user action and brigadier does not forge those; the bundle was staged at ${DESKTOP_BUNDLE(roots)}.`,
-      `To finish: run \`bun run build:mcp\` to emit dist/mcp/server.js, copy it to server/brigadier-mcp.js beside the manifest, zip that directory with manifest.json at the archive root, rename it brigadier.mcpb, and open it with Desktop.`,
+      `THE .mcpb BUNDLE WAS ONLY STAGED, AT ${DESKTOP_BUNDLE(roots)}. Desktop installs a bundle by an explicit user action and brigadier does not forge those. The MCP registration above is the path that needs no build step; the bundle is here for anyone who wants the packaged extension instead.`,
+      `Quit Claude Desktop completely and relaunch it before the registered server appears. Desktop reads ${appendPath(roots.claudeDesktopConfig, "claude_desktop_config.json")} only at startup.`,
+      `To finish the bundle instead: run \`bun run build:mcp\` to emit dist/mcp/server.js, copy it to server/brigadier-mcp.js beside the manifest, zip that directory with manifest.json at the archive root, rename it brigadier.mcpb, and open it with Desktop.`,
       `Desktop gets an MCP server rather than a skill because Desktop Skills execute server-side and cannot invoke a local binary, while Desktop MCP servers run locally with your full privileges and can spawn \`claude -p\`.`,
       `THE HANDOFF HOOK IS IMPOSSIBLE ON CLAUDE DESKTOP. It exposes no hook surface, and an MCP server is called by the model rather than by the transcript. There is no workaround.`,
     ],
@@ -457,19 +615,33 @@ const HOST_PLANS: readonly HostPlan[] = [
 
 const USAGE = `Usage: brigadier install <host>... [options]
 
-Hosts:
+Hosts that read a skill directory:
   claude-code      a skill at ~/.claude/skills/brigadier, auto-loading as a plugin
   codex            a skill at ~/.agents/skills/brigadier, plus $CODEX_HOME/AGENTS.md
   opencode         a plugin at ~/.config/opencode/plugin/brigadier.js
-  claude-desktop   an MCP bundle staged at ~/.brigadier/surfaces/claude-desktop
+
+Hosts that read none, and reach brigadier only over MCP. Each writes one
+"brigadier" key into the host's own MCP configuration, and every one of them is
+skipped unless guiRegistrationConsent is recorded in your brigadier config:
+  cursor           ~/.cursor/mcp.json
+  windsurf         ~/.codeium/windsurf/mcp_config.json
+  antigravity      ~/.gemini/config/mcp_config.json
+  claude-desktop   ~/Library/Application Support/Claude/claude_desktop_config.json,
+                   plus an .mcpb bundle staged at ~/.brigadier/surfaces/claude-desktop
 
 Options:
       --all        install every host above
       --dry-run    report what would be written and write nothing
       --force      replace a file that brigadier did not write, or that was
                    edited after brigadier wrote it (written with mode 0644 or
-                   0755, not the replaced file's mode)
+                   0755, not the replaced file's mode). It does not grant
+                   registration consent, and nothing here does.
   -h, --help       print this message
+
+Environment:
+  BRIGADIER_MCP_COMMAND   the command a GUI host is told to spawn; defaults to
+                          this executable when it is the compiled binary, and to
+                          "brigadier" otherwise
 
 Exit codes:
   0  every file is in place
@@ -477,7 +649,13 @@ Exit codes:
   2  usage error
 `;
 
-type Verdict = "created" | "updated" | "unchanged" | "refused" | "failed";
+type Verdict =
+  | "created"
+  | "updated"
+  | "unchanged"
+  | "skipped"
+  | "refused"
+  | "failed";
 
 interface FileOutcome {
   readonly verdict: Verdict;
@@ -552,9 +730,13 @@ export async function runInstall(
     codexHook = prepared;
   }
 
+  const consent = await readGuiConsent(io.env);
+  const mcpCommand = resolveMcpCommand(io.env);
+
   let refused = 0;
   let changed = 0;
   let unchanged = 0;
+  let skipped = 0;
 
   for (const host of parsed.hosts) {
     const plan = HOST_PLANS.find((candidate) => candidate.host === host);
@@ -578,6 +760,8 @@ export async function runInstall(
         refused += 1;
       } else if (outcome.verdict === "unchanged") {
         unchanged += 1;
+      } else if (outcome.verdict === "skipped") {
+        skipped += 1;
       } else {
         changed += 1;
       }
@@ -598,9 +782,47 @@ export async function runInstall(
         changed += 1;
       }
     }
+    let mcpVerdict: Verdict | null = null;
+    if (plan.mcp !== undefined) {
+      const outcome = await applyMcpRegistration({
+        fs,
+        registration: plan.mcp,
+        roots,
+        env: io.env,
+        command: mcpCommand,
+        consent,
+        dryRun: parsed.dryRun,
+      });
+      mcpVerdict = outcome.verdict;
+      writeOutcome(io.stdout, outcome);
+      if (outcome.verdict === "refused" || outcome.verdict === "failed") {
+        refused += 1;
+      } else if (outcome.verdict === "unchanged") {
+        unchanged += 1;
+      } else if (outcome.verdict === "skipped") {
+        skipped += 1;
+      } else {
+        changed += 1;
+      }
+    }
     io.stdout.write("\n");
     for (const note of plan.notes(roots)) {
       io.stdout.write(`  note: ${note}\n`);
+    }
+    if (plan.mcp !== undefined) {
+      // The citation is printed, not merely recorded. A registration written to
+      // a guessed path is silent breakage the user blames on their editor, so
+      // the source it was read from belongs where they can check it.
+      io.stdout.write(
+        `  note: that path and entry shape were read from ${plan.mcp.documentation}\n`,
+      );
+      if (
+        mcpVerdict !== null &&
+        registrationCarriesCommand(mcpVerdict) &&
+        !isAbsolute(mcpCommand)
+      ) {
+        io.stdout.write(`  note: ${bareCommandNote(mcpCommand)}\n`);
+      }
     }
   }
 
@@ -622,9 +844,234 @@ export async function runInstall(
   }
 
   io.stdout.write(
-    `\n${parsed.dryRun ? "dry run: " : ""}${changed} written, ${unchanged} unchanged, ${refused} refused.\n`,
+    `\n${parsed.dryRun ? "dry run: " : ""}${changed} written, ${unchanged} unchanged, ${skipped} skipped, ${refused} refused.\n`,
   );
   return refused > 0 ? 1 : 0;
+}
+
+/**
+ * Whether the user has said yes, once, to brigadier writing into a third-party
+ * application's configuration.
+ *
+ * EVERY FAILURE IS A NO, and that is the point rather than a shortcut. A missing
+ * config, an unparseable one, an unreadable one, and an explicit false all mean
+ * the same thing here: nobody said yes. Only `guiRegistrationConsent === true`
+ * in a config that actually parsed is a yes.
+ */
+async function readGuiConsent(env: ConfigEnvironment): Promise<boolean> {
+  try {
+    const config = await readConfig(resolveConfigPath(env));
+    return config?.guiRegistrationConsent === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The sentence that says how to turn registration on. Never how to fake it.
+ *
+ * IT NAMES `brigadier init` ON PURPOSE, AND THE DOCTRINE AGREES. Every installed
+ * SKILL.md tells an agent never to run init to make a config appear — config is
+ * automatic — and carves out exactly this one case, because recording consent to
+ * write into somebody else's application is a human's decision and the
+ * interactive question is the only thing that can ask for it. So this sentence
+ * addresses the person, and an agent that reads it should hand it over rather
+ * than run it.
+ */
+function consentInstructions(env: ConfigEnvironment): string {
+  let path: string;
+  try {
+    path = resolveConfigPath(env);
+  } catch {
+    path = "$BRIGADIER_HOME/config.json";
+  }
+  return `brigadier writes into another application's configuration only on an explicit yes, and only a human can give it. Run \`brigadier init\` yourself — recording this consent is the one thing it is for — and answer yes to "Register brigadier's MCP server with detected GUI hosts", which records "guiRegistrationConsent": true in ${path}. Nothing else, including --force, grants it.`;
+}
+
+interface McpApplyInput {
+  readonly fs: SurfaceIo;
+  readonly registration: McpRegistration;
+  readonly roots: Roots;
+  readonly env: ConfigEnvironment;
+  readonly command: string;
+  readonly consent: boolean;
+  readonly dryRun: boolean;
+}
+
+/**
+ * Merges brigadier's own key into a host's MCP configuration, or explains why it
+ * did not.
+ *
+ * TWO GATES, IN THIS ORDER, and both answer `skipped` rather than an error: no
+ * recorded consent, and a host whose configuration directory is not there.
+ * The second is not a safety check so much as an honesty one — creating
+ * `~/.cursor/` on a machine with no Cursor writes a file nothing will ever read
+ * and leaves a stranger's directory behind.
+ */
+async function applyMcpRegistration(
+  input: McpApplyInput,
+): Promise<FileOutcome> {
+  const path = input.registration.path(input.roots);
+  const root = input.registration.root(input.roots);
+  if (!input.consent) {
+    return {
+      verdict: "skipped",
+      path,
+      detail: consentInstructions(input.env),
+    };
+  }
+
+  let rootPresent: boolean;
+  try {
+    await input.fs.lstat(root);
+    rootPresent = true;
+  } catch (error) {
+    if (!isMissingFile(error)) {
+      return { verdict: "failed", path, detail: describe(error) };
+    }
+    rootPresent = false;
+  }
+  if (!rootPresent) {
+    return {
+      verdict: "skipped",
+      path,
+      detail: `${root} does not exist, so this host is not installed on this machine. brigadier does not create another product's configuration directory.`,
+    };
+  }
+
+  const proof = await proveWriteContained(input.fs, root, path);
+  if (!proof.ok) {
+    return { verdict: "refused", path, detail: proof.message };
+  }
+
+  let snapshot: SurfaceSnapshot | null;
+  try {
+    snapshot = await readIfPresent(input.fs, path);
+  } catch (error) {
+    return {
+      verdict: "failed",
+      path,
+      detail: `could not safely read ${path}: ${describe(error)}`,
+    };
+  }
+
+  const entry = input.registration.entry(input.command);
+  const merged = mergeMcpServer(snapshot?.contents ?? null, entry, path);
+  if (!merged.ok) {
+    return { verdict: "refused", path, detail: merged.message };
+  }
+  const verdict: Verdict =
+    snapshot === null
+      ? "created"
+      : merged.contents === snapshot.contents
+        ? "unchanged"
+        : "updated";
+  if (verdict === "unchanged" || input.dryRun) {
+    return { verdict, path, detail: null };
+  }
+
+  try {
+    await input.fs.mkdir(parentOf(path));
+    const finalProof = await proveWriteContained(input.fs, root, path);
+    if (!finalProof.ok) {
+      return { verdict: "refused", path, detail: finalProof.message };
+    }
+    await input.fs.writeFileAtomic(path, merged.contents, FILE_MODE, snapshot);
+    return { verdict, path, detail: null };
+  } catch (error) {
+    const after = await proveWriteContained(input.fs, root, path);
+    return after.ok
+      ? { verdict: "failed", path, detail: describe(error) }
+      : { verdict: "refused", path, detail: after.message };
+  }
+}
+
+/**
+ * Produces the file contents with `mcpServers.brigadier` set to `entry`.
+ *
+ * ONLY BRIGADIER'S OWN KEY IS TOUCHED. Every other server in the file, every
+ * unknown top-level key, and the surrounding formatting survive, because the
+ * merge is byte surgery on the parsed layout rather than a re-serialization of
+ * the whole document. A file that is not a JSON object is refused and left
+ * exactly as it is: a user's MCP configuration is not brigadier's to repair.
+ */
+function mergeMcpServer(
+  source: string | null,
+  entry: Record<string, unknown>,
+  path: string,
+):
+  | { readonly ok: true; readonly contents: string }
+  | { readonly ok: false; readonly message: string } {
+  const fresh = `${JSON.stringify({ [MCP_SERVERS_KEY]: { [MCP_SERVER_KEY]: entry } }, null, 2)}\n`;
+  // A zero-byte or whitespace-only file carries no information to preserve, and
+  // some hosts create one before they have ever been configured.
+  if (source === null || source.trim().length === 0) {
+    return { ok: true, contents: fresh };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    return {
+      ok: false,
+      message: `could not parse ${path}. Fix the malformed JSON and re-run; brigadier left the file unchanged.`,
+    };
+  }
+  if (!isJsonObject(parsed)) {
+    return {
+      ok: false,
+      message: `could not merge ${path}: its top level must be a JSON object. Fix the file and re-run; brigadier left it unchanged.`,
+    };
+  }
+  const serversValue = parsed[MCP_SERVERS_KEY];
+  if (serversValue !== undefined && !isJsonObject(serversValue)) {
+    return {
+      ok: false,
+      message: `could not merge ${path}: "${MCP_SERVERS_KEY}" must be a JSON object. Fix the file and re-run; brigadier left it unchanged.`,
+    };
+  }
+
+  const budget = new JsonScanBudget(source);
+  const rootLayout = objectLayout(source, 0, budget);
+  const serversRange = rootLayout.properties.get(MCP_SERVERS_KEY);
+  if (serversRange === undefined) {
+    return {
+      ok: true,
+      contents: insertObjectProperty(
+        source,
+        rootLayout,
+        MCP_SERVERS_KEY,
+        JSON.stringify({ [MCP_SERVER_KEY]: entry }, null, 2),
+        2,
+      ),
+    };
+  }
+
+  const serversLayout = objectLayout(source, serversRange.start, budget);
+  const existing = serversLayout.properties.get(MCP_SERVER_KEY);
+  if (existing === undefined) {
+    return {
+      ok: true,
+      contents: insertObjectProperty(
+        source,
+        serversLayout,
+        MCP_SERVER_KEY,
+        JSON.stringify(entry, null, 2),
+        4,
+      ),
+    };
+  }
+  if (
+    JSON.stringify(JSON.parse(source.slice(existing.start, existing.end))) ===
+    JSON.stringify(entry)
+  ) {
+    return { ok: true, contents: source };
+  }
+  return {
+    ok: true,
+    contents: `${source.slice(0, existing.start)}${JSON.stringify(entry)}${source.slice(existing.end)}`,
+  };
 }
 
 interface CodexHookPreparation {
@@ -1345,6 +1792,19 @@ export function resolveRoots(env: ConfigEnvironment): Roots {
         : appendPath(xdgConfig, "opencode"),
     codexHome: codexHome ?? appendPath(home, ".codex"),
     brigadierHome,
+    // No environment overrides for these four: each host documents exactly one
+    // user-scoped location and none of them reads an override variable, so an
+    // invented one would only be a way to write the registration where the host
+    // will never look for it.
+    cursorConfig: appendPath(home, ".cursor"),
+    windsurfConfig: appendPath(home, ".codeium", "windsurf"),
+    antigravityConfig: appendPath(home, ".gemini", "config"),
+    claudeDesktopConfig: appendPath(
+      home,
+      "Library",
+      "Application Support",
+      "Claude",
+    ),
   };
 }
 
