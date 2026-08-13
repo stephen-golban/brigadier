@@ -37,6 +37,15 @@ import {
  */
 export const CONFIG_VERSION = 3;
 
+/** GUI coding hosts whose own configuration may expose brigadier over MCP. */
+export const GUI_HOSTS = [
+  "cursor",
+  "windsurf",
+  "antigravity",
+  "claude-desktop",
+] as const;
+export type GuiHost = (typeof GUI_HOSTS)[number];
+
 /**
  * Brigadier's own effort ladder, ordered lowest to highest. Vendor CLIs report
  * richer ladders (Codex reports `low|medium|high|xhigh|max|ultra`); levels with
@@ -79,6 +88,8 @@ export interface BrigadierConfig {
   readonly secretsConsent: boolean;
   /** Repository-relative `.env`-shaped files approved for worker worktrees. */
   readonly linkedSecretPaths: readonly string[];
+  /** Consent to register brigadier's MCP server into GUI hosts' own configs. */
+  readonly guiRegistrationConsent?: boolean;
   /**
    * Consent to run a slice on a model that scores below its difficulty floor
    * rather than failing the slice.
@@ -123,6 +134,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   "vendors",
   "secretsConsent",
   "linkedSecretPaths",
+  "guiRegistrationConsent",
   "allowDegradedRouting",
 ]);
 const VENDOR_KEYS: ReadonlySet<string> = new Set([
@@ -223,6 +235,12 @@ export function parseConfig(value: unknown): BrigadierConfig {
   if (typeof root.allowDegradedRouting !== "boolean") {
     issues.push("allowDegradedRouting must be a boolean");
   }
+  if (
+    root.guiRegistrationConsent !== undefined &&
+    typeof root.guiRegistrationConsent !== "boolean"
+  ) {
+    issues.push("guiRegistrationConsent must be a boolean when present");
+  }
   if (!Array.isArray(root.vendors)) {
     issues.push("vendors must be an array");
     throw new ConfigValidationError(issues);
@@ -245,6 +263,7 @@ export function parseConfig(value: unknown): BrigadierConfig {
     vendors,
     secretsConsent: root.secretsConsent === true,
     linkedSecretPaths,
+    guiRegistrationConsent: root.guiRegistrationConsent === true,
     allowDegradedRouting: root.allowDegradedRouting === true,
   };
 }

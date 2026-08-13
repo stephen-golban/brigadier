@@ -10,13 +10,18 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrigadierConfig } from "../src/config/index.ts";
-import { resolveConfigPath, writeConfig } from "../src/config/index.ts";
+import {
+  readConfig,
+  resolveConfigPath,
+  writeConfig,
+} from "../src/config/index.ts";
 import type {
   AnyWorker,
   ClaudeWorkerSpec,
   SpawnedWorker,
   Worker,
 } from "../src/contracts.ts";
+import type { Discoverer } from "../src/discovery/contracts.ts";
 import type {
   InputStream,
   OutputStream,
@@ -360,6 +365,7 @@ interface InvokeOptions {
   readonly scratchHome: string;
   readonly stdin?: string;
   readonly config?: BrigadierConfig | null;
+  readonly discoverer?: Discoverer;
   readonly runner?: RecordingSliceRunner | null;
   /** Replaces the model that turns a task description into a plan. */
   readonly planner?: Planner;
@@ -420,6 +426,9 @@ async function invoke(options: InvokeOptions): Promise<Invocation> {
     stderr,
     cwd: options.cwd,
     harness,
+    ...(options.discoverer === undefined
+      ? {}
+      : { discoverer: options.discoverer }),
     ...(options.stdin === undefined
       ? {}
       : { stdin: scriptedInput(options.stdin) }),
@@ -539,6 +548,40 @@ function scriptedInput(text: string): InputStream {
     async *[Symbol.asyncIterator]() {
       yield text;
     },
+  };
+}
+
+function lazyDiscoverer(): Discoverer {
+  return {
+    discover: () =>
+      Promise.resolve({
+        vendors: [
+          {
+            vendor: "claude",
+            executable: "/opt/homebrew/bin/claude",
+            version: "2.0.14",
+            models: [
+              {
+                id: "claude-opus-5",
+                displayName: "Claude Opus 5",
+                supportedEfforts: ["medium", "high", "xhigh"],
+                defaultEffort: "high",
+                selectable: true,
+              },
+              {
+                id: "claude-sonnet-5",
+                displayName: "Claude Sonnet 5",
+                supportedEfforts: ["medium", "high"],
+                defaultEffort: "high",
+                selectable: true,
+              },
+            ],
+            catalogSource: "static-table",
+          },
+        ],
+        missing: ["codex"],
+        warnings: [],
+      }),
   };
 }
 
@@ -1655,24 +1698,24 @@ describe("brigadier run: exit codes", () => {
     });
   });
 
-  test("exits 1 with an actionable message when no config exists", async () => {
+  test("a missing config is created lazily and the run proceeds", async () => {
     await withScratchHome(async ({ scratchHome, cwd, plan }) => {
       const result = await invoke({
         argv: ["run", "--plan", plan],
         cwd,
         scratchHome,
         config: null,
+        discoverer: lazyDiscoverer(),
       });
 
-      expect(result.code).toBe(1);
-      expect(result.stderr).toBe(
-        `brigadier run: no brigadier config was found at ${resolveConfigPath({ BRIGADIER_HOME: scratchHome })}. Run \`brigadier init\` to scan this machine for worker CLIs and write one.\n`,
-      );
-      expect(result.engine.prepared).toEqual([]);
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain("brigadier: detected claude");
+      expect(result.stderr).toContain("brigadier: wrote config to");
+      expect(result.engine.prepared).toHaveLength(1);
     });
   });
 
-  test("exits 1 with a different message when the config cannot be trusted", async () => {
+  test("a wrong-version config is rebuilt lazily and the run proceeds", async () => {
     await withScratchHome(async ({ scratchHome, cwd, plan }) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       await Bun.write(path, '{"version": 2, "vendors": "nope"}\n');
@@ -1681,13 +1724,12 @@ describe("brigadier run: exit codes", () => {
         cwd,
         scratchHome,
         config: null,
+        discoverer: lazyDiscoverer(),
       });
 
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain(
-        `brigadier run: the config at ${path} cannot be used:`,
-      );
-      expect(result.stderr).toContain("Re-run `brigadier init` to rebuild it.");
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(`config at ${path} has version 2`);
+      expect((await readConfig(path))?.version).toBe(3);
     });
   });
 

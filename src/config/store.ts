@@ -41,6 +41,8 @@ export interface ConfigIo {
   writeFile(path: string, contents: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
+  /** Optional because older injected stores predate GUI-host detection. */
+  exists?(path: string): Promise<boolean>;
 }
 
 export const nodeConfigIo: ConfigIo = {
@@ -74,6 +76,17 @@ export const nodeConfigIo: ConfigIo = {
   },
   async unlink(path) {
     await unlink(path);
+  },
+  async exists(path) {
+    try {
+      await stat(path);
+      return true;
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return false;
+      }
+      throw error;
+    }
   },
 };
 

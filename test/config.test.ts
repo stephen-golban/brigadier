@@ -16,7 +16,9 @@ import {
   ConfigValidationError,
   DEFAULT_EFFORT_CEILING,
   defaultEffortCeiling,
+  detectGuiHosts,
   EFFORT_LADDER,
+  ensureConfig,
   narrowEfforts,
   parseConfig,
   readConfig,
@@ -54,6 +56,7 @@ const CANONICAL: BrigadierConfig = {
   ],
   secretsConsent: false,
   linkedSecretPaths: [],
+  guiRegistrationConsent: false,
   allowDegradedRouting: false,
 };
 
@@ -79,6 +82,7 @@ const CANONICAL_BYTES = `{
   ],
   "secretsConsent": false,
   "linkedSecretPaths": [],
+  "guiRegistrationConsent": false,
   "allowDegradedRouting": false
 }
 `;
@@ -482,6 +486,258 @@ describe("atomic config write", () => {
   });
 });
 
+describe("lazy config", () => {
+  test("no installed worker CLI is still a hard error", async () => {
+    await withScratchHome(async (scratchHome) => {
+      await expect(
+        ensureConfig({
+          environment: { BRIGADIER_HOME: scratchHome },
+          stderr: collector(),
+          discoverer: {
+            discover: () =>
+              Promise.resolve({
+                vendors: [],
+                missing: ["claude", "codex"],
+                warnings: [],
+              }),
+          },
+        }),
+      ).rejects.toThrow("no installed worker CLI reported a selectable model");
+      expect(await readdir(scratchHome)).toEqual([]);
+    });
+  });
+
+  test("an unwritable config home warns once and returns an in-memory config", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const stderr = collector();
+      const unwritable: ConfigIo = {
+        ...nodeConfigIo,
+        writeFile: async () => {
+          const error = new Error("permission denied") as Error & {
+            code: string;
+          };
+          error.code = "EACCES";
+          throw error;
+        },
+      };
+      const result = await ensureConfig({
+        environment: { BRIGADIER_HOME: scratchHome },
+        io: unwritable,
+        stderr,
+        discoverer: codexDiscoverer(),
+      });
+
+      expect(result.inMemory).toBe(true);
+      expect(result.written).toBe(false);
+      expect(result.config.vendors[0]?.vendor).toBe("codex");
+      expect(
+        stderr.text().match(/using the detected configuration in memory/g),
+      ).toHaveLength(1);
+      expect(await readdir(scratchHome)).toEqual([]);
+    });
+  });
+
+  test("invalid JSON at the config path is left untouched and used in memory", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeFile(path, "{ not json", "utf8");
+      const before = await readFile(path, "utf8");
+      const stderr = collector();
+
+      const result = await ensureConfig({
+        environment: { BRIGADIER_HOME: scratchHome },
+        stderr,
+        discoverer: codexDiscoverer(),
+      });
+
+      expect(result.written).toBe(false);
+      expect(result.inMemory).toBe(true);
+      expect(result.config.vendors[0]?.vendor).toBe("codex");
+      const after = await readFile(path, "utf8");
+      expect(after).toBe(before);
+      expect(stderr.text()).toContain(path);
+    });
+  });
+
+  test("a current-version config that fails schema validation is left untouched and used in memory", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const invalidCurrent = {
+        version: CONFIG_VERSION,
+        vendors: [{ ...CANONICAL.vendors[0], apiKey: "sk-live-secret" }],
+        secretsConsent: false,
+        linkedSecretPaths: [],
+        guiRegistrationConsent: false,
+        allowDegradedRouting: false,
+      };
+      await writeFile(path, `${JSON.stringify(invalidCurrent)}\n`, "utf8");
+      const before = await readFile(path, "utf8");
+      const stderr = collector();
+
+      const result = await ensureConfig({
+        environment: { BRIGADIER_HOME: scratchHome },
+        stderr,
+        discoverer: codexDiscoverer(),
+      });
+
+      expect(result.written).toBe(false);
+      expect(result.inMemory).toBe(true);
+      expect(result.config.vendors[0]?.vendor).toBe("codex");
+      const after = await readFile(path, "utf8");
+      expect(after).toBe(before);
+      expect(stderr.text()).toContain(path);
+    });
+  });
+
+  test("racing creators both use the atomic writer and leave one valid config", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const environment = { BRIGADIER_HOME: scratchHome };
+      const path = resolveConfigPath(environment);
+      let initialReads = 0;
+      let releaseReads: (() => void) | undefined;
+      const readsReady = new Promise<void>((resolve) => {
+        releaseReads = resolve;
+      });
+      const racingIo: ConfigIo = {
+        ...nodeConfigIo,
+        readFile: async (candidate) => {
+          if (candidate === path && initialReads < 2) {
+            initialReads += 1;
+            if (initialReads === 2) {
+              releaseReads?.();
+            }
+            await readsReady;
+          }
+          return nodeConfigIo.readFile(candidate);
+        },
+      };
+      const [first, second] = await Promise.all([
+        ensureConfig({
+          environment,
+          io: racingIo,
+          stderr: collector(),
+          discoverer: codexDiscoverer(),
+        }),
+        ensureConfig({
+          environment,
+          io: racingIo,
+          stderr: collector(),
+          discoverer: codexDiscoverer(),
+        }),
+      ]);
+
+      expect(first.written).toBe(true);
+      expect(second.written).toBe(true);
+      expect(await readConfig(first.path)).toEqual(first.config);
+      expect(await readdir(scratchHome)).toEqual(["config.json"]);
+    });
+  });
+
+  test("rewrites a wrong-version config and preserves compatible tuned fields", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeFile(
+        path,
+        JSON.stringify({
+          version: 2,
+          vendors: [
+            {
+              vendor: "codex",
+              executable: "/old/codex",
+              version: "0.100.0",
+              defaultModel: "gpt-5.6-sol",
+              models: [{ id: "gpt-5.6-sol", effortCeiling: "medium" }],
+            },
+          ],
+          secretsConsent: true,
+          linkedSecretPaths: [".env"],
+          guiRegistrationConsent: true,
+          allowDegradedRouting: true,
+        }),
+      );
+      const stderr = collector();
+      const result = await ensureConfig({
+        environment: { BRIGADIER_HOME: scratchHome },
+        stderr,
+        discoverer: codexDiscoverer(),
+      });
+
+      expect(result.written).toBe(true);
+      expect(result.config.vendors[0]?.models[0]?.effortCeiling).toBe("medium");
+      expect(result.config.secretsConsent).toBe(true);
+      expect(result.config.linkedSecretPaths).toEqual([".env"]);
+      expect(result.config.allowDegradedRouting).toBe(true);
+      expect(result.config.guiRegistrationConsent).toBe(false);
+      expect((await readConfig(path))?.version).toBe(CONFIG_VERSION);
+      expect(stderr.text()).toContain("has version 2");
+    });
+  });
+
+  test("returns an existing valid current config untouched", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeConfig(path, CANONICAL);
+      const before = await readFile(path, "utf8");
+      let probes = 0;
+      const stderr = collector();
+      const result = await ensureConfig({
+        environment: { BRIGADIER_HOME: scratchHome },
+        stderr,
+        discoverer: {
+          discover: () => {
+            probes += 1;
+            throw new Error("must not probe");
+          },
+        },
+      });
+
+      expect(result).toEqual({
+        config: CANONICAL,
+        path,
+        written: false,
+        inMemory: false,
+      });
+      expect(probes).toBe(0);
+      expect(await readFile(path, "utf8")).toBe(before);
+      expect(stderr.text()).toBe("");
+    });
+  });
+});
+
+test("detectGuiHosts probes injectable host locations without persisting them", async () => {
+  const seen: string[] = [];
+  const io: ConfigIo = {
+    ...nodeConfigIo,
+    exists: (path) => {
+      seen.push(path);
+      return Promise.resolve(
+        path === "/example/home/.cursor" || path === "/example/appdata/Claude",
+      );
+    },
+  };
+  expect(
+    await detectGuiHosts(
+      { HOME: "/example/home", APPDATA: "/example/appdata" },
+      io,
+    ),
+  ).toEqual(["cursor", "claude-desktop"]);
+  expect(seen).toContain("/example/home/.cursor");
+  expect(seen).toContain("/example/appdata/Claude");
+
+  const seenAppData: string[] = [];
+  const ioAppData: ConfigIo = {
+    ...nodeConfigIo,
+    exists: (path) => {
+      seenAppData.push(path);
+      return Promise.resolve(path === "/Applications/Cursor.app");
+    },
+  };
+  expect(await detectGuiHosts({ HOME: "/example/home" }, ioAppData)).toEqual([
+    "cursor",
+  ]);
+  expect(seenAppData).toContain("/Applications/Cursor.app");
+});
+
 test("no test in the suite resolves $BRIGADIER_HOME to the real home directory", async () => {
   const testDirectory = import.meta.dir;
   const files = (await readdir(testDirectory)).filter((name) =>
@@ -519,6 +775,46 @@ function withVendorKey(key: string): unknown {
   return {
     ...CANONICAL,
     vendors: [{ ...CANONICAL.vendors[0], [key]: "gpt-5.6-sol" }],
+  };
+}
+
+function codexDiscoverer() {
+  return {
+    discover: () =>
+      Promise.resolve({
+        vendors: [
+          {
+            vendor: "codex" as const,
+            executable: "/opt/homebrew/bin/codex",
+            version: "0.145.0",
+            models: [
+              {
+                id: "gpt-5.6-sol",
+                displayName: "GPT-5.6 Sol",
+                supportedEfforts: ["medium", "high"],
+                defaultEffort: "high",
+                selectable: true,
+              },
+            ],
+            catalogSource: "probe" as const,
+          },
+        ],
+        missing: ["claude" as const],
+        warnings: [],
+      }),
+  };
+}
+
+function collector() {
+  const chunks: string[] = [];
+  return {
+    write(chunk: string) {
+      chunks.push(chunk);
+      return true;
+    },
+    text() {
+      return chunks.join("");
+    },
   };
 }
 
