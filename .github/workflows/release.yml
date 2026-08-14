@@ -37,7 +37,7 @@ jobs:
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v7.0.1
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: 1.3.14
@@ -133,7 +133,7 @@ jobs:
           shasum -a 256 "brigadier-${version}-${{ matrix.platform }}.tar.gz" > "brigadier-${version}-${{ matrix.platform }}.tar.gz.sha256"
           cd ..
           bun ./scripts/assemble-platform-package.ts "${{ matrix.platform }}" ./release-bin/brigadier ./release-packages
-      - uses: actions/upload-artifact@v4.6.2
+      - uses: actions/upload-artifact@v6.0.0
         with:
           name: release-${{ matrix.platform }}
           path: release-packages/*
@@ -143,7 +143,7 @@ jobs:
     name: Package root npm module
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v7.0.1
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: 1.3.14
@@ -157,7 +157,7 @@ jobs:
             echo "src/mcp/server.ts is not present; packaging the declared MCP shim without its future build output"
           fi
       - run: mkdir -p release-packages && npm pack --pack-destination release-packages
-      - uses: actions/upload-artifact@v4.6.2
+      - uses: actions/upload-artifact@v6.0.0
         with:
           name: release-root-npm
           path: release-packages/*.tgz
@@ -172,7 +172,7 @@ jobs:
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@v7.0.0
         with:
           pattern: release-*
           path: release-packages
@@ -206,7 +206,7 @@ jobs:
       RELEASE_PUBLISH_ENABLED: ${{ secrets.RELEASE_PUBLISH_ENABLED }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4.3.0
+      - uses: actions/download-artifact@v7.0.0
         with:
           pattern: release-*
           path: release-packages
