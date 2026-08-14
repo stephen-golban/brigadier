@@ -4,8 +4,8 @@ class Brigadier < Formula
   version "0.0.0"
   license "MIT"
 
-  # Replace these placeholder digests with release digests before publishing
-  # the tap. docs/RELEASING.md contains the exact update commands.
+  # Update this release template with scripts/update-homebrew-formula.ts before
+  # publishing a release. GitHub has not published an archive yet.
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/stephen-golban/brigadier/releases/download/v0.0.0/brigadier-0.0.0-darwin-arm64.tar.gz"
@@ -28,6 +28,13 @@ class Brigadier < Formula
 
   def install
     bin.install "brigadier"
+  end
+
+  def caveats
+    <<~EOS
+      Run `brigadier init` once to choose which detected hosts brigadier should work inside.
+      Restart your AI CLI afterwards.
+    EOS
   end
 
   test do
