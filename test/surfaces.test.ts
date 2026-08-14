@@ -73,16 +73,16 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 432,
   },
   "claude-code/hooks/nudge.mjs": {
-    sha256: "13b2eb97a3f65ad2053262ec444098b4f5bc65aa1fdd1daf89aafe9e8f02de7d",
-    bytes: 12147,
+    sha256: "d0ed63ed121af0878747ebbef053285deb5f7126fcd971a03c656d248ddd1647",
+    bytes: 12930,
   },
   "claude-desktop/README.md": {
     sha256: "bb5a0937ed1fe91eba5b9e62389c99b538afef5e21a03cc9b67fcf3b0a79e4a3",
     bytes: 3722,
   },
   "claude-desktop/manifest.json": {
-    sha256: "151d858963600f7c2cae06df761703c8bf7a3de5fab11350df1f1986497e91e9",
-    bytes: 2536,
+    sha256: "5ee29923ff3dae4d32960611ac9835c7bb6e1da1526e44551335c69e12bdff3f",
+    bytes: 2798,
   },
   "codex/AGENTS.md": {
     sha256: "5e7e861ee00bee3015160c018e6da36f466038f8e40058ba99f22cfad3dd917a",
@@ -575,7 +575,7 @@ describe("the surface templates", () => {
     expect(
       paragraphContaining(methodology, "does not claim an unranked model"),
     ).toBe(
-      "Every successful salvage route records `waivedDifficultyFloor: true`. For a\nranked winner this records a known below-floor score. For an unranked winner it\ndoes not claim an unranked model has a sub-floor score; it records that brigadier\ndid not establish the requested floor. Ranked candidates precede all unranked\ncandidates, ranked candidates are ordered by descending score, and ties or\nunranked-only choices preserve configuration order\n([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and\n[`src/routing/router.ts:657`](../src/routing/router.ts#L657)).",
+      "Every successful salvage route records `waivedDifficultyFloor: true`. For a\nranked winner this records a known below-floor score. For an unranked winner it\ndoes not claim an unranked model has a sub-floor score; it records that brigadier\ndid not establish the requested floor. Ranked candidates precede all unranked\ncandidates, ranked candidates are ordered by descending score, and ties or\nunranked-only choices preserve configuration order\n([`src/routing/router.ts:345`](../src/routing/router.ts#L345) and\n[`src/routing/router.ts:656`](../src/routing/router.ts#L656)).",
     );
   });
 
@@ -2217,6 +2217,20 @@ describe("the nudge hook", () => {
       false,
       "Have a look at every one of the handlers in the routes directory and tell me which of them are still using the deprecated response helper, across the whole codebase.",
     ],
+    // A QUESTION WITH NO PUNCTUATION IS STILL A QUESTION. People drop the mark
+    // constantly, and this shape carries a structural verb, a breadth word and
+    // a quantified plural — everything the matcher fires on. It fired, and it
+    // spent the session's only nudge on somebody asking how to do the work.
+    [
+      "an unpunctuated question, verbatim",
+      false,
+      "How do I refactor every module across the codebase and migrate all call sites",
+    ],
+    [
+      "an unpunctuated question, long enough to be scanned",
+      false,
+      "How do I refactor every module across the codebase and migrate all the call sites to the new helper without breaking the handlers, the persistence layer or the seed scripts",
+    ],
     // AND THE OTHER DIRECTION: genuinely independent pieces, which are what the
     // session's one nudge is for.
     [
@@ -2270,8 +2284,12 @@ describe("the nudge hook", () => {
       // src/worker/shared.ts stamps this marker at the spawn, so a slice prompt
       // — long, enumerated, and full of exactly the words the matcher looks for
       // — cannot make the hook tell a worker to run brigadier. The prompt used
-      // here is one the matcher demonstrably fires on above.
-      const [, , firing] = MATCHER_CASES[8] ?? ["", false, ""];
+      // here is the first case the table above demonstrably fires on, found by
+      // lookup rather than by index: a silent case inserted earlier in the table
+      // would otherwise slide a NON-firing prompt in here and turn this proof
+      // into a no-op that still passes.
+      const firing =
+        MATCHER_CASES.find(([, shouldFire]) => shouldFire)?.[2] ?? "";
       const run = await runNudge(prompt("session-worker", firing), scratch, {
         BRIGADIER_WORKER: "1",
       });

@@ -6,7 +6,7 @@ they are listed at the bottom of this page and printed by `brigadier --help`.
 
 | Command | What it does |
 | --- | --- |
-| `brigadier init` | scan this machine for installed worker CLIs and write a config |
+| `brigadier init` | scan this machine for installed worker CLIs and write a config, interactively. **Not a setup step** — see below |
 | `brigadier run` | run a task or a plan: decompose it, route every slice, spawn a worker for each, commit what it produced, and merge the lot |
 | `brigadier install` | write brigadier's host-side doctrine into each host |
 | `brigadier mcp` | serve brigadier's tools over stdio MCP |
@@ -18,9 +18,93 @@ command with options is not the one command whose options cannot be looked up.
 An unknown command, or no command at all, is a usage error: exit `2`, with the
 usage text on stderr.
 
+## Configuration is automatic
+
+**`brigadier run` does not need a config to exist, and never asks you for one.**
+It calls `ensureConfig`, which runs the same probe `init` runs, accepts the
+proposed defaults, writes the file, and carries on. It reads no stdin, so an
+agent with no keyboard attached can be the first thing that ever runs brigadier.
+Every diagnostic goes to **stderr**; stdout stays the run report, which is
+parsed.
+
+Four cases, and **every one of them proceeds**. What differs is what ends up on
+disk:
+
+| What is on disk | What happens |
+| --- | --- |
+| nothing | the machine is probed, a config is written, and each detection is reported: `brigadier: detected codex codex-cli 0.147.0 at /usr/local/bin/codex`, then `brigadier: wrote config to <path>` |
+| a config at the current version that parses | reused exactly as it is. Nothing is probed and nothing is printed |
+| a config at a **different** version | re-probed and rewritten in place, printing `has version 2; re-probing this machine and preserving compatible settings`. Tuned per-model effort ceilings, `secretsConsent`, `linkedSecretPaths` and `allowDegradedRouting` are carried across |
+| a config at the **current** version that will not parse or will not validate | left **byte-for-byte alone**. The run proceeds on a configuration detected in memory that is **not saved**, and says so: `could not be parsed: …; leaving it untouched and proceeding with a detected configuration that will not be saved` |
+
+The last row is the point: a typo in a hand-edited config must not cost you the
+config. The same in-memory fallback covers a config home that cannot be written
+at all, which prints `using the detected configuration in memory for this run`.
+
+**Nothing about the config file is fatal any more.** What is still fatal is the
+machine around it, and two of those conditions belong to this section:
+
+- **No installed worker CLI.** With nothing to route to, `run` exits `1` with
+  `no installed worker CLI reported a selectable model. Install Claude Code or
+  Codex, then try again.` and writes no file.
+- **No resolvable config home.** With neither `$BRIGADIER_HOME` nor `$HOME` set,
+  there is no directory to put a config in and none to look for one in, so the
+  lazy path cannot run at all and `run` exits `1` before it starts.
+
+Three further conditions exit `1` for reasons unrelated to configuration — an
+unreadable or invalid plan document, an environment missing `HOME`, `PATH` or
+`USER`, and a planner that could not produce a plan. [Exit
+codes](#exit-codes) lists all five together, and is the authority.
+
+Lazy config **never grants consent for anything**. `guiRegistrationConsent` is
+written `false` on every path that creates or rewrites a config this way — even
+when a wrong-version file on disk happened to contain `true`, because that file
+did not validate and its consent is not evidence a human answered a question. An
+existing, valid, current config that already records `true` is reused untouched
+and keeps it.
+
+### The install-time probe, and why you must not rely on it
+
+`npm install` invokes `scripts/postinstall.mjs`, which *would* spawn `brigadier
+init --yes` to get the probe out of the way before the first run rather than
+during it. **In practice it usually does not run at all**, and a plain `npm
+install` is one of the cases where it does not. It is a convenience with no
+guarantee attached, and it declines far more often than it acts:
+
+- it skips when `CI` is set, by presence and not by value;
+- it skips when `process.stdout.isTTY` is not `true` — and npm does not run
+  lifecycle scripts in the foreground by default, so stdout is normally a pipe
+  and this is normally false. **A plain `npm install` therefore usually skips it
+  too**, not merely `--ignore-scripts`, CI and container builds;
+- it skips when a config already exists, and when it cannot tell whether one
+  does;
+- it abandons a probe that takes longer than 5 seconds, killing the whole
+  process group.
+
+It exits `0` unconditionally, on every path including its own internal defects,
+because a postinstall that exits nonzero fails `npm install` for the entire
+dependency tree. It prints nothing on success or failure, and it registers
+nothing into any third-party application: it spawns the ordinary CLI with the
+ordinary `--yes` flag, whose default for registration consent is No.
+
+Nothing downstream may depend on it having run. **Lazy config is the guarantee.**
+
 ## brigadier init
 
-Probe, propose, confirm, write. `init` resolves each vendor's executable from
+Probe, propose, confirm, write.
+
+**`init` is not a setup step, and has not been a prerequisite for a run since
+lazy config landed.** Never run it to make a config appear; the section above is
+what actually does that. It remains the interactive way to *choose* — a different
+default model, a different effort ceiling, degraded routing, secret-file
+visibility — and it has exactly one job nothing else can do: recording the
+explicit yes that lets `brigadier install` write into a GUI application's own
+configuration. That question can only be asked interactively, so a human runs
+`init` once for it. The doctrine brigadier installs into every host says the same
+thing, so an agent that reads a consent-skipped message should hand it to the
+user rather than run `init` itself.
+
+`init` resolves each vendor's executable from
 `$PATH`, runs `<executable> --version`, and reads that vendor's model catalog.
 There is no flag and no environment variable that points `init` at a different
 executable: the discoverer does accept per-vendor overrides, but only when it is
@@ -48,13 +132,26 @@ Interactively it asks, in this order:
    reported are offered);
 3. whether a slice may run on a model below its difficulty floor rather than
    failing (`allowDegradedRouting`);
-4. whether brigadier may link secret files into worker worktrees
+4. whether brigadier may register its MCP server with the GUI hosts it detected
+   (`guiRegistrationConsent`) — **asked only when at least one was detected**,
+   and naming the ones it found;
+5. whether brigadier may link secret files into worker worktrees
    (`secretsConsent`), and if so, the repository-relative paths as a JSON array.
 
-Questions 3 and 4 both default to **No** on a fresh config. On a re-run the
+Questions 3, 4 and 5 all default to **No** on a fresh config. On a re-run the
 existing value is the default, so pressing enter through the whole flow changes
 nothing. The secret-path prompt accepts three malformed answers before it gives
 up and keeps the current list.
+
+Question 4 is the one question in brigadier that no non-interactive path may
+answer yes. `--yes`, `--print-config`, the postinstall script and lazy config all
+leave it as it was, and `brigadier install --force` does not grant it either.
+Detection itself writes nothing: `init` looks for each GUI host's usual
+directories and application bundles purely to decide whether the question is
+worth asking, and persists no result. Preserving a yes a human already gave is
+not the same as forging one, so `--yes` and a re-run carry an existing `true`
+forward rather than silently revoking it — exactly as they have always done for
+`secretsConsent`.
 
 | Option | Effect |
 | --- | --- |
@@ -172,19 +269,41 @@ Writes brigadier's host-side doctrine into each host's configuration slot, or
 stages Claude Desktop's MCP bundle for manual installation, so the host hands
 work *to* brigadier instead of doing it itself.
 
+Hosts that read a skill directory:
+
 | Host | Where its files land |
 | --- | --- |
-| `claude-code` | `~/.claude/skills/brigadier/` (a skill that auto-loads as a plugin, plus a `PreCompact` handoff hook) |
+| `claude-code` | `~/.claude/skills/brigadier/` (a skill that auto-loads as a plugin, plus a `PreCompact` handoff hook and a `UserPromptSubmit` nudge hook) |
 | `codex` | `~/.agents/skills/brigadier/`, plus `$CODEX_HOME/AGENTS.md` and a merged registration in `$CODEX_HOME/hooks.json` |
 | `opencode` | `~/.config/opencode/plugin/brigadier.js` |
-| `claude-desktop` | `~/.brigadier/surfaces/claude-desktop/` — **staged only**, nothing is installed into Desktop |
+
+Hosts that read none, and reach brigadier only over MCP. Each merges one
+`brigadier` key into the host's own `mcpServers` object, and **every one of them
+is skipped unless `guiRegistrationConsent` is recorded in your brigadier
+config**:
+
+| Host | Where the registration lands |
+| --- | --- |
+| `cursor` | `~/.cursor/mcp.json` |
+| `windsurf` | `~/.codeium/windsurf/mcp_config.json` |
+| `antigravity` | `~/.gemini/config/mcp_config.json` |
+| `claude-desktop` | `~/Library/Application Support/Claude/claude_desktop_config.json`, plus an `.mcpb` bundle **staged only** at `~/.brigadier/surfaces/claude-desktop/` |
 
 | Option | Effect |
 | --- | --- |
 | `--all` | install every host above |
 | `--dry-run` | report what would be written and write nothing |
-| `--force` | replace a file brigadier did not write, or that was edited after brigadier wrote it (written with mode 0644 or 0755, not the replaced file's mode) |
+| `--force` | replace a file brigadier did not write, or that was edited after brigadier wrote it (written with mode 0644 or 0755, not the replaced file's mode). **It does not grant registration consent, and nothing here does** |
 | `-h`, `--help` | print usage |
+
+A registration that is skipped for want of consent prints the sentence that says
+how to enable it, and that sentence addresses the person, not the agent: run
+`brigadier init` yourself and answer yes to *"Register brigadier's MCP server
+with detected GUI hosts"*. A host whose configuration directory does not exist is
+skipped rather than conjured — creating `~/.cursor/` on a machine with no Cursor
+leaves a stranger's directory holding a file nothing will read. Each
+registration also prints the host documentation its path and entry shape were
+read from, so the path is auditable rather than trusted.
 
 A manifest at `$BRIGADIER_HOME/surfaces.json` records the SHA-256 of everything
 brigadier last wrote. A file matching its recorded hash is brigadier's own and
@@ -236,6 +355,21 @@ leading `~`, and a drive-relative Windows path are refused rather than resolved.
 pipeline reads an absent snapshot as "unknown" and therefore as available, so a
 drained model is not avoided there. The tool prints that caveat in its own
 output. A real run learns the limit from the worker and escalates.
+
+The two tools that read a config go through the same lazy path `run` does, so a
+tool call on an unconfigured machine configures it instead of demanding an
+interactive step of a client that has no keyboard. Diagnostics go to stderr,
+because stdout is JSON-RPC only. No worker CLI at all is still an error, and the
+tool now says that rather than pointing at a command that no longer needs
+running. The result shapes are unchanged.
+
+The tool **descriptions** are doctrine, not decoration. Cursor, Windsurf,
+Antigravity and Claude Desktop read no skill directory, so this metadata is the
+only thing brigadier ever gets to say to those hosts: when to reach for it, that
+the work goes here rather than inline, enough of the plan shape to build a valid
+document including exclusive `ownedPaths`, and that a brigadier worker must never
+call back in. `surfaces/claude-desktop/manifest.json` declares the same three
+strings and `test/surfaces.test.ts` fails the build if they disagree.
 
 ## Reading a run
 
@@ -349,12 +483,17 @@ did.
 
 ## Exit codes
 
+**A missing, wrong-version, or unparseable config is no longer among the exit-`1`
+causes.** Each of those is handled by [Configuration is
+automatic](#configuration-is-automatic) and the run proceeds. Only having no
+worker CLI to route to, or no directory to resolve a config in, still stops it.
+
 `brigadier run`, and the top-level dispatch:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | the command succeeded |
-| `1` | brigadier could not start the run: no config, an unreadable or invalid plan document, an environment missing `HOME`, `PATH` or `USER`, or a planner that could not produce a plan. No ref and no worktree was created |
+| `1` | brigadier could not start the run: no installed worker CLI at all, no resolvable config home (neither `BRIGADIER_HOME` nor `HOME`), an unreadable or invalid plan document, an environment missing `HOME`, `PATH` or `USER`, or a planner that could not produce a plan. No ref and no worktree was created |
 | `2` | usage error: an unknown command or option, a missing or malformed option value, a bad `--slug` or `--max-workers`, both a task description and `--plan`, or a second bare argument |
 | `3` | the run started and did not succeed. The `run failed:` line names the stage that stopped it, and each slice's line names what happened to it |
 | `4` | the planner model ran but found the task too ambiguous to plan. No slice worker, worktree, ref, or commit was created; the questions are printed. Not a failed slice run — answer them and run it again |
@@ -377,9 +516,15 @@ worktree that would not be removed is still on disk.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | every file is in place |
+| `0` | nothing was refused and nothing failed to be written. **Not** a claim that every file is in place: a skip does not move the exit code |
 | `1` | at least one file was refused or could not be written |
 | `2` | usage error |
+
+A registration skipped for want of GUI consent, or for a host that is not
+installed, is a skip rather than a refusal, so `brigadier install --all` on a
+machine with no recorded consent skips all four GUI registrations and still exits
+`0`. Skips are named in the output and counted in its closing summary line; a
+script that needs to know what landed must read the report.
 
 ## Bounds and worker limits
 
@@ -459,15 +604,26 @@ Variables the CLI itself reads:
 | `CODEX_HOME` | `run`, `install` | forwarded to a Codex worker when set, because Codex resolves its credentials relative to it rather than to `HOME`; and the root for `AGENTS.md` and `hooks.json` during `install`. Never defaulted by brigadier — Codex falls back to `$HOME/.codex` itself |
 | `CLAUDE_CONFIG_DIR` | `install` | the Claude Code config root; defaults to `$HOME/.claude` |
 | `XDG_CONFIG_HOME` | `install` | the opencode config root; defaults to `$HOME/.config` |
+| `BRIGADIER_MCP_COMMAND` | `install` | the command a GUI host's MCP registration is told to spawn. Defaults to this executable when brigadier is running as its own compiled binary, and to the bare name `brigadier` otherwise. Set it to an absolute path when the bare name would not resolve |
+| `CI` | `scripts/postinstall.mjs` | present at any value, the install-time probe skips |
 
 `run` refuses a machine missing any of `HOME`, `PATH` or `USER` before it writes
 a ref, rather than rediscovering the problem once per slice. A task-backed run
 refuses it one step earlier still, before the planner launches.
 
 Worker processes get a deliberately minimal environment — `HOME`, `PATH`,
-`USER`, `SHELL=/bin/sh`, plus `CODEX_HOME` for a Codex worker and
-`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` for a Claude one. No other ambient variable
-of yours enters a worker.
+`USER`, `SHELL=/bin/sh`, `BRIGADIER_WORKER=1`, plus `CODEX_HOME` for a Codex
+worker and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` for a Claude one. No other
+ambient variable of yours enters a worker.
 
-`BRIGADIER_HANDOFF_STDIN_TIMEOUT_MS` is read by the handoff hook script
-`brigadier install` writes, not by the CLI.
+Two more variables belong to the hook scripts `brigadier install` writes rather
+than to the CLI. `BRIGADIER_HANDOFF_STDIN_TIMEOUT_MS` bounds how long either hook
+waits on stdin, and `BRIGADIER_NUDGE=off` silences the `UserPromptSubmit` nudge
+entirely. See [HOSTS.md](HOSTS.md#the-nudge-hook).
+
+`BRIGADIER_WORKER=1` is set **by** brigadier rather than read from you. Every
+worker is spawned with it, stamped at the spawn after the spec's own environment
+is spread so a spec cannot override it and an ancestor process cannot supply it.
+The nudge hook checks it before it reads stdin and stays silent, which is what
+stops a slice worker from being told to start a second orchestrator inside its
+own slice.

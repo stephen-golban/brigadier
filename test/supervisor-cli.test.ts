@@ -906,7 +906,7 @@ describe("brigadier run: options", () => {
       });
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(
-        "  1  brigadier could not start the run: no config, an unreadable or invalid\n     plan file, an environment with no HOME, PATH, or USER, or a planner that\n     could not produce a plan",
+        "  1  brigadier could not start the run: no installed worker CLI, no resolvable\n     config home (neither BRIGADIER_HOME nor HOME), an unreadable or invalid\n     plan file, an environment with no HOME, PATH, or USER, or a planner that\n     could not produce a plan",
       );
       // The code the sentence describes.
       expect(() =>

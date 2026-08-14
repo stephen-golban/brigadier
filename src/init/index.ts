@@ -710,7 +710,8 @@ Options:
 
 Exit codes:
   0  the command succeeded
-  1  brigadier could not start the run: no config, an unreadable or invalid
+  1  brigadier could not start the run: no installed worker CLI, no resolvable
+     config home (neither BRIGADIER_HOME nor HOME), an unreadable or invalid
      plan file, an environment with no HOME, PATH, or USER, or a planner that
      could not produce a plan
   2  usage error
@@ -883,10 +884,14 @@ async function loadDiscoverer(): Promise<Discoverer> {
  * THE EXIT CODES, which are an interface a CI step branches on:
  *
  *   0  the run succeeded.
- *   1  brigadier could not start the run at all — no config, an unreadable or
- *      malformed plan file, or an environment missing any of HOME, PATH, or
- *      USER, all three of which `requireLaunchEnv` demands. Nothing was
- *      created, and the fix is outside the plan.
+ *   1  brigadier could not start the run at all — no installed worker CLI to
+ *      route to, no resolvable config home (neither `$BRIGADIER_HOME` nor
+ *      `$HOME`), an unreadable or malformed plan file, an environment missing
+ *      any of HOME, PATH, or USER, all three of which `requireLaunchEnv`
+ *      demands, or a planner that could not produce a plan. A config that is
+ *      missing, wrong-version or unparseable is NOT among these: lazy config
+ *      handles each and the run proceeds. Nothing was created, and the fix is
+ *      outside the plan.
  *   2  usage error: an unknown option, a missing `--plan`, a bad `--slug` or
  *      `--max-workers`, or a bare positional argument.
  *   3  the run started and did not succeed. This is a report, not a crash: the

@@ -206,8 +206,12 @@ entry it discarded might have been the blocking one.
 
 ## Who reviews
 
-The other configured vendor's **default model** — the one you told
-`brigadier init` you wanted from that vendor — rather than a routing decision.
+The other configured vendor's **default model** — the one recorded for that
+vendor in `config.json` under the resolved config home, which is
+`$BRIGADIER_HOME` when that is set and `$HOME/.brigadier` otherwise, whether
+brigadier proposed it during lazy configuration or you chose it in
+`brigadier init` — rather than a routing
+decision.
 Routing ranks models against a *slice's* difficulty, and a review is not the
 slice; "who should read this" is a different question.
 
@@ -232,10 +236,11 @@ Cancellation is different. The review record carries `CANCELLED`, but the slice
 runner treats it as a cancelled, non-retryable attempt, removes the worktree, and
 does not commit the unreviewed change.
 
-Failing closed was the alternative and it was refused: `brigadier init` produces
-a single-vendor config whenever it finds one CLI, and one vendor's outage — or
-one missing install — would then fail every slice of every run for reasons that
-have nothing to do with the user's code.
+Failing closed was the alternative and it was refused: discovery produces a
+single-vendor config whenever it finds one CLI — and it now does that by itself,
+on the first run, without anyone choosing it — so one vendor's outage, or one
+missing install, would then fail every slice of every run for reasons that have
+nothing to do with the user's code.
 
 **The price, stated plainly: on a single-vendor install, nothing adversarially
 reviews anything.** A slice that otherwise succeeds commits with

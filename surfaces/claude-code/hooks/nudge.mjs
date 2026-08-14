@@ -227,13 +227,28 @@ function looksMultiPart(text) {
 /**
  * Whether this prompt reads as a question rather than an assignment.
  *
- * A trailing `?` is the easy case. The other one is a prompt whose OPENING
- * sentence is the question and whose remainder is evidence — symptoms, a log,
- * a list of things the asker has already tried — which is the shape a bug
- * report takes and is exactly the shape that used to slip through.
+ * THREE SHAPES, AND PUNCTUATION IS ONLY ONE OF THEM.
+ *
+ * A trailing `?` is the easy case. An opening interrogative word is the second,
+ * and it is tested WITHOUT requiring a `?` anywhere in the prompt, because
+ * people drop the question mark constantly: "How do I refactor every module
+ * across the codebase and migrate all the call sites" is a question, and it
+ * happens to carry a structural verb, a breadth word and a quantified plural —
+ * everything the matcher below fires on. Requiring punctuation before consulting
+ * the openers meant a question in that shape spent the session's only nudge.
+ * The third is a prompt whose OPENING sentence is the question and whose
+ * remainder is evidence — symptoms, a log, a list of things the asker has
+ * already tried — which is the shape a bug report takes.
+ *
+ * Reading an imperative that opens "Do ..." or "Have ..." as a question is the
+ * price, and it is deliberately the side to err on: a missed nudge costs one
+ * nudge, a false positive costs the session the only one it will ever get.
  */
 function looksLikeQuestion(text) {
   if (text.endsWith("?")) {
+    return true;
+  }
+  if (QUESTION_OPENERS.test(text)) {
     return true;
   }
   const mark = text.indexOf("?");
@@ -241,7 +256,7 @@ function looksLikeQuestion(text) {
     return false;
   }
   const sentenceEnd = text.search(/[.!]/);
-  return sentenceEnd < 0 || mark < sentenceEnd || QUESTION_OPENERS.test(text);
+  return sentenceEnd < 0 || mark < sentenceEnd;
 }
 
 /** Two or more named files, or one quantified plural target. */

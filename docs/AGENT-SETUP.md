@@ -112,28 +112,38 @@ Node-compatible modules under `dist/`; `build:unsigned` additionally skips
 path requires Bun. The executable is not on `PATH` — either move it somewhere
 on `PATH` or call it by path, and use that same form in every command below.
 
-## Step 2 — configure non-interactively
+## Step 2 — there is nothing to configure
 
-```sh
-brigadier init --yes
+**Do not run `brigadier init`. It is not a setup step and has not been a
+prerequisite for a run.** A turn spent on it is a turn wasted.
+
+`brigadier run` configures the machine itself, without reading stdin. It probes
+for installed worker CLIs, writes `$BRIGADIER_HOME/config.json`, reports each
+detection on **stderr**, and carries on:
+
+```text
+brigadier: detected codex codex-cli 0.147.0 at /usr/local/bin/codex
+brigadier: wrote config to /Users/you/.brigadier/config.json
 ```
 
-`--yes` accepts **every proposed default without prompting** and then writes the
-config. What it accepts is the proposal brigadier built from discovery: a
-default model per vendor, a per-model effort ceiling, and — on a fresh
-machine — `allowDegradedRouting: false` and `secretsConsent: false`. On a
-re-run, an existing config supplies the defaults, so `--yes` carries the user's
-previous answers forward rather than resetting them.
+A config already there at the current version is reused untouched and prints
+nothing. A config at a **different** version is re-probed and rewritten in place,
+carrying across tuned effort ceilings, `secretsConsent`, `linkedSecretPaths` and
+`allowDegradedRouting`. A **current**-version config that will not parse is left
+byte-for-byte alone; the run proceeds on a detected configuration held in memory
+that is not saved, and says so on stderr. **Report that line to the user** — their
+config file has a defect and brigadier deliberately did not overwrite it.
 
-The proposed ceiling is not `high` for every model. It is the highest rung
-brigadier proposes that the model itself reported: `high` where the model allows
-it, otherwise `medium`, and never above `high`. A model that reports neither is
-excluded from the proposal rather than recorded at an effort its vendor would
-reject, so do not report a `medium` ceiling or a missing model as a defect.
+An `npm install` may have run a probe already, but assume it did not: that script
+skips whenever `CI` is set or stdout is not a TTY, which covers a plain
+`npm install`. Never treat a missing config as a defect or a reason to intervene.
 
-Expected: exit `0` and a final line reading `Wrote <path>`.
+The one failure that is still fatal: **no installed worker CLI at all**. The run
+exits `1` with `no installed worker CLI reported a selectable model. Install
+Claude Code or Codex, then try again.` and nothing is written. That is a real
+precondition failure — stop and tell the user.
 
-To inspect the resolved config without writing anything:
+### Inspecting the config without changing anything
 
 ```sh
 brigadier init --print-config
@@ -141,8 +151,15 @@ brigadier init --print-config
 
 `--print-config` prints the resolved config as JSON on stdout and **writes no
 file**. It also suppresses the discovery report and the proposal block, sends
-discovery notices to stderr, and prompts for nothing. Use it to show the user
-what would be recorded before you record it.
+discovery notices to stderr, and prompts for nothing. This is the one `init`
+invocation an agent may make freely, because it changes nothing. Use it to show
+the user what would be recorded.
+
+The ceiling it proposes is not `high` for every model. It is the highest rung
+brigadier proposes that the model itself reported: `high` where the model allows
+it, otherwise `medium`, and never above `high`. A model that reports neither is
+excluded from the proposal rather than recorded at an effort its vendor would
+reject, so do not report a `medium` ceiling or a missing model as a defect.
 
 One asymmetry to know: with **no** installed CLI reporting a selectable model,
 `--print-config` still prints a config and exits `0`, while plain
@@ -150,12 +167,27 @@ One asymmetry to know: with **no** installed CLI reporting a selectable model,
 Never read a successful `--print-config` as proof that a worker CLI was found —
 check its `vendors` array.
 
+### The one time a human runs `brigadier init`
+
+Registering brigadier's MCP server into a GUI application's own configuration
+(Cursor, Windsurf, Antigravity, Claude Desktop) takes an explicit yes, and only
+the interactive question can ask for it. Nothing else grants it — not `--yes`,
+not `--print-config`, not the install-time probe, not the lazy config a run
+writes, and not `brigadier install --force`.
+
+So if `brigadier install` reports a registration skipped for want of consent,
+**pass that sentence to the user and let them run `brigadier init` once
+themselves.** Do not run it for them, and do not hand-edit
+`guiRegistrationConsent` into their config. This is a consent decision, exactly
+like `secretsConsent` below.
+
 ### Where the config lands
 
 `$BRIGADIER_HOME/config.json` when `BRIGADIER_HOME` is set and non-empty,
 otherwise `$HOME/.brigadier/config.json`. The directory is created mode `0700`
-and the file mode `0600`. With neither variable set, `init` refuses rather than
-guessing a home directory.
+and the file mode `0600`. With neither variable set, brigadier refuses rather
+than guessing a home directory — that is one of the two remaining exit-`1`
+config failures.
 
 ### Do not turn on secret-file visibility
 
@@ -219,11 +251,13 @@ If the dry run reports the slice as `failed ROUTING_FAILED`, read the `rejected
 model that was considered and why each was refused — and report them to the user
 rather than retrying blindly.
 
-## Step 4 — install host doctrine (optional)
+## Step 4 — install host doctrine
 
-`brigadier install <host>` writes brigadier's doctrine into a CLI host so that
-host hands work to brigadier instead of doing it itself. It is optional; nothing
-in Step 3 depends on it.
+`brigadier install <host>` writes brigadier's doctrine into a host so that host
+hands work to brigadier instead of doing it itself. Nothing in Step 3 depends on
+it, but **this is how brigadier is primarily meant to be used**: the user keeps
+working in the host they already have, and brigadier engages from inside that
+session. Install it into the host you are running in, at least.
 
 **Always dry-run first:**
 
@@ -232,8 +266,39 @@ brigadier install --all --dry-run     # reports what would be written, writes no
 brigadier install claude-code codex   # then the real thing
 ```
 
-Exit `0` means every file is in place; `1` means at least one file was refused
-or could not be written; `2` is a usage error. A refusal is not a crash — the
+Seven hosts, in two kinds. `claude-code` and `codex` read a skill directory and
+get the doctrine written into it. `cursor`, `windsurf`, `antigravity` and
+`claude-desktop` read none, so brigadier merges one `brigadier` key into that
+host's own MCP configuration instead — **and every one of those four is skipped
+unless the user has recorded registration consent.** A skip is not a failure and
+does not move the exit code. When you see one, relay its message; the remedy is
+the user running `brigadier init` once, and it is not yours to perform.
+
+**`opencode` is the exception, and installing it alone is a trap.** opencode
+reads `~/.claude/skills` and `~/.agents/skills` natively, so it gets the doctrine
+from `brigadier install claude-code` or `brigadier install codex` — never from
+its own name. `brigadier install opencode` writes only the compaction-handoff
+plugin, which is the one thing a skill cannot be. If the user is on opencode,
+install `codex` (or `claude-code`) for the doctrine and `opencode` for the hook;
+`opencode` by itself leaves the host with a hook and nothing telling it to
+delegate.
+
+On Claude Code the install also registers a `UserPromptSubmit` nudge hook beside
+the `PreCompact` handoff hook. Neither needs approval on that host. The nudge
+says one sentence, at most once per session, only for a prompt that describes
+more than one independent piece of work, and `BRIGADIER_NUDGE=off` silences it.
+It is deliberately **not** registered on Codex, because Codex binds hook approval
+to the exact registration and adding an event would disarm the approved handoff.
+
+Exit `0` means nothing was refused and nothing failed to be written; `1` means at
+least one file was refused or could not be written; `2` is a usage error. **`0`
+does not mean every file is in place.** A skip does not move the exit code, so
+`brigadier install --all` with no recorded consent skips all four GUI
+registrations and still exits `0`. Read the per-file lines and the closing
+`… written, … unchanged, … skipped, … refused.` summary rather than the code
+alone; you are the one telling the user what actually landed.
+
+A refusal is not a crash — the
 destination is left exactly as it is. **Read the refusal message, because there
 are two kinds and only one of them has a remedy.**
 
@@ -300,8 +365,8 @@ budget, the run refuses and names the number to pass. Do not raise
 
 | Symptom | Exit | What to do |
 | --- | --- | --- |
-| `no brigadier config was found at <path>` | `1` | run Step 2 (`brigadier init --yes`), then retry |
-| `the config at <path> cannot be used` | `1` | the config exists but is invalid; show the message to the user and re-run `brigadier init` |
+| `no installed worker CLI reported a selectable model` | `1` | there is nothing to route to. Ask the user to install Claude Code or Codex and log in. Do not retry |
+| `config at <path> could not be parsed: …; leaving it untouched` | *(none)* | **not a failure.** The run proceeds on a detected config held in memory. Relay the line so the user knows their config file has a defect brigadier refused to overwrite |
 | `could not read the plan file <path>` / `is not valid JSON` | `1` | fix the path or the JSON. Nothing was created |
 | `is not a valid plan document (<n> issue(s))` | `1` | every defect is listed at once; repair them all in one pass, then retry |
 | a missing `HOME`, `PATH`, or `USER` | `1` | the environment cannot launch any worker. Do not patch it silently — tell the user which variable is missing |
@@ -323,6 +388,13 @@ same task, will produce the same questions and spend the planner's tokens again.
   consent says.
 - **Never enable `secretsConsent` on the user's behalf.** It defaults to No. If
   a slice seems to need it, ask.
+- **Never grant `guiRegistrationConsent` on the user's behalf.** It authorizes
+  brigadier to write into another application's configuration. Only the
+  interactive question in `brigadier init` may record it, and hand-editing the
+  config to fake it is the same violation as answering it for them.
+- **Never run `brigadier init` to make a config appear.** It is not a setup
+  step; `brigadier run` configures the machine itself. The only `init` an agent
+  may run freely is `--print-config`, which writes nothing.
 - **Never claim a slice was reviewed when the report says
   `review: not run (NO_OTHER_VENDOR)`.** That line means nothing adversarially
   reviewed the change. Report it as unreviewed.
