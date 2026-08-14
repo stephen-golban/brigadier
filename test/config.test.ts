@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { ParsedBrigadierConfig } from "../src/config/contracts.ts";
 import type { BrigadierConfig, ConfigIo } from "../src/config/index.ts";
 import {
   CONFIG_VERSION,
@@ -184,8 +185,17 @@ describe("effort ladder narrowing", () => {
 });
 
 describe("parseConfig", () => {
+  test("accepts a literal without enabledHosts and returns a required array", () => {
+    const input: BrigadierConfig = structuredClone(CANONICAL);
+    const output: ParsedBrigadierConfig = parseConfig(input);
+
+    expect(output.enabledHosts).toEqual([]);
+  });
+
   test("accepts a canonical config unchanged", () => {
-    expect(parseConfig(structuredClone(CANONICAL))).toEqual(CANONICAL);
+    expect<BrigadierConfig>(parseConfig(structuredClone(CANONICAL))).toEqual(
+      CANONICAL,
+    );
     expect(parseConfig(structuredClone(CANONICAL)).enabledHosts).toEqual([]);
     expect(serializeConfig(CANONICAL)).toBe(CANONICAL_BYTES);
     expect(serializeConfig(parseConfig(structuredClone(CANONICAL)))).toBe(
@@ -722,7 +732,7 @@ describe("lazy config", () => {
       });
 
       expect(result).toEqual({
-        config: CANONICAL,
+        config: parseConfig(CANONICAL),
         path,
         written: false,
         inMemory: false,

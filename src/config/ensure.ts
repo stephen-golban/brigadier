@@ -4,7 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
 import type { OutputStream } from "../init/prompt.js";
 import { proposeConfig } from "../init/propose.js";
-import type { BrigadierConfig, GuiHost, Host } from "./contracts.js";
+import type { GuiHost, Host, ParsedBrigadierConfig } from "./contracts.js";
 import { CONFIG_VERSION, GUI_HOSTS, HOSTS, parseConfig } from "./contracts.js";
 import type { ConfigEnvironment, ConfigIo } from "./store.js";
 import {
@@ -22,7 +22,7 @@ export interface EnsureConfigOptions {
 }
 
 export interface EnsureConfigResult {
-  readonly config: BrigadierConfig;
+  readonly config: ParsedBrigadierConfig;
   readonly path: string;
   /** false when an existing, current, valid config was reused as-is. */
   readonly written: boolean;
@@ -115,9 +115,9 @@ export async function ensureConfig(
   }
 
   try {
-    const written = await writeConfig(path, config, io);
+    await writeConfig(path, config, io);
     stderr.write(`brigadier: wrote config to ${path}\n`);
-    return { config: written, path, written: true, inMemory: false };
+    return { config, path, written: true, inMemory: false };
   } catch (error) {
     stderr.write(
       `brigadier: could not write config to ${path}; using the detected configuration in memory for this run: ${describe(error)}\n`,
@@ -127,19 +127,21 @@ export async function ensureConfig(
 }
 
 type EnsureLoad =
-  | { readonly kind: "current"; readonly config: BrigadierConfig }
+  | { readonly kind: "current"; readonly config: ParsedBrigadierConfig }
   | { readonly kind: "missing" }
   | { readonly kind: "invalid"; readonly reason: string }
   | {
       readonly kind: "wrong-version";
       readonly version: unknown;
-      readonly prior: BrigadierConfig | null;
+      readonly prior: ParsedBrigadierConfig | null;
     };
 
 async function loadForEnsure(path: string, io: ConfigIo): Promise<EnsureLoad> {
   try {
     const config = await readConfig(path, io);
-    return config === null ? { kind: "missing" } : { kind: "current", config };
+    return config === null
+      ? { kind: "missing" }
+      : { kind: "current", config: parseConfig(config) };
   } catch (error) {
     let raw: unknown;
     try {
@@ -160,7 +162,7 @@ async function loadForEnsure(path: string, io: ConfigIo): Promise<EnsureLoad> {
 }
 
 /** Projects only current fields out of an old file before normal validation. */
-function preserveCompatibleFields(raw: unknown): BrigadierConfig | null {
+function preserveCompatibleFields(raw: unknown): ParsedBrigadierConfig | null {
   const old = record(raw);
   if (old === null) {
     return null;
@@ -217,7 +219,7 @@ export async function detectHosts(
   io: ConfigIo = nodeConfigIo,
   lookup: ExecutableLookup = createExecutableLookup(environment),
 ): Promise<readonly HostDetection[]> {
-  const directoryCandidates = hostDirectoryCandidates(environment);
+  const pathCandidates = hostPathCandidates(environment);
   const detected: HostDetection[] = [];
 
   for (const host of HOSTS) {
@@ -235,12 +237,12 @@ export async function detectHosts(
           continue;
         }
       } catch {
-        // A failed executable probe is unknown; directory evidence may remain.
+        // A failed executable probe is unknown; marker evidence may remain.
       }
     }
 
     let evidence: string | null = null;
-    for (const candidate of directoryCandidates[host]) {
+    for (const candidate of pathCandidates[host]) {
       if (await pathExists(io, candidate)) {
         evidence = resolve(candidate);
         break;
@@ -293,6 +295,7 @@ function createExecutableLookup(
       for (const directory of path.split(delimiter)) {
         // PATH entries are POSIX path bytes. Spaces are legal and meaningful.
         if (directory.length === 0) {
+          // Do not let a checked-out repository impersonate an installed host.
           continue;
         }
         const candidate = resolve(join(directory, command));
@@ -322,7 +325,7 @@ function hostCommand(host: Host): string | null {
   return null;
 }
 
-function hostDirectoryCandidates(
+function hostPathCandidates(
   environment: ConfigEnvironment,
 ): Readonly<Record<Host, readonly string[]>> {
   const home = environment.HOME ?? "";
@@ -333,15 +336,23 @@ function hostDirectoryCandidates(
   const fromHome = (...parts: string[]): string[] =>
     home.length === 0 ? [] : [resolve(home, ...parts)];
 
+  // Brigadier creates each bare skill-host root itself. Only host-owned marker
+  // files count as fallback evidence; the installer writes none of these.
   return {
     "claude-code": [
-      ...fromEnvironment("CLAUDE_CONFIG_DIR"),
-      ...fromHome(".claude"),
+      ...fromEnvironment("CLAUDE_CONFIG_DIR", "settings.json"),
+      ...fromHome(".claude", "settings.json"),
+      ...fromHome(".claude.json"),
     ],
-    codex: [...fromEnvironment("CODEX_HOME"), ...fromHome(".codex")],
+    codex: [
+      ...fromEnvironment("CODEX_HOME", "config.toml"),
+      ...fromEnvironment("CODEX_HOME", "auth.json"),
+      ...fromHome(".codex", "config.toml"),
+      ...fromHome(".codex", "auth.json"),
+    ],
     opencode: [
-      ...fromEnvironment("XDG_CONFIG_HOME", "opencode"),
-      ...fromHome(".config", "opencode"),
+      ...fromEnvironment("XDG_CONFIG_HOME", "opencode", "opencode.json"),
+      ...fromHome(".config", "opencode", "opencode.json"),
     ],
     // ~/.agents/skills is deliberately absent: Codex and opencode both read
     // it, and brigadier itself creates it when installing either host.
