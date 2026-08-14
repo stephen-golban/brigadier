@@ -10,7 +10,10 @@ export const platforms = [
   "linux-x64",
 ] as const;
 
-export function assetName(version: string, platform: (typeof platforms)[number]) {
+export function assetName(
+  version: string,
+  platform: (typeof platforms)[number],
+) {
   return `brigadier-${version}-${platform}.tar.gz`;
 }
 
@@ -78,7 +81,8 @@ export async function updateFormula(
 }
 
 async function main() {
-  const [version, checksumDirectoryArgument, formulaPathArgument] = process.argv.slice(2);
+  const [version, checksumDirectoryArgument, formulaPathArgument] =
+    process.argv.slice(2);
   if (version === undefined || checksumDirectoryArgument === undefined) {
     fail(
       "usage: update-homebrew-formula.ts <version> <release-assets-directory> [formula-path]",

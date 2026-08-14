@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assetName,
@@ -26,7 +27,11 @@ test("installer maps supported uname triples to release asset platforms", async 
       'uname() { case "$1" in -s) printf "%s\\n" "$test_os" ;; -m) printf "%s\\n" "$test_arch" ;; esac; }; detect_platform; printf "%s\\n" "$platform"',
     );
     const child = Bun.spawn(["sh", "-c", script], {
-      env: { ...process.env, test_os: operatingSystem, test_arch: architecture },
+      env: {
+        ...process.env,
+        test_os: operatingSystem,
+        test_arch: architecture,
+      },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -47,10 +52,12 @@ test("release asset naming and URL construction are deterministic", () => {
 
 test("checksum parsing accepts only a digest for its expected archive", () => {
   const digest = "a".repeat(64);
-  expect(checksumFromContents(`${digest}  archive.tar.gz\n`, "archive.tar.gz")).toBe(digest);
-  expect(() => checksumFromContents(`${digest}  other.tar.gz\n`, "archive.tar.gz")).toThrow(
-    "invalid SHA-256 checksum file",
-  );
+  expect(
+    checksumFromContents(`${digest}  archive.tar.gz\n`, "archive.tar.gz"),
+  ).toBe(digest);
+  expect(() =>
+    checksumFromContents(`${digest}  other.tar.gz\n`, "archive.tar.gz"),
+  ).toThrow("invalid SHA-256 checksum file");
 });
 
 test("formula updater rewrites all release URLs and checksums without network access", async () => {
@@ -75,4 +82,51 @@ test("installer retains checksum verification and guarded interactive setup", as
   expect(source).toContain("BRIGADIER_SKIP_CHECKSUM=1");
   expect(source).toContain("/dev/tty");
   expect(source).toContain('"$installed_binary" init </dev/tty');
+});
+
+test("installer succeeds when interactive setup does not finish", async () => {
+  const source = await readFile(join(root, "install.sh"), "utf8");
+  const installDirectory = await mkdtemp(
+    join(tmpdir(), "brigadier-installer-test-"),
+  );
+  const script = source
+    .replace(
+      "if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then",
+      "if true; then",
+    )
+    .replace(
+      '"$installed_binary" init </dev/tty',
+      '"$installed_binary" init </dev/null',
+    )
+    .replace(
+      'main "$@"',
+      `download() { :; }
+verify_checksum() { :; }
+tar() {
+  printf '%s\\n' '#!/bin/sh' 'case "$1" in' '--version) printf "%s\\n" "0.0.0" ;;' 'init) printf "%s\\n" "stub init failed" >&2; exit 1 ;;' 'esac' > "$temporary_directory/brigadier"
+  chmod +x "$temporary_directory/brigadier"
+}
+main "$@"`,
+    );
+
+  try {
+    const child = Bun.spawn(["sh", "-c", script], {
+      env: {
+        ...process.env,
+        BRIGADIER_INSTALL_DIR: installDirectory,
+        BRIGADIER_VERSION: "0.0.0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+
+    expect(await child.exited).toBe(0);
+    expect(stdout).toContain("Installed brigadier 0.0.0");
+    expect(stderr).toContain("stub init failed");
+    expect(stderr).toContain("brigadier setup did not finish");
+  } finally {
+    await rm(installDirectory, { recursive: true, force: true });
+  }
 });
