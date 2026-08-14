@@ -93,8 +93,14 @@ export interface VendorConfig {
 export interface BrigadierConfig {
   readonly version: typeof CONFIG_VERSION;
   readonly vendors: readonly VendorConfig[];
-  /** Hosts the user selected from the set detected by `brigadier init`. */
-  readonly enabledHosts: readonly Host[];
+  /**
+   * Hosts the user selected from the set detected by `brigadier init`.
+   *
+   * Optional only on the input/literal shape so existing callers can supply a
+   * version-3 config written before this field existed. `parseConfig` returns
+   * `ParsedBrigadierConfig`, where the property is always a required array.
+   */
+  readonly enabledHosts?: readonly Host[];
   /** Consent to link secret files into worker worktrees. */
   readonly secretsConsent: boolean;
   /** Repository-relative `.env`-shaped files approved for worker worktrees. */
@@ -124,6 +130,11 @@ export interface BrigadierConfig {
    * on something weaker than the work asked for.
    */
   readonly allowDegradedRouting: boolean;
+}
+
+/** A validated config returned to readers, with every default materialized. */
+export interface ParsedBrigadierConfig extends BrigadierConfig {
+  readonly enabledHosts: readonly Host[];
 }
 
 /** Raised by `parseConfig` and by every config transform in `init`. */
@@ -209,11 +220,12 @@ function isEffort(value: unknown): value is Effort {
 }
 
 /**
- * Validates an untrusted value into a `BrigadierConfig`, rejecting unknown keys
- * so nothing outside the documented surface can be smuggled into the file.
- * Returns a fresh, canonically ordered object.
+ * Validates an untrusted value into a `ParsedBrigadierConfig`, rejecting
+ * unknown keys so nothing outside the documented surface can be smuggled into
+ * the file. Returns a fresh, canonically ordered object with all reader
+ * defaults materialized.
  */
-export function parseConfig(value: unknown): BrigadierConfig {
+export function parseConfig(value: unknown): ParsedBrigadierConfig {
   const root = asRecord(value);
   if (root === null) {
     throw new ConfigValidationError(["config must be a JSON object"]);
@@ -272,7 +284,7 @@ export function parseConfig(value: unknown): BrigadierConfig {
   if (issues.length > 0) {
     throw new ConfigValidationError(issues);
   }
-  const config: BrigadierConfig = {
+  const config: ParsedBrigadierConfig = {
     version: CONFIG_VERSION,
     vendors,
     enabledHosts,

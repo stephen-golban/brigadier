@@ -79,11 +79,11 @@ test("a version-3 config without enabledHosts reads as an empty selection", () =
   );
 });
 
-test("every host is detected by its ordered directory fallback", async () => {
+test("every host is detected by its ordered path fallback", async () => {
   const present = new Set([
-    "/machine/claude-override",
-    "/machine/codex-override",
-    "/machine/xdg/opencode",
+    "/machine/claude-override/settings.json",
+    "/machine/codex-override/config.toml",
+    "/machine/xdg/opencode/opencode.json",
     "/machine/home/.cursor",
     "/machine/home/.codeium/windsurf",
     "/machine/home/.antigravity",
@@ -139,6 +139,71 @@ test("absent hosts have null evidence and shared agents skills prove nothing", a
   expect(detections.every((entry) => !entry.present)).toBe(true);
 });
 
+test("brigadier install --all files do not prove skill hosts are installed", async () => {
+  const installFootprint = new Set([
+    "/machine/home/.claude",
+    "/machine/home/.claude/skills",
+    "/machine/home/.claude/skills/brigadier",
+    "/machine/home/.claude/skills/brigadier/SKILL.md",
+    "/machine/home/.claude/skills/brigadier/.claude-plugin",
+    "/machine/home/.claude/skills/brigadier/.claude-plugin/plugin.json",
+    "/machine/home/.claude/skills/brigadier/hooks",
+    "/machine/home/.claude/skills/brigadier/hooks/hooks.json",
+    "/machine/home/.claude/skills/brigadier/hooks/handoff.mjs",
+    "/machine/home/.claude/skills/brigadier/hooks/nudge.mjs",
+    "/machine/home/.claude/skills/brigadier/hooks/README.md",
+    "/machine/home/.codex",
+    "/machine/home/.codex/AGENTS.md",
+    "/machine/home/.codex/hooks.json",
+    "/machine/home/.config",
+    "/machine/home/.config/opencode",
+    "/machine/home/.config/opencode/plugin",
+    "/machine/home/.config/opencode/plugin/brigadier.js",
+  ]);
+  const detections = await detectHosts(
+    { HOME: "/machine/home", PATH: "" },
+    describedIo((path) => installFootprint.has(path)),
+    NO_EXECUTABLES,
+  );
+
+  for (const host of ["claude-code", "codex", "opencode"] as const) {
+    expect(detection(detections, host)).toEqual({
+      host,
+      present: false,
+      evidence: null,
+      evidenceKind: null,
+    });
+  }
+});
+
+test("secondary host markers and additive home fallbacks remain evidence", async () => {
+  const present = new Set([
+    "/machine/home/.claude.json",
+    "/machine/codex-override/auth.json",
+    "/machine/home/.config/opencode/opencode.json",
+  ]);
+  const detections = await detectHosts(
+    {
+      HOME: "/machine/home",
+      CLAUDE_CONFIG_DIR: "/machine/claude-override",
+      CODEX_HOME: "/machine/codex-override",
+      XDG_CONFIG_HOME: "/machine/xdg",
+    },
+    describedIo((path) => present.has(path)),
+    NO_EXECUTABLES,
+  );
+
+  expect(detection(detections, "claude-code").evidence).toBe(
+    "/machine/home/.claude.json",
+  );
+  expect(detection(detections, "codex").evidence).toBe(
+    "/machine/codex-override/auth.json",
+  );
+  expect(detection(detections, "opencode").evidence).toBe(
+    "/machine/home/.config/opencode/opencode.json",
+  );
+});
+
 test("a missing override remains additive with the home fallback", async () => {
   const seen: string[] = [];
   const detections = await detectHosts(
@@ -148,18 +213,18 @@ test("a missing override remains additive with the home fallback", async () => {
     },
     describedIo((path) => {
       seen.push(path);
-      return path === "/machine/home/.claude";
+      return path === "/machine/home/.claude/settings.json";
     }),
     NO_EXECUTABLES,
   );
 
-  expect(seen.indexOf("/machine/missing-claude")).toBeLessThan(
-    seen.indexOf("/machine/home/.claude"),
+  expect(seen.indexOf("/machine/missing-claude/settings.json")).toBeLessThan(
+    seen.indexOf("/machine/home/.claude/settings.json"),
   );
   expect(detection(detections, "claude-code")).toEqual({
     host: "claude-code",
     present: true,
-    evidence: "/machine/home/.claude",
+    evidence: "/machine/home/.claude/settings.json",
     evidenceKind: "directory",
   });
 });
@@ -179,7 +244,7 @@ test("permission errors are not presence and do not hide later evidence", async 
       if (path.includes("inaccessible")) {
         throw inaccessible;
       }
-      return path === "/machine/home/.claude";
+      return path === "/machine/home/.claude/settings.json";
     }),
     NO_EXECUTABLES,
   );
@@ -187,7 +252,7 @@ test("permission errors are not presence and do not hide later evidence", async 
   expect(detection(detections, "claude-code")).toEqual({
     host: "claude-code",
     present: true,
-    evidence: "/machine/home/.claude",
+    evidence: "/machine/home/.claude/settings.json",
     evidenceKind: "directory",
   });
   expect(detection(detections, "codex").present).toBe(false);
