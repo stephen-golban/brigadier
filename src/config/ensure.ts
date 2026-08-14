@@ -1,9 +1,11 @@
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { delimiter, join, resolve } from "node:path";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
 import type { OutputStream } from "../init/prompt.js";
 import { proposeConfig } from "../init/propose.js";
-import type { BrigadierConfig, GuiHost } from "./contracts.js";
-import { CONFIG_VERSION, GUI_HOSTS, parseConfig } from "./contracts.js";
+import type { BrigadierConfig, GuiHost, Host } from "./contracts.js";
+import { CONFIG_VERSION, GUI_HOSTS, HOSTS, parseConfig } from "./contracts.js";
 import type { ConfigEnvironment, ConfigIo } from "./store.js";
 import {
   nodeConfigIo,
@@ -32,6 +34,25 @@ export interface EnsureConfigResult {
    */
   readonly inMemory: boolean;
 }
+
+/** Injectable executable resolution keeps host detection machine-independent. */
+export interface ExecutableLookup {
+  resolve(command: string): Promise<string | null>;
+}
+
+export type HostDetection =
+  | {
+      readonly host: Host;
+      readonly present: true;
+      readonly evidence: string;
+      readonly evidenceKind: "executable" | "directory";
+    }
+  | {
+      readonly host: Host;
+      readonly present: false;
+      readonly evidence: null;
+      readonly evidenceKind: null;
+    };
 
 /**
  * Returns a usable config, creating one from the same discovery report as
@@ -65,6 +86,9 @@ export async function ensureConfig(
   // untrusted old-version file happened to contain a truthy value for it.
   const config = parseConfig({
     ...proposal.config,
+    ...(prior !== null && prior.enabledHosts.length > 0
+      ? { enabledHosts: prior.enabledHosts }
+      : {}),
     secretsConsent: prior?.secretsConsent ?? proposal.config.secretsConsent,
     linkedSecretPaths:
       prior?.linkedSecretPaths ?? proposal.config.linkedSecretPaths,
@@ -151,6 +175,9 @@ function preserveCompatibleFields(raw: unknown): BrigadierConfig | null {
         : [],
       guiRegistrationConsent: false,
       allowDegradedRouting: old.allowDegradedRouting === true,
+      ...(Array.isArray(old.enabledHosts) && old.enabledHosts.length > 0
+        ? { enabledHosts: old.enabledHosts }
+        : {}),
     });
   } catch {
     return null;
@@ -184,54 +211,154 @@ async function createRealDiscoverer(): Promise<Discoverer> {
   return discovery.createDiscoverer();
 }
 
+/** Read-only detection of every host brigadier knows how to install into. */
+export async function detectHosts(
+  environment: ConfigEnvironment,
+  io: ConfigIo = nodeConfigIo,
+  lookup: ExecutableLookup = createExecutableLookup(environment),
+): Promise<readonly HostDetection[]> {
+  const directoryCandidates = hostDirectoryCandidates(environment);
+  const detected: HostDetection[] = [];
+
+  for (const host of HOSTS) {
+    const command = hostCommand(host);
+    if (command !== null) {
+      try {
+        const executable = await lookup.resolve(command);
+        if (executable !== null && executable.length > 0) {
+          detected.push({
+            host,
+            present: true,
+            evidence: resolve(executable),
+            evidenceKind: "executable",
+          });
+          continue;
+        }
+      } catch {
+        // A failed executable probe is unknown; directory evidence may remain.
+      }
+    }
+
+    let evidence: string | null = null;
+    for (const candidate of directoryCandidates[host]) {
+      if (await pathExists(io, candidate)) {
+        evidence = resolve(candidate);
+        break;
+      }
+    }
+    detected.push(
+      evidence === null
+        ? { host, present: false, evidence: null, evidenceKind: null }
+        : { host, present: true, evidence, evidenceKind: "directory" },
+    );
+  }
+  return detected;
+}
+
 /** Cheap, read-only detection of GUI hosts. No result is persisted. */
 export async function detectGuiHosts(
   environment: ConfigEnvironment,
   io: ConfigIo = nodeConfigIo,
 ): Promise<readonly GuiHost[]> {
-  const candidates = guiHostCandidates(environment);
-  const detected: GuiHost[] = [];
-  for (const host of GUI_HOSTS) {
-    const paths = candidates[host];
-    for (const path of paths) {
-      try {
-        if (await pathExists(io, path)) {
-          detected.push(host);
-          break;
-        }
-      } catch {
-        // One inaccessible candidate must not hide another host or break init.
-      }
-    }
-  }
-  return detected;
+  const detections = await detectHosts(environment, io, {
+    resolve: () => Promise.resolve(null),
+  });
+  return detections
+    .filter(
+      (entry): entry is HostDetection & { readonly host: GuiHost } =>
+        entry.present && (GUI_HOSTS as readonly string[]).includes(entry.host),
+    )
+    .map((entry) => entry.host);
 }
 
 async function pathExists(io: ConfigIo, path: string): Promise<boolean> {
-  if (io.exists !== undefined) {
-    return io.exists(path);
-  }
   try {
+    if (io.exists !== undefined) {
+      return (await io.exists(path)) === true;
+    }
     await io.readFile(path);
     return true;
-  } catch (error) {
-    return !(
-      error instanceof Error &&
-      (error as { readonly code?: unknown }).code === "ENOENT"
-    );
+  } catch {
+    // Missing, inaccessible, and every other failure are not positive evidence.
+    return false;
   }
+}
+
+function createExecutableLookup(
+  environment: ConfigEnvironment,
+): ExecutableLookup {
+  return {
+    async resolve(command) {
+      const path = environment.PATH ?? "";
+      for (const directory of path.split(delimiter)) {
+        // PATH entries are POSIX path bytes. Spaces are legal and meaningful.
+        if (directory.length === 0) {
+          continue;
+        }
+        const candidate = resolve(join(directory, command));
+        try {
+          const metadata = await stat(candidate);
+          if (!metadata.isFile()) {
+            continue;
+          }
+          await access(candidate, constants.X_OK);
+          return candidate;
+        } catch {
+          // An unusable candidate does not hide a later PATH entry.
+        }
+      }
+      return null;
+    },
+  };
+}
+
+function hostCommand(host: Host): string | null {
+  if (host === "claude-code") {
+    return "claude";
+  }
+  if (host === "codex" || host === "opencode") {
+    return host;
+  }
+  return null;
+}
+
+function hostDirectoryCandidates(
+  environment: ConfigEnvironment,
+): Readonly<Record<Host, readonly string[]>> {
+  const home = environment.HOME ?? "";
+  const fromEnvironment = (name: string, ...parts: string[]): string[] => {
+    const root = environment[name] ?? "";
+    return root.length === 0 ? [] : [resolve(root, ...parts)];
+  };
+  const fromHome = (...parts: string[]): string[] =>
+    home.length === 0 ? [] : [resolve(home, ...parts)];
+
+  return {
+    "claude-code": [
+      ...fromEnvironment("CLAUDE_CONFIG_DIR"),
+      ...fromHome(".claude"),
+    ],
+    codex: [...fromEnvironment("CODEX_HOME"), ...fromHome(".codex")],
+    opencode: [
+      ...fromEnvironment("XDG_CONFIG_HOME", "opencode"),
+      ...fromHome(".config", "opencode"),
+    ],
+    // ~/.agents/skills is deliberately absent: Codex and opencode both read
+    // it, and brigadier itself creates it when installing either host.
+    ...guiHostCandidates(environment),
+  };
 }
 
 function guiHostCandidates(
   environment: ConfigEnvironment,
 ): Readonly<Record<GuiHost, readonly string[]>> {
-  const home = environment.HOME?.trim() ?? "";
-  const appData = environment.APPDATA?.trim() ?? "";
-  const localAppData = environment.LOCALAPPDATA?.trim() ?? "";
+  const home = environment.HOME ?? "";
+  const appData = environment.APPDATA ?? "";
+  const localAppData = environment.LOCALAPPDATA ?? "";
   const fromHome = (...parts: string[]): string[] =>
-    home.length === 0 ? [] : [join(home, ...parts)];
+    home.length === 0 ? [] : [resolve(home, ...parts)];
   const fromAppData = (root: string, ...parts: string[]): string[] =>
-    root.length === 0 ? [] : [join(root, ...parts)];
+    root.length === 0 ? [] : [resolve(root, ...parts)];
 
   return {
     cursor: [
