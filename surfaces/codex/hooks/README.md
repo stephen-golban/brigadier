@@ -49,6 +49,13 @@ The installer copies the script to the absolute form of
 }
 ```
 
+`PreCompact` is the only event brigadier registers here, and that is deliberate.
+Claude Code also gets a `UserPromptSubmit` nudge; Codex does not, because Codex
+binds approval to the registration — event, matcher, and command together — so
+adding a second event would disarm the already-approved handoff until the user
+approved the new registration. A nudge is not worth silently switching off the
+handoff.
+
 `PreCompact` is the Codex event fired before compaction. The command path is
 absolute and shell-quoted. `# brigadier-managed-hook` is the stable ownership
 marker, but an entry is brigadier-owned only when it has no keys other than a

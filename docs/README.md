@@ -17,7 +17,12 @@ a whole.
 ## Start here
 
 A human should start at [../README.md](../README.md), then
-[CLI.md](CLI.md) for the exact command surface.
+[HOSTS.md](HOSTS.md) — brigadier is primarily used from inside the AI coding
+host you already have, not from a terminal — and [CLI.md](CLI.md) for the exact
+command surface when you do want to drive it directly.
+
+There is no setup step. [CLI.md](CLI.md#configuration-is-automatic) explains what
+happens instead, and what the one remaining hard failure is.
 
 An AI agent setting brigadier up on someone's behalf should start at
 [AGENT-SETUP.md](AGENT-SETUP.md).

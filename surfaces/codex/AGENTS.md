@@ -1,9 +1,22 @@
 # You are not the worker
 
-This machine has `brigadier` installed. When a coding task decomposes into
-independent pieces, do not write them here. Plan them, hand them to
-`brigadier run`, and review what comes back. Your context is for coordination
-and judgement; a worker session is disposable and starts clean.
+This machine has `brigadier` installed, and you are the one who runs it. When a
+coding task decomposes into independent pieces, do not write them here. Plan
+them, invoke `brigadier run` yourself from inside this session, and review what
+comes back. Your context is for coordination and judgement; a worker session is
+disposable and starts clean.
+
+## If you are already a brigadier worker, stop here
+
+**A brigadier worker must never invoke brigadier.** If the prompt you were given
+is one slice of somebody else's plan — it names an `id`, the paths you own, and
+the evidence you owe — then you are the worker, and the work in front of you is
+the work you do. Spawning a second orchestrator from inside a slice spends the
+whole slice and lands nothing. This has happened. brigadier stamps
+`BRIGADIER_WORKER=1` into every worker's environment, which is enough to keep the
+nudge hook quiet inside a worker but does not stop you: nothing in the product
+refuses a second run, so this paragraph is what prevents it. This file is loaded
+into brigadier's own workers, so it is talking to you.
 
 1. **Decompose by file ownership.** Disjoint `ownedPaths` are necessary, but do
    not by themselves make slices independent. If one slice needs another's
@@ -45,14 +58,21 @@ and judgement; a worker session is disposable and starts clean.
 - Edit a file while a slice that owns it is running.
 - Do the work here because it "looks quick" — a one-file change is a one-slice
   plan.
-- Invent commands. brigadier has exactly four: `init`, `run`, `install`, and
-  `mcp`. `brigadier run "<task description>"` asks a model to decompose the task
+- Hand the user a command to type. You have a shell; run `brigadier` yourself.
+- Invent commands. brigadier has exactly four: `run`, `install`, `mcp`, and
+  `init`. `brigadier run "<task description>"` asks a model to decompose the task
   and sends the result through the same validator used for `--plan`. On genuine
   ambiguity it exits 4 with `status: "needs_human"` and structured questions; no
   worktree is created and no slice worker is spawned.
 
-`brigadier init` must have been run once on this machine; it writes
-`$BRIGADIER_HOME/config.json`, defaulting to `~/.brigadier/config.json`.
+There is no setup step. Configuration is automatic: `brigadier run` probes this
+machine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)
+when none is there, and carries on. Never run `brigadier init` to make a config
+appear; it is not a prerequisite. Its one real job belongs to a human: recording
+the explicit yes that lets brigadier register its MCP server into a GUI
+application's own configuration. If `brigadier install` reports a registration
+skipped for want of consent, pass that sentence to the user and let them run
+`brigadier init` once themselves.
 
 ## A note specific to Codex
 

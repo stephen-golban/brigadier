@@ -18,6 +18,7 @@ import {
   ClaudeWorker,
   CodexWorker,
 } from "../src/worker/index.ts";
+import { workerEnvironment } from "../src/worker/shared.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const fakeBin = resolve(repositoryRoot, "scripts/fakes");
@@ -606,6 +607,29 @@ test("Claude maxTurns succeeds at the limit and fails only over the limit", asyn
     ok: false,
     failure: { kind: "TURN_LIMIT" },
   });
+});
+
+test("every worker is stamped as a worker, at the spawner", () => {
+  // THE MECHANICAL HALF OF THE RE-ENTRY GUARD. A slice prompt is long,
+  // enumerated, and full of exactly the words the host-side nudge hook matches
+  // on, so without this marker that hook fires inside a worker and tells it to
+  // start a second orchestrator — which spends the whole slice and lands
+  // nothing. `surfaces/claude-code/hooks/nudge.mjs` reads it before it reads
+  // stdin, and `test/surfaces.test.ts` asserts the silence it produces.
+  //
+  // STAMPED HERE, NEVER INHERITED. It is written after the spec's environment is
+  // spread, so a spec cannot carry a different value in and a genuine top-level
+  // session cannot pick one up from an ancestor and silently disarm its nudge.
+  expect(workerEnvironment(claudeSpec("success"))).toMatchObject({
+    SHELL: "/bin/sh",
+    BRIGADIER_WORKER: "1",
+  });
+  expect(workerEnvironment(codexSpec("success"))).toMatchObject({
+    SHELL: "/bin/sh",
+    BRIGADIER_WORKER: "1",
+  });
+  const spec = claudeSpec("success", { BRIGADIER_WORKER: "not-a-worker" });
+  expect(workerEnvironment(spec).BRIGADIER_WORKER).toBe("1");
 });
 
 test("re-validates branded idle timeout values at the spawn boundary", async () => {

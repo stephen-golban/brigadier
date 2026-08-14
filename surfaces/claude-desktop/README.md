@@ -26,11 +26,23 @@ Desktop exposes no hook surface of any kind, and an MCP server is invoked by the
 model when the model chooses to invoke it — never by the transcript, and never at
 the moment the context fills. There is no workaround and none is offered.
 
-## Installing
+## Installing: the registration, or the bundle
 
-`brigadier install claude-desktop` stages this directory to
-`~/.brigadier/surfaces/claude-desktop/` and prints what to do next. It does not
-install anything into Desktop itself, because Desktop installs a bundle by an
+`brigadier install claude-desktop` does two things.
+
+It merges a `brigadier` entry into Desktop's own MCP configuration at
+`~/Library/Application Support/Claude/claude_desktop_config.json`, under the
+top-level `mcpServers` key documented at
+<https://modelcontextprotocol.io/docs/develop/connect-local-servers>. Every other
+server in that file is preserved byte-for-byte; only brigadier's own key is
+written. **This happens only if you consented once during `brigadier init`**, and
+only if Desktop's configuration directory already exists. Quit Desktop
+completely and relaunch it before the server appears. This is the path that
+needs no build step.
+
+It also stages this directory to `~/.brigadier/surfaces/claude-desktop/` and
+prints what to do next, for anyone who wants the packaged `.mcpb` extension
+instead. brigadier does not install that bundle: Desktop installs a bundle by an
 explicit user action and brigadier does not forge those.
 
 To produce the installable `.mcpb`:

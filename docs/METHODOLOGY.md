@@ -24,14 +24,14 @@ The implementation has two preceding eligibility stages and implements the
 last four stages more tightly together. Its actual procedure is:
 
 1. Build one pool, in configuration order, from every configured model
-   ([`src/routing/router.ts:201`](../src/routing/router.ts#L201) and
+   ([`src/routing/router.ts:203`](../src/routing/router.ts#L203) and
    [`src/routing/router.ts:396`](../src/routing/router.ts#L396)).
 2. Apply quota per model. An exhausted model leaves the pool; a warning or an
    unknown reading does not
    ([`src/routing/router.ts:220`](../src/routing/router.ts#L220) and
    [`src/routing/router.ts:249`](../src/routing/router.ts#L249)).
 3. Exclude an exact `(vendor, model)` pair that already failed this slice
-   ([`src/routing/router.ts:285`](../src/routing/router.ts#L285)). This is retry
+   ([`src/routing/router.ts:287`](../src/routing/router.ts#L287)). This is retry
    history, not a preference.
 4. Filter on required image input, web search, structured output, command
    execution, and minimum context window. A missing capability record passes
@@ -59,8 +59,8 @@ last four stages more tightly together. Its actual procedure is:
    and effort. Ranked candidates precede unranked candidates; within the ranked
    set the highest score wins, and configuration order breaks ties and orders
    unranked candidates
-   ([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and
-   [`src/routing/router.ts:657`](../src/routing/router.ts#L657)).
+   ([`src/routing/router.ts:345`](../src/routing/router.ts#L345) and
+   [`src/routing/router.ts:656`](../src/routing/router.ts#L656)).
 
 This differs from the five-stage summary in two checkable ways. Quota and retry
 exclusion run before capability. In the code, cost ordering is computed before
@@ -151,9 +151,9 @@ makes that coupling reviewable; it does not remove the maintenance hazard.
 
 Brigadier's effort ladder is exactly `medium | high | xhigh`, ordered from low
 to high in
-[`src/config/contracts.ts:46`](../src/config/contracts.ts#L46). The default
+[`src/config/contracts.ts:55`](../src/config/contracts.ts#L55). The default
 configured ceiling is `high`
-([`src/config/contracts.ts:57`](../src/config/contracts.ts#L57)). On an initial
+([`src/config/contracts.ts:66`](../src/config/contracts.ts#L66)). On an initial
 attempt, a `routine` slice starts at `medium`; `standard` and `hard` start at
 `high`. No initial difficulty predicts `xhigh`
 ([`src/routing/router.ts:1008`](../src/routing/router.ts#L1008)).
@@ -167,7 +167,7 @@ for those comparative claims is shipped with the router.
 After a worker actually runs and the attempt fails, the supervisor records that
 exact model as excluded and marks the next request `escalated`
 ([`src/supervisor/slice.ts:340`](../src/supervisor/slice.ts#L340) and
-[`src/supervisor/slice.ts:568`](../src/supervisor/slice.ts#L568)). Exclusion
+[`src/supervisor/slice.ts:578`](../src/supervisor/slice.ts#L578)). Exclusion
 forces routing to another eligible model; under the ascending table this is
 normally the next model up. It is exact identity-based history, so capability,
 quota, and the floor can make the actual next choice differ from a simple
@@ -191,8 +191,8 @@ itself unlock `xhigh`.
 ## Degraded routing
 
 `allowDegradedRouting` defaults to `false`
-([`src/config/contracts.ts:100`](../src/config/contracts.ts#L100) and
-[`src/init/propose.ts:175`](../src/init/propose.ts#L175)). Ordinary
+([`src/config/contracts.ts:111`](../src/config/contracts.ts#L111) and
+[`src/init/propose.ts:176`](../src/init/propose.ts#L176)). Ordinary
 routing admits only ranked models that establish the requested difficulty floor.
 
 With consent, the salvage pool contains both kinds of model that brigadier
@@ -218,8 +218,8 @@ does not claim an unranked model has a sub-floor score; it records that brigadie
 did not establish the requested floor. Ranked candidates precede all unranked
 candidates, ranked candidates are ordered by descending score, and ties or
 unranked-only choices preserve configuration order
-([`src/routing/router.ts:343`](../src/routing/router.ts#L343) and
-[`src/routing/router.ts:657`](../src/routing/router.ts#L657)).
+([`src/routing/router.ts:345`](../src/routing/router.ts#L345) and
+[`src/routing/router.ts:656`](../src/routing/router.ts#L656)).
 
 Consent waives only the floor. It cannot revive a quota-exhausted or excluded
 model, manufacture a missing capability, or create a supported effort.
@@ -238,7 +238,7 @@ a vendor is exhausted, that vendor has no candidate left. If only one tier is
 exhausted, healthy sibling tiers remain and compete normally. Therefore a
 healthy model always beats a drained one in the limited sense that the drained
 model is not a candidate at all; there is no fallback tie-break or substitution
-([`src/routing/router.ts:48`](../src/routing/router.ts#L48)).
+([`src/routing/router.ts:49`](../src/routing/router.ts#L49)).
 
 The vendors expose different quota shapes:
 
@@ -260,7 +260,7 @@ vendor-family words such as `claude`, `codex`, or `gpt` are refused
 reduce false matches; they do not make unreviewed wire data trustworthy. A
 genuine token belonging to an unrelated model can still match, and a true match
 can remove that model from routing
-([`src/quota/contracts.ts:150`](../src/quota/contracts.ts#L150)). If false
+([`src/quota/contracts.ts:158`](../src/quota/contracts.ts#L158)). If false
 matches remove the whole configured pool, the visible failure can be a spurious
 `ALL_VENDORS_EXHAUSTED` while capacity is actually healthy.
 

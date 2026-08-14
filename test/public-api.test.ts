@@ -33,6 +33,7 @@ const PUBLIC_API: readonly string[] = [
   "DIFFICULTY_FLOORS",
   "EFFORT_LADDER",
   "FAILURE_KINDS",
+  "GUI_HOSTS",
   "GitWorktreeEngine",
   "IDLE_TIMEOUT_BOUNDARY_MS",
   "LinkedSecretCommitError",
@@ -58,6 +59,8 @@ const PUBLIC_API: readonly string[] = [
   "createRunner",
   "createSliceRunner",
   "defaultEffortCeiling",
+  "detectGuiHosts",
+  "ensureConfig",
   "narrowEfforts",
   "normalizeClaudeRateLimitEvent",
   "normalizeCodexRateLimits",
@@ -87,7 +90,7 @@ test("root barrel exposes exactly the curated public surface", () => {
   const exports = Object.keys(packageApi).sort();
 
   expect(exports).toEqual([...PUBLIC_API]);
-  expect(exports).toHaveLength(65);
+  expect(exports).toHaveLength(68);
 });
 
 test("root barrel leaks neither internals nor CLI and discovery plumbing", () => {

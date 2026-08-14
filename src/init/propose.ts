@@ -172,6 +172,7 @@ export function proposeConfig(
     secretsConsent: existing?.secretsConsent ?? false,
     linkedSecretPaths:
       existing?.secretsConsent === true ? existing.linkedSecretPaths : [],
+    guiRegistrationConsent: existing?.guiRegistrationConsent ?? false,
     allowDegradedRouting: existing?.allowDegradedRouting ?? false,
   });
 
@@ -420,6 +421,13 @@ export function withSecretsConsent(
   consent: boolean,
 ): BrigadierConfig {
   return parseConfig({ ...config, secretsConsent: consent });
+}
+
+export function withGuiRegistrationConsent(
+  config: BrigadierConfig,
+  consent: boolean,
+): BrigadierConfig {
+  return parseConfig({ ...config, guiRegistrationConsent: consent });
 }
 
 export function withLinkedSecretPaths(

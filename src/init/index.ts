@@ -21,6 +21,8 @@ import type {
 } from "../config/index.js";
 import {
   ConfigValidationError,
+  detectGuiHosts,
+  ensureConfig,
   readConfig,
   resolveConfigPath,
   serializeConfig,
@@ -89,6 +91,7 @@ import {
   withDefaultModel,
   withDegradedRouting,
   withEffortCeiling,
+  withGuiRegistrationConsent,
   withLinkedSecretPaths,
   withSecretsConsent,
 } from "./propose.js";
@@ -202,7 +205,8 @@ export async function runInit(options: InitOptions): Promise<number> {
       reader: new LineReader(options.stdin),
       output: stdout,
     };
-    config = await confirmInteractively(io, proposal, config);
+    const guiHosts = await detectGuiHosts(options.env, options.io);
+    config = await confirmInteractively(io, proposal, config, guiHosts);
   } else if (!quiet) {
     stdout.write("\nAccepting every proposed default (--yes).\n");
   }
@@ -395,6 +399,7 @@ async function confirmInteractively(
   io: PromptIo,
   proposal: Proposal,
   initial: BrigadierConfig,
+  guiHosts: readonly import("../config/index.js").GuiHost[],
 ): Promise<BrigadierConfig> {
   let config = initial;
   for (const vendor of proposal.vendors) {
@@ -435,6 +440,15 @@ async function confirmInteractively(
     config.allowDegradedRouting,
   );
   config = withDegradedRouting(config, degraded);
+
+  if (guiHosts.length > 0) {
+    const guiConsent = await confirmPrompt(
+      io,
+      `Register brigadier's MCP server with detected GUI hosts (${guiHosts.join(", ")})?`,
+      config.guiRegistrationConsent === true,
+    );
+    config = withGuiRegistrationConsent(config, guiConsent);
+  }
 
   // Default No on a fresh config. On a re-run the current value is
   // the default, so an existing yes is not silently discarded by pressing enter.
@@ -696,7 +710,8 @@ Options:
 
 Exit codes:
   0  the command succeeded
-  1  brigadier could not start the run: no config, an unreadable or invalid
+  1  brigadier could not start the run: no installed worker CLI, no resolvable
+     config home (neither BRIGADIER_HOME nor HOME), an unreadable or invalid
      plan file, an environment with no HOME, PATH, or USER, or a planner that
      could not produce a plan
   2  usage error
@@ -743,6 +758,9 @@ export async function runCli(options: CliOptions): Promise<number> {
       stderr,
       ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
       ...(options.io === undefined ? {} : { io: options.io }),
+      ...(options.discoverer === undefined
+        ? {}
+        : { discoverer: options.discoverer }),
       ...(options.harness === undefined ? {} : { harness: options.harness }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.onCancellable === undefined
@@ -866,10 +884,14 @@ async function loadDiscoverer(): Promise<Discoverer> {
  * THE EXIT CODES, which are an interface a CI step branches on:
  *
  *   0  the run succeeded.
- *   1  brigadier could not start the run at all — no config, an unreadable or
- *      malformed plan file, or an environment missing any of HOME, PATH, or
- *      USER, all three of which `requireLaunchEnv` demands. Nothing was
- *      created, and the fix is outside the plan.
+ *   1  brigadier could not start the run at all — no installed worker CLI to
+ *      route to, no resolvable config home (neither `$BRIGADIER_HOME` nor
+ *      `$HOME`), an unreadable or malformed plan file, an environment missing
+ *      any of HOME, PATH, or USER, all three of which `requireLaunchEnv`
+ *      demands, or a planner that could not produce a plan. A config that is
+ *      missing, wrong-version or unparseable is NOT among these: lazy config
+ *      handles each and the run proceeds. Nothing was created, and the fix is
+ *      outside the plan.
  *   2  usage error: an unknown option, a missing `--plan`, a bad `--slug` or
  *      `--max-workers`, or a bare positional argument.
  *   3  the run started and did not succeed. This is a report, not a crash: the
@@ -991,6 +1013,7 @@ interface RunOptions {
   /** Required only for `--plan -`. */
   readonly stdin?: InputStream;
   readonly io?: ConfigIo;
+  readonly discoverer?: Discoverer;
   readonly harness?: RunHarness;
   /** See `CliOptions.signal`. */
   readonly signal?: AbortSignal;
@@ -1504,44 +1527,24 @@ type LoadedConfig =
   | { readonly ok: true; readonly config: BrigadierConfig }
   | { readonly ok: false; readonly message: string };
 
-/**
- * Reads the machine's config, or explains what to do about not having one.
- *
- * Both failures point at `brigadier init`, and they are worded apart on
- * purpose: "there is no config" and "the config you have cannot be trusted" ask
- * the same command of the user for different reasons, and a user who has run
- * `init` before needs to know which one they are looking at.
- */
+/** Ensures the machine has a usable config without reading stdin. */
 async function loadRunConfig(options: RunOptions): Promise<LoadedConfig> {
-  let configPath: string;
   try {
-    configPath = resolveConfigPath(options.env);
+    const ensured = await ensureConfig({
+      environment: options.env,
+      stderr: options.stderr,
+      ...(options.io === undefined ? {} : { io: options.io }),
+      ...(options.discoverer === undefined
+        ? {}
+        : { discoverer: options.discoverer }),
+    });
+    return { ok: true, config: ensured.config };
   } catch (error) {
     return {
       ok: false,
       message: `brigadier run: ${describe(error)}`,
     };
   }
-
-  let config: BrigadierConfig | null;
-  try {
-    config =
-      options.io === undefined
-        ? await readConfig(configPath)
-        : await readConfig(configPath, options.io);
-  } catch (error) {
-    return {
-      ok: false,
-      message: `brigadier run: the config at ${configPath} cannot be used: ${describe(error)}. Re-run \`brigadier init\` to rebuild it.`,
-    };
-  }
-  if (config === null) {
-    return {
-      ok: false,
-      message: `brigadier run: no brigadier config was found at ${configPath}. Run \`brigadier init\` to scan this machine for worker CLIs and write one.`,
-    };
-  }
-  return { ok: true, config };
 }
 
 type PlanSource =
@@ -2011,6 +2014,7 @@ export {
   withDefaultModel,
   withDegradedRouting,
   withEffortCeiling,
+  withGuiRegistrationConsent,
   withLinkedSecretPaths,
   withSecretsConsent,
 } from "./propose.js";

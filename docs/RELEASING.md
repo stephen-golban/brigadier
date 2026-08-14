@@ -9,7 +9,11 @@ records what remained unproven when the `0.1.1` release began.
 A release ships five npm packages and four archives:
 
 - `@stephen-golban/brigadier` — the JavaScript launchers, the typed `dist/`
-  build, and the MCP server bundle.
+  build, the MCP server bundle, and `scripts/postinstall.mjs`. That script is
+  named by the `postinstall` lifecycle hook, so `files` must keep carrying it: a
+  `postinstall` naming a file the tarball does not contain breaks every published
+  install. `test/packaging.test.ts` derives that assertion from a real
+  `npm pack` rather than from a transcribed list.
 - `@stephen-golban/brigadier-{darwin,linux}-{arm64,x64}` — one native executable
   each, installed as an `optionalDependency` of the root package so `npm i`
   fetches only the binary for the current machine.

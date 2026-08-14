@@ -12,6 +12,17 @@
  * task description into a plan, but MCP clients submit plan documents to these
  * three tools; task-to-plan is not part of this MCP contract.
  *
+ * THESE DESCRIPTIONS ARE THE DOCTRINE, NOT DECORATION. Cursor, Windsurf,
+ * Antigravity, and Claude Desktop read no skill directory, so MCP is the only
+ * door brigadier has into those hosts and this metadata is the only thing their
+ * model ever reads about it. Since nothing here turns a task into a plan, the
+ * host agent has to build one itself — which means the description has to say
+ * WHEN to delegate, that the work goes here rather than inline, enough of the
+ * plan shape to construct a valid document, and that a brigadier worker must
+ * never call back into brigadier. Keep them tight; this is host-visible
+ * metadata, and `surfaces/claude-desktop/manifest.json` declares the same three
+ * strings, with `test/surfaces.test.ts` failing the build if they disagree.
+ *
  * The two impure tools reach the outside world through injected functions, so
  * every assertion in `test/mcp.test.ts` about framing, dispatch, and the two
  * pure tools runs against the real implementation, and only the part that would
@@ -35,6 +46,8 @@ import type { ToolDefinition, ToolResult } from "./protocol.js";
 export interface LoadedConfig {
   readonly path: string;
   readonly config: BrigadierConfig | null;
+  /** Present when a real config lookup failed for a specific reason. */
+  readonly reason?: string;
 }
 
 /** Everything `brigadier_run` needs, already parsed and defaulted. */
@@ -113,7 +126,7 @@ export function createTools(
     {
       name: "brigadier_validate_plan",
       description:
-        "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing.",
+        "Check a brigadier plan document for shape defects and scheduling defects, and report the dependency waves it would run in. Touches nothing. Draft a plan against this before brigadier_run: it names every defect at once, including two slices that claim the same path.",
       inputSchema: {
         type: "object",
         properties: { plan: PLAN_SCHEMA },
@@ -124,7 +137,7 @@ export function createTools(
     {
       name: "brigadier_route_plan",
       description:
-        "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker.",
+        "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker. Worth a call before brigadier_run, because a slice no model can take is worth knowing about before a worker is spent on its siblings.",
       inputSchema: {
         type: "object",
         properties: { plan: PLAN_SCHEMA },
@@ -135,7 +148,7 @@ export function createTools(
     {
       name: "brigadier_run",
       description:
-        "Run a brigadier plan on a local repository: route every slice, spawn a worker for each, commit what it produced, and merge the lot.",
+        "Hand multi-part coding work to brigadier instead of doing it inline: it routes every slice, gives each its own git worktree and worker, commits what each produced, and merges the lot. Reach for this whenever the work has more than one independent piece — a feature, a cross-file refactor, a migration, a bug with several call sites, a batch of mechanical edits — and route that work here rather than editing the files yourself. Build the plan as the plan argument documents: one slice per independent piece, exclusive ownedPaths (no two slices may claim the same path, or a directory containing another's), and dependsOn naming any slice whose committed output another slice needs. There is no setup step: brigadier configures itself on first use, so never tell the user to run brigadier init — the one exception is registering brigadier with a GUI host, which needs a consent only an interactive brigadier init, run by the user, can record. Never call this if you are yourself a brigadier worker running one slice: re-entry spends the whole slice and lands nothing.",
       inputSchema: {
         type: "object",
         properties: {
@@ -224,7 +237,9 @@ async function routeTool(
   const loaded = await dependencies.loadConfig();
   if (loaded.config === null) {
     return {
-      text: `no brigadier config was found at ${loaded.path}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one.`,
+      text:
+        loaded.reason ??
+        `brigadier configuration is unavailable at ${loaded.path}.`,
       isError: true,
     };
   }

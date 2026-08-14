@@ -26,8 +26,10 @@
  */
 
 import packageJson from "../../package.json";
+import { type EnsureConfigResult, ensureConfig } from "../config/index.js";
 import type { ConfigEnvironment } from "../config/store.js";
-import { readConfig, resolveConfigPath } from "../config/store.js";
+import { resolveConfigPath } from "../config/store.js";
+import type { Discoverer } from "../discovery/contracts.js";
 import { buildRunDependencies } from "../init/index.js";
 import type { InputStream, OutputStream } from "../init/prompt.js";
 // Imported from the module rather than the barrel for the same reason
@@ -65,6 +67,12 @@ export interface McpRunControl {
   readonly onCancellable?: () => void;
 }
 
+interface RealDependenciesControl extends Pick<McpRunControl, "signal"> {
+  readonly stderr?: OutputStream;
+  /** Test seam for deterministic lazy-config discovery. */
+  readonly discoverer?: Discoverer;
+}
+
 /**
  * The entry point `bin/brigadier-mcp.js` calls. Wires the real process streams,
  * the real config store, and the real supervisor.
@@ -80,7 +88,11 @@ export async function runMcpServer(
     stdout: process.stdout,
     stderr: process.stderr,
     version: packageJson.version,
-    dependencies: createRealDependencies(process.env, control),
+    dependencies: createRealDependencies(process.env, {
+      // STDOUT is JSON-RPC only. Lazy-config diagnostics belong on stderr.
+      stderr: process.stderr,
+      ...(control.signal === undefined ? {} : { signal: control.signal }),
+    }),
     ...control,
   });
 }
@@ -140,22 +152,45 @@ export async function serveMcp(options: McpServerOptions): Promise<number> {
  */
 export function createRealDependencies(
   env: ConfigEnvironment,
-  control: Pick<McpRunControl, "signal"> = {},
+  control: RealDependenciesControl = {},
 ): ToolDependencies {
+  const stderr = control.stderr ?? process.stderr;
   return {
     async loadConfig(): Promise<LoadedConfig> {
-      const path = resolveConfigPath(env);
-      return { path, config: await readConfig(path) };
+      try {
+        const ensured = await ensureConfig({
+          environment: env,
+          stderr,
+          ...(control.discoverer === undefined
+            ? {}
+            : { discoverer: control.discoverer }),
+        });
+        return { path: ensured.path, config: ensured.config };
+      } catch (error) {
+        return {
+          path: resolveConfigPath(env),
+          config: null,
+          reason: describeError(error),
+        };
+      }
     },
     async execute(request: McpRunRequest) {
-      const path = resolveConfigPath(env);
-      const config = await readConfig(path);
-      if (config === null) {
+      let ensured: EnsureConfigResult;
+      try {
+        ensured = await ensureConfig({
+          environment: env,
+          stderr,
+          ...(control.discoverer === undefined
+            ? {}
+            : { discoverer: control.discoverer }),
+        });
+      } catch (error) {
         return {
-          text: `no brigadier config was found at ${path}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one.`,
+          text: describeError(error),
           isError: true,
         };
       }
+      const config = ensured.config;
       const launchEnv = requireLaunchEnv(env);
       const log: string[] = [];
       const dependencies = buildRunDependencies({
@@ -199,6 +234,10 @@ export function createRealDependencies(
       }
     },
   };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export type { ToolDefinition, ToolResult } from "./protocol.js";

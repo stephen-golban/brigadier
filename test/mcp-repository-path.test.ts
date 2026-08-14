@@ -50,6 +50,8 @@ const MAX_STREAM_CHUNKS = 128;
 
 /** Leak guard only: a child that writes NOTHING must not outlive the test. */
 const KILL_AFTER_MS = 30_000;
+const NO_WORKER_CLI_MESSAGE =
+  "no installed worker CLI reported a selectable model. Install Claude Code or Codex, then try again.";
 
 interface Session {
   readonly stdout: string;
@@ -112,7 +114,7 @@ async function drive(
   env: Record<string, string>,
 ): Promise<Session> {
   const proc = Bun.spawn({
-    cmd: ["bun", entry, "mcp"],
+    cmd: [process.execPath, entry, "mcp"],
     cwd,
     env,
     stdin: "pipe",
@@ -219,8 +221,6 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
   // The server is launched somewhere that is NOT this repository, which is what
   // a relative path would otherwise resolve against.
   const launchDirectory = await mkdtemp(join(tmpdir(), "brigadier-mcp-cwd-"));
-  const scratchConfig = join(scratchHome, "config.json");
-
   try {
     const session = await drive(
       [
@@ -236,7 +236,7 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
       ],
       launchDirectory,
       {
-        PATH: process.env.PATH ?? "",
+        PATH: "",
         HOME: scratchHome,
         BRIGADIER_HOME: scratchHome,
         USER: "brigadier-test",
@@ -257,12 +257,10 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
       '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
     );
 
-    // ABSOLUTE: accepted by the validator, and it got all the way to the real
-    // execute, which refuses only because $BRIGADIER_HOME is empty. That the
-    // path named here is the SCRATCH one is also the proof that the owner's
-    // ~/.brigadier was never consulted.
+    // ABSOLUTE: accepted by the validator, then the real lazy-config path
+    // reports the actual fatal reason: PATH intentionally names no worker CLI.
     expect(lines[1]).toBe(
-      `{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"no brigadier config was found at ${scratchConfig}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one."}],"isError":true}}`,
+      `{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"${NO_WORKER_CLI_MESSAGE}"}],"isError":true}}`,
     );
 
     // RELATIVE: refused, with the reason and the offending value quoted back.
@@ -276,15 +274,15 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
       '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"repositoryPath must be an absolute path, because this server\'s working directory is not the client\'s, so a relative path would resolve against whatever directory the server happened to be launched in and could silently target the wrong repository. Received \\"~/code/repo\\". A leading ~ is not expanded here, because no shell is involved; spell the home directory out in full."}],"isError":true}}',
     );
 
-    // TRAILING SLASH: still absolute, still accepted.
+    // TRAILING SLASH: still absolute, still reaches the same fatal discovery.
     expect(lines[4]).toBe(
-      `{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"no brigadier config was found at ${scratchConfig}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one."}],"isError":true}}`,
+      `{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"${NO_WORKER_CLI_MESSAGE}"}],"isError":true}}`,
     );
 
-    // INTERIOR `..`: still absolute, still accepted. Normalising it is the
-    // worktree engine's job, not this validator's.
+    // INTERIOR `..`: still absolute and reaches the same discovery. Normalising
+    // it is the worktree engine's job, not this validator's.
     expect(lines[5]).toBe(
-      `{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"no brigadier config was found at ${scratchConfig}. Run \`brigadier init\` on this machine to scan for worker CLIs and write one."}],"isError":true}}`,
+      `{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"${NO_WORKER_CLI_MESSAGE}"}],"isError":true}}`,
     );
 
     // EXPLICITLY RELATIVE: `./` is refused exactly like a bare relative path.

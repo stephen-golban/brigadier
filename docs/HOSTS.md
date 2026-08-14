@@ -1,9 +1,13 @@
 # Host surfaces
 
 brigadier is one engine. `brigadier install <host>` writes a small doctrine
-artifact into a host's configuration slot, or stages Desktop's MCP bundle for
-manual installation, so the host hands work *to* brigadier instead of doing it
-itself. The doctrine's whole message is *you are not the worker*.
+artifact into a host's configuration slot — or, for a host that reads no skill
+directory, merges an MCP registration into the host's own configuration — so the
+host hands work *to* brigadier instead of doing it itself. The doctrine's whole
+message is *you are not the worker*.
+
+This is the primary way brigadier is meant to be used. You keep working in the
+host you already use; brigadier engages from inside that session.
 
 It is not a package manager, it installs no plugin runtime, and it depends on
 none. The shipped product spawns `claude` and `codex` as plain subprocesses.
@@ -15,15 +19,37 @@ brigadier install --all
 brigadier install --all --dry-run
 ```
 
+Seven hosts, in two kinds. `claude-code` and `codex` read a skill directory, so
+brigadier writes the doctrine into it. `cursor`, `windsurf`, `antigravity` and
+`claude-desktop` read none, so the only door is MCP and brigadier merges one key
+into the host's own configuration — which it will not do without [an explicit
+yes](#registration-into-a-gui-host-needs-an-explicit-yes).
+
+`opencode` sits across that line and is the one host whose name on the command
+line is not how it gets its doctrine. It reads `~/.claude/skills` and
+`~/.agents/skills` natively, so the doctrine reaches it through `brigadier
+install claude-code` or `brigadier install codex`; `brigadier install opencode`
+writes neither a skill nor an MCP registration, only [the compaction-handoff
+plugin](#opencode) that a skill cannot be. Installing `opencode` alone leaves the
+host with a hook and no doctrine.
+
 | Option | Effect |
 | --- | --- |
 | `--all` | install every host |
 | `--dry-run` | report what would be written and write nothing |
-| `--force` | replace a regular file brigadier did not write, or that was edited after it did |
+| `--force` | replace a regular file brigadier did not write, or that was edited after it did. It does **not** grant registration consent |
 | `-h`, `--help` | print usage |
 
-Exit codes: `0` every file is in place, `1` at least one file was refused or
-could not be written, `2` usage error.
+Exit codes: `0` nothing was refused and nothing failed to be written, `1` at
+least one file was refused or could not be written, `2` usage error.
+
+**`0` does not mean every file is in place.** A registration skipped for want of
+consent, or for a host that is not installed, is a **skip** rather than a
+refusal, and a skip does not move the exit code — so `brigadier install --all` on
+a machine that has recorded no consent skips all four GUI registrations and still
+exits `0`. Every skip is named on its own line in the output and counted in the
+closing `… written, … unchanged, … skipped, … refused.` summary. **Automation
+must read that report, not the exit code alone.**
 
 ## Idempotent, and it never silently overwrites your edits
 
@@ -44,13 +70,17 @@ brigadier last wrote to each path:
 
 Running `brigadier install` twice does nothing the second time.
 
-The manifest governs the files brigadier writes whole. `$CODEX_HOME/hooks.json`
-is the one file it shares with other tools, so it is merged instead, and its
-protection is different: brigadier only ever touches the one entry carrying its
-own `# brigadier-managed-hook` marker, leaves everything else in the file
-untouched, and refuses the whole write if the JSON does not parse. It is not
-recorded in the manifest, and `--force` has no bearing on it — if you edit
-brigadier's own marked entry, the next install replaces it.
+The manifest governs the files brigadier writes **whole**. Files it shares with
+other tools are merged instead, and their protection is different: brigadier
+touches only its own entry, leaves every other byte alone, refuses the whole
+write if the JSON does not parse, records nothing in the manifest, and gives
+`--force` no bearing on the outcome — if you edit brigadier's own entry, the next
+install replaces it.
+
+There are two kinds of such file. `$CODEX_HOME/hooks.json`, where brigadier's
+entry is the one carrying a `# brigadier-managed-hook` marker in its command
+string; and each of the four GUI hosts' MCP configurations, where it is the
+`brigadier` key under `mcpServers`.
 
 A destination symlink is always refused, even with `--force`. The installer
 resolves the install root, refuses writes that escape it, and opens destination
@@ -60,9 +90,9 @@ files with `O_NOFOLLOW` so a symlink swap cannot redirect the write.
 
 Roots come from the environment: `$CLAUDE_CONFIG_DIR` (else `$HOME/.claude`),
 `$CODEX_HOME` (else `$HOME/.codex`), `$XDG_CONFIG_HOME` (else
-`$HOME/.config`), and `$BRIGADIER_HOME` (else `$HOME/.brigadier`). With `$HOME`
-unset and not every override supplied, the command refuses rather than guessing
-a home directory.
+`$HOME/.config`), and `$BRIGADIER_HOME` (else `$HOME/.brigadier`). The four GUI
+hosts are anchored under `$HOME` directly. With `$HOME` unset and not every
+override supplied, the command refuses rather than guessing a home directory.
 
 ### `claude-code`
 
@@ -72,12 +102,17 @@ a home directory.
 | plugin marker | `~/.claude/skills/brigadier/.claude-plugin/plugin.json` |
 | hook registration | `~/.claude/skills/brigadier/hooks/hooks.json` |
 | handoff hook | `~/.claude/skills/brigadier/hooks/handoff.mjs` |
+| nudge hook | `~/.claude/skills/brigadier/hooks/nudge.mjs` |
 | hook notes | `~/.claude/skills/brigadier/hooks/README.md` |
 
 The skill auto-loads as the plugin `brigadier@skills-dir` in your next Claude
 Code session, because of the `.claude-plugin/plugin.json` beside it. No
-marketplace, and no consent dialog. The handoff hook is registered against
-`PreCompact` and needs no approval on this host.
+marketplace, and no consent dialog. Both hooks are registered in that one
+`hooks.json` — `handoff.mjs` against `PreCompact` with a `"*"` matcher, and
+`nudge.mjs` against `UserPromptSubmit`, which takes no matcher on this host so
+the registration carries none. **Neither needs approval on this host.** The
+command strings use `${CLAUDE_PLUGIN_ROOT}`, which Claude Code expands to the
+installed skill directory, so the registrations survive being installed anywhere.
 
 ### `codex`
 
@@ -152,24 +187,110 @@ and what each one means live next to the plugin, in
 there is one place to read them rather than two that can disagree. If the hook
 never fires on your build, that array is still the one line to change.
 
-### `claude-desktop`
+## The hosts that read no skill directory
 
-`brigadier install claude-desktop` **installs nothing into Desktop.** Desktop
-installs a bundle by an explicit user action, and brigadier does not forge those.
-It stages the bundle at `~/.brigadier/surfaces/claude-desktop/` and prints what
-to do next.
+Cursor, Windsurf, Antigravity and Claude Desktop read none of the skill
+directories above. MCP is the only door brigadier has into them, so what
+`brigadier install <host>` does for these four is merge a single `brigadier` key
+into the host's own `mcpServers` object. **Every other byte of that file is
+preserved** — the merge splices brigadier's own range into the existing text
+rather than reserializing the document, so your formatting, key order and
+comment-free whitespace survive. A file whose JSON does not parse, or whose top
+level or `mcpServers` value is not an object, is **refused** with nothing
+written and the reason named.
+
+| Host | File | Entry written under `mcpServers.brigadier` |
+| --- | --- | --- |
+| `cursor` | `~/.cursor/mcp.json` | `{"type":"stdio","command":<command>,"args":["mcp"]}` |
+| `windsurf` | `~/.codeium/windsurf/mcp_config.json` | `{"command":<command>,"args":["mcp"]}` |
+| `antigravity` | `~/.gemini/config/mcp_config.json` | `{"command":<command>,"args":["mcp"]}` |
+| `claude-desktop` | `~/Library/Application Support/Claude/claude_desktop_config.json` | `{"command":<command>,"args":["mcp"]}` |
+
+Each path and entry shape was read from that host's own documentation rather
+than inferred from a sibling, and `brigadier install` **prints the citation it
+used** so you can audit the path instead of trusting it:
+[Cursor](https://cursor.com/docs/context/mcp),
+[Windsurf](https://docs.devin.ai/desktop/cascade/mcp),
+[Antigravity](https://antigravity.google/docs/mcp),
+[Claude Desktop](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
+
+Two of those deserve a note. **Cursor alone gets `"type": "stdio"`**, because
+Cursor alone documents that field as required for stdio servers while its own
+examples omit it; writing it satisfies the table and contradicts nothing in the
+examples. And **Antigravity's widely-cited path is wrong** — third-party guides
+name `~/.gemini/antigravity/mcp_config.json`, but Antigravity's own
+documentation puts only `mcp_oauth_tokens.json` there.
+
+Windsurf's path is correct for Cascade today and is a shrinking surface:
+Cognition folded Windsurf into Devin, and its documentation now describes Cascade
+as the legacy agent while the Devin Local agent configures MCP through the Devin
+CLI instead. Windsurf documents no project-scoped MCP file, so this global one is
+the only option.
+
+**There is no hook surface on any of these four.** Nothing watches the
+transcript; the server is invoked only when the model chooses to invoke it. The
+tool descriptions are therefore the entire doctrine those hosts will ever see,
+which is why they carry when to delegate, that the work goes to brigadier rather
+than inline, the plan shape, and the rule that a worker must never call back in.
+
+### Registration into a GUI host needs an explicit yes
+
+Every one of the four registrations is gated on `guiRegistrationConsent === true`
+in your own brigadier config. **No consent, no byte.** Every other answer — a
+missing config, an unparseable one, an unreadable one, and an explicit `false` —
+counts as no.
+
+That consent is recorded in exactly one place: the question *"Register
+brigadier's MCP server with detected GUI hosts"*, asked once during an
+**interactive** `brigadier init`, and only when at least one GUI host was
+detected. Nothing else grants it. Not `brigadier init --yes`, not
+`--print-config`, not the `postinstall` probe, not the lazy config that
+`brigadier run` writes, and not `brigadier install --force`. This is the one
+thing `brigadier init` is still genuinely for; the doctrine brigadier installs
+into every host says the same, and tells an agent to hand the sentence to the
+user rather than run `init` on their behalf.
+
+A skipped registration says which of the two gates stopped it. The second gate is
+a host whose configuration directory does not exist, which is skipped rather than
+conjured — creating `~/.cursor/` on a machine with no Cursor leaves a stranger's
+directory holding a file nothing will ever read.
+
+### `BRIGADIER_MCP_COMMAND`
+
+The registration has to name a command for the host to spawn, and **a
+Finder-launched application does not inherit a login shell's `PATH`**. When
+brigadier is running as its own compiled binary, `process.execPath` is an honest
+absolute path and that is what gets written. Running from source under `bun`, or
+as `node dist/cli.js`, there is no honest absolute path to offer, so the bare
+name `brigadier` is written — and `install` prints a warning saying so, because
+the failure mode is silent: the host cannot find the command, the server never
+starts, nothing reports it, and the user blames their editor.
+
+Set `BRIGADIER_MCP_COMMAND` to an absolute path and run `install` again to write
+that instead. It overrides both defaults.
+
+### `claude-desktop` also stages an `.mcpb` bundle
+
+Desktop is the one GUI host with a second, older route. Alongside the MCP
+registration above, `brigadier install claude-desktop` stages a bundle — and
+**installs nothing into Desktop itself**, because Desktop installs a bundle by an
+explicit user action and brigadier does not forge those.
 
 | File | Path |
 | --- | --- |
 | bundle manifest | `~/.brigadier/surfaces/claude-desktop/manifest.json` |
 | instructions | `~/.brigadier/surfaces/claude-desktop/README.md` |
 
-To finish, from a source checkout: run `bun run build:mcp`, copy
-`dist/mcp/server.js` to `server/brigadier-mcp.js` inside the staged directory —
-the path the manifest's `entry_point` names — zip that directory with
-`manifest.json` at the archive root, rename it `brigadier.mcpb`, and open it with
-Desktop. The build leaves no generated JavaScript under `src/`. See
-[RELEASING.md](RELEASING.md).
+The registration is the path that needs no build step; the bundle is there for
+anyone who wants the packaged extension instead. To finish it, from a source
+checkout: run `bun run build:mcp`, copy `dist/mcp/server.js` to
+`server/brigadier-mcp.js` inside the staged directory — the path the manifest's
+`entry_point` names — zip that directory with `manifest.json` at the archive
+root, rename it `brigadier.mcpb`, and open it with Desktop. The build leaves no
+generated JavaScript under `src/`. See [RELEASING.md](RELEASING.md).
+
+**Quit Desktop completely and relaunch it** before a registered server appears;
+it reads `claude_desktop_config.json` only at startup.
 
 Desktop gets an MCP server rather than a skill because Desktop **Skills execute
 server-side** and cannot invoke a local binary, while Desktop **MCP servers run
@@ -178,6 +299,107 @@ the entire reason brigadier ships an MCP server at all.
 
 The server is zero-dependency: it speaks JSON-RPC 2.0 over stdio against the MCP
 spec directly, with no SDK. There is nothing to install inside the bundle.
+
+## The doctrine
+
+Three things are what brigadier installs into a host, and they are worth stating
+here because they changed:
+
+1. **You are not the worker.** The host agent plans the slices and invokes
+   `brigadier run` itself, from inside its own session, then reviews what comes
+   back. It does not hand the user a command to type.
+2. **There is no setup step.** Configuration is automatic; `brigadier init` is
+   never to be run to make a config appear. The single carve-out is recording GUI
+   registration consent, which belongs to a human — an agent passes the sentence
+   on rather than running the command.
+3. **A brigadier worker must never invoke brigadier.** Re-entry spends the whole
+   slice and lands nothing. This has actually happened, which is why it is
+   guarded twice: by this prose, and by `BRIGADIER_WORKER=1`.
+
+Not every surface carries all three at the same length, because they are not the
+same kind of artifact:
+
+| Surface | Carries |
+| --- | --- |
+| each installed `SKILL.md`, and `$CODEX_HOME/AGENTS.md` | all three, at length, with the reasoning |
+| the `brigadier_run` MCP tool description | all three, compressed to a clause each. It is the only place a GUI host can ever learn any of them, so none may be left out |
+| the `brigadier_validate_plan` and `brigadier_route_plan` descriptions | neither delegation nor setup nor re-entry: they say what the tool does and that it is worth calling before `brigadier_run`. `brigadier_run` is where a model that is about to start work is standing |
+
+The three MCP strings are pinned byte-for-byte in `test/mcp.test.ts`, and
+`test/surfaces.test.ts` holds the staged `.mcpb` manifest to exactly the same
+bytes, so the two cannot drift apart.
+
+## The nudge hook
+
+**Claude Code only.** The skill's own description fires only when the host model
+happens to notice it, which is the wrong thing to depend on at the moment a
+multi-part task arrives. `nudge.mjs` runs on `UserPromptSubmit` instead — on the
+prompt itself — and, when it speaks at all, says one sentence: that this looks
+like more than one independent piece of work, that the skill should be loaded and
+the work written as a plan and run through `brigadier run`, and that a worker
+already running a slice should ignore it. The same sentence is returned twice, as
+`systemMessage` so you see it and as `additionalContext` so the model does.
+
+**Restraint is the design constraint, not coverage.** A hook that speaks every
+turn gets uninstalled within a day, and an uninstalled hook nudges nobody. So it
+is silent:
+
+- for **any question**, however it is formatted — a trailing `?`, a question mark
+  before the first sentence ends, or an opening interrogative word **whether or
+  not the prompt is punctuated at all**. A bug report that opens "why is this
+  failing?" and then lists three symptoms is three bullets about **one** thing,
+  so this refusal runs before the list is counted; and *"How do I refactor every
+  module across the codebase and migrate all the call sites"* is somebody asking
+  how to do the work, not assigning it, even though it carries every word the
+  matcher fires on;
+- for anything **under 120 characters**, because below that a prompt is a request
+  rather than a plan;
+- for material **inside fenced blocks**, terminated or not. A pasted config or
+  diff is something you are showing, not assigning, so every fence is stripped
+  before a bullet or a keyword is read;
+- **for the rest of the session once it has spoken** — at most one nudge per
+  session, ever;
+- when **`BRIGADIER_NUDGE=off`** is set, which silences it entirely;
+- when **`BRIGADIER_WORKER=1`** is set, checked before stdin is even read;
+- and on every unrecognised, unparseable, or unbounded input, because silence is
+  always a legal hook response.
+
+What is left fires on one of three shapes: three or more enumerated list items; a
+short list of two plus a breadth or scope word; or a structural verb
+(`refactor`, `migrate`, `rename`, `rewrite`, `overhaul`, `backfill`, `scaffold`)
+**and** a breadth word (`every`, `each`, `across`, `throughout`, `codebase`,
+`call sites`, `multiple`, `several`, `all the`, `one by one`, `in parallel`)
+**and** several targets actually named — two or more distinct files with
+extensions, or a quantified plural such as "every module" or "all the call
+sites". That last conjunct is what keeps ordinary English about one function out:
+*"refactor `parseCsv` to handle multiple delimiters across quoted fields"* is one
+function in one file and does not fire. Only the first 20,000 characters are
+scanned, so a pasted log cannot cost a session its nudge. Fourteen matcher cases
+are pinned byte-for-byte in the test suite, and ten of them are prompts that
+must **not** fire.
+
+Once-per-session is enforced by an exclusive create of a marker file under the
+system temp directory, named by a SHA-256 of the host-supplied `session_id` — the
+id is hashed rather than interpolated so it can never become a path segment. The
+exclusive create **is** the lock, so two racing hooks cannot both speak. A session
+with no id, and a marker that cannot be written, both answer silence rather than
+risk a hook that speaks every turn.
+
+**It is deliberately not registered on Codex.** Codex binds hook approval to the
+registration — event, matcher, and command together — so adding a second event
+would disarm the already-approved handoff until the user approved again. A nudge
+is not worth silently switching off the handoff.
+
+### Why a worker never hears it
+
+A slice prompt is long, enumerated, and full of exactly the words this hook looks
+for. A worker runs `claude -p`, which executes your `UserPromptSubmit` hooks — so
+without a guard the hook would tell a worker to start a second orchestrator from
+inside its own slice. `workerEnvironment` stamps `BRIGADIER_WORKER=1` at the
+spawn, after the spec's own environment is spread, so a spec cannot override it
+and an ancestor process cannot supply it into a genuine top-level session. The
+hook reads it before it reads stdin. The doctrine paragraph in every installed
+`SKILL.md` is the other half; belt and braces is deliberate.
 
 ## The handoff hook, honestly
 
@@ -191,11 +413,19 @@ tempted to keep grinding rather than delegate. **It does not exist uniformly.**
 | opencode | **Event names verified.** The plugin subscribes to the session event bus against event names verified on a running opencode 1.18.16 |
 | Codex | **Registered, then trust-gated.** `brigadier install codex` writes the `PreCompact` registration, but hooks run only after you click to trust it, and until then it is a silent no-op. Approval binds to the registration, not to the script's contents, so an approved script can change later without another click. This is not seamless and is not presented as such |
 | Claude Desktop | **Impossible.** Desktop exposes no hook surface at all, and an MCP server is called by the model, never by the transcript. There is no workaround |
+| Cursor, Windsurf, Antigravity | **Impossible.** None exposes a hook surface either. The MCP tool descriptions are the only doctrine they get, and they are read only when the model reaches for a tool |
 
 ## Using brigadier over MCP directly
 
 `brigadier mcp` serves the same three tools over stdio to any MCP client, with no
-bundle involved. It takes no runtime options; `-h`/`--help` prints usage.
+bundle involved. It takes no runtime options; `-h`/`--help` prints usage. This is
+the command the four GUI registrations above name in their `args`.
+
+The two tools that read a config use the same lazy path `brigadier run` does, so
+a tool call on an unconfigured machine configures it rather than demanding an
+interactive step of a client with no keyboard. Diagnostics go to stderr; stdout
+is JSON-RPC only. No worker CLI at all is still an error, and the tool says so
+rather than pointing at a command that no longer needs running.
 
 | Tool | Effect |
 | --- | --- |

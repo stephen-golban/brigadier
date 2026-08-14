@@ -19,6 +19,7 @@ import {
   resolveConfigPath,
   writeConfig,
 } from "../src/config/index.ts";
+import { nodeConfigIo } from "../src/config/store.ts";
 import type {
   DiscoveredModel,
   Discoverer,
@@ -214,6 +215,7 @@ const BOTH_VENDORS_CONFIG: BrigadierConfig = {
   ],
   secretsConsent: false,
   linkedSecretPaths: [],
+  guiRegistrationConsent: false,
   allowDegradedRouting: false,
 };
 
@@ -240,6 +242,7 @@ describe("brigadier init --yes", () => {
       const raw = await readFile(path, "utf8");
       expect(raw.endsWith("\n")).toBe(true);
       expect(JSON.parse(raw)).toEqual(BOTH_VENDORS_CONFIG);
+      expect(JSON.parse(raw).guiRegistrationConsent).toBe(false);
       expect(stdout.text()).toContain(`Wrote ${path}`);
     });
   });
@@ -323,6 +326,211 @@ describe("brigadier init --yes", () => {
   });
 });
 
+test("only an explicit interactive yes grants GUI registration consent", async () => {
+  await withScratchHome(async (scratchHome) => {
+    const configIo = {
+      ...nodeConfigIo,
+      exists: (path: string) => Promise.resolve(path.endsWith("/.cursor")),
+    };
+    const stdout = collector();
+    const code = await runInit({
+      discoverer: fakeDiscoverer(CODEX_REPORT),
+      env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+      stdout,
+      stderr: collector(),
+      stdin: scriptedInput(["", "", "", "yes", "no"]),
+      assumeYes: false,
+      printConfig: false,
+      io: configIo,
+    });
+
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain("detected GUI hosts (cursor)");
+    expect(
+      (
+        await readConfig(
+          resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+          configIo,
+        )
+      )?.guiRegistrationConsent,
+    ).toBe(true);
+  });
+});
+
+test("a detected GUI host adds one prompt without shifting later answers", async () => {
+  await withScratchHome(async (scratchHome) => {
+    const runInteractive = async (
+      scratchHome: string,
+      guiHostExists: boolean,
+      lines: readonly string[],
+    ) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: (candidate: string) =>
+          Promise.resolve(
+            guiHostExists && candidate === "/Applications/Cursor.app",
+          ),
+      };
+      let promptLinesRead = 0;
+      const stdin: InputStream = {
+        async *[Symbol.asyncIterator]() {
+          for (const line of lines) {
+            promptLinesRead += 1;
+            yield `${line}\n`;
+          }
+        },
+      };
+
+      expect(
+        await runInit({
+          discoverer: fakeDiscoverer(CODEX_REPORT),
+          env: { BRIGADIER_HOME: scratchHome },
+          stdout: collector(),
+          stderr: collector(),
+          stdin,
+          assumeYes: false,
+          printConfig: false,
+          io: configIo,
+        }),
+      ).toBe(0);
+
+      return {
+        config: await readConfig(
+          resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+          configIo,
+        ),
+        promptLinesRead,
+      };
+    };
+
+    const withoutGuiHost = await runInteractive(scratchHome, false, [
+      "",
+      "",
+      "y",
+      "n",
+    ]);
+
+    expect(withoutGuiHost.promptLinesRead).toBe(4);
+    expect(withoutGuiHost.config?.guiRegistrationConsent).toBe(false);
+    expect(withoutGuiHost.config?.allowDegradedRouting).toBe(true);
+    expect(withoutGuiHost.config?.secretsConsent).toBe(false);
+
+    await withScratchHome(async (scratchHome) => {
+      const withGuiHost = await runInteractive(scratchHome, true, [
+        "",
+        "",
+        "y",
+        "y",
+        "n",
+      ]);
+
+      expect(withGuiHost.promptLinesRead).toBe(5);
+      expect(withGuiHost.promptLinesRead).toBe(
+        withoutGuiHost.promptLinesRead + 1,
+      );
+      expect(withGuiHost.config?.guiRegistrationConsent).toBe(true);
+      expect(withGuiHost.config?.allowDegradedRouting).toBe(true);
+      expect(withGuiHost.config?.secretsConsent).toBe(false);
+    });
+  });
+});
+
+describe("GUI registration consent survives a re-run", () => {
+  const PRIOR_GUI_TRUE_CONFIG: BrigadierConfig = {
+    version: 3,
+    vendors: [
+      {
+        vendor: "codex",
+        executable: "/opt/homebrew/bin/codex",
+        version: "0.145.0",
+        defaultModel: "gpt-5.6-sol",
+        models: [
+          { id: "gpt-5.6-sol", effortCeiling: "high" },
+          { id: "gpt-5.6-terra", effortCeiling: "high" },
+        ],
+      },
+    ],
+    secretsConsent: false,
+    linkedSecretPaths: [],
+    guiRegistrationConsent: true,
+    allowDegradedRouting: false,
+  };
+
+  test("pressing Enter at the GUI prompt keeps a previously recorded true", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeConfig(path, PRIOR_GUI_TRUE_CONFIG);
+      const configIo = {
+        ...nodeConfigIo,
+        exists: (candidate: string) =>
+          Promise.resolve(candidate.endsWith("/.cursor")),
+      };
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout: collector(),
+        stderr: collector(),
+        stdin: scriptedInput(["", "", "", "", "no"]),
+        assumeYes: false,
+        printConfig: false,
+        io: configIo,
+      });
+
+      expect(code).toBe(0);
+      expect((await readConfig(path, configIo))?.guiRegistrationConsent).toBe(
+        true,
+      );
+    });
+  });
+
+  test("keeps a previously recorded true when no GUI host is detected", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeConfig(path, PRIOR_GUI_TRUE_CONFIG);
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout: collector(),
+        stderr: collector(),
+        stdin: scriptedInput(["", "", "", "no"]),
+        assumeYes: false,
+        printConfig: false,
+        io: configIo,
+      });
+
+      expect(code).toBe(0);
+      expect((await readConfig(path, configIo))?.guiRegistrationConsent).toBe(
+        true,
+      );
+    });
+  });
+
+  test("keeps a previously recorded true under --yes", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      await writeConfig(path, PRIOR_GUI_TRUE_CONFIG);
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome },
+        stdout: collector(),
+        stderr: collector(),
+        assumeYes: true,
+        printConfig: false,
+      });
+
+      expect(code).toBe(0);
+      expect((await readConfig(path))?.guiRegistrationConsent).toBe(true);
+    });
+  });
+});
+
 describe("brigadier init --print-config", () => {
   test("emits valid JSON, exits 0, and writes nothing", async () => {
     await withScratchHome(async (scratchHome) => {
@@ -367,6 +575,7 @@ describe("brigadier init --print-config", () => {
         vendors: [],
         secretsConsent: false,
         linkedSecretPaths: [],
+        guiRegistrationConsent: false,
         allowDegradedRouting: false,
       });
     });
@@ -485,6 +694,10 @@ describe("degraded routing", () => {
 describe("linked secret paths", () => {
   test("asks for paths only after consent and persists the exact list", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const stdout = collector();
       const code = await runInit({
         discoverer: fakeDiscoverer(CODEX_REPORT),
@@ -501,11 +714,13 @@ describe("linked secret paths", () => {
         ]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
 
       expect(code).toBe(0);
       const written = await readConfig(
         resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        configIo,
       );
       expect(written?.secretsConsent).toBe(true);
       expect(written?.linkedSecretPaths).toEqual([
@@ -527,6 +742,10 @@ describe("linked secret paths", () => {
 
   test("does not ask for paths without consent and stores an empty list", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const configPath = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
       const prior = withLinkedSecretPaths(
         withSecretsConsent(proposeConfig(CODEX_REPORT, null).config, true),
@@ -543,10 +762,11 @@ describe("linked secret paths", () => {
         stdin: scriptedInput(["", "", "", "n"]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
 
       expect(code).toBe(0);
-      const written = await readConfig(configPath);
+      const written = await readConfig(configPath, configIo);
       expect(written?.secretsConsent).toBe(false);
       expect(written?.linkedSecretPaths).toEqual([]);
       expect(
@@ -561,6 +781,10 @@ describe("linked secret paths", () => {
 
   test("bounds invalid path input at three attempts and keeps the safe default", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const stdout = collector();
       const traversal = "config/" + "../" + ".env";
       const code = await runInit({
@@ -579,6 +803,7 @@ describe("linked secret paths", () => {
         ]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
 
       expect(code).toBe(0);
@@ -824,6 +1049,10 @@ describe("effort ceilings", () => {
 
   test("offers a per-model ceiling override behind the documented warning", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const stdout = collector();
       const code = await runInit({
         discoverer: fakeDiscoverer(CODEX_REPORT),
@@ -835,11 +1064,13 @@ describe("effort ceilings", () => {
         stdin: scriptedInput(["", "y", "3", "1", "", ""]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
 
       expect(code).toBe(0);
       const written = await readConfig(
         resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        configIo,
       );
       expect(written?.vendors[0]?.models).toEqual([
         { id: "gpt-5.6-sol", effortCeiling: "xhigh" },
@@ -943,6 +1174,10 @@ describe("prompt synchronization", () => {
 
   test("every prompt in the flow reads exactly one line", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const singleModel: DiscoveryReport = {
         vendors: [
           {
@@ -981,11 +1216,13 @@ describe("prompt synchronization", () => {
         stdin: scriptedInput(["n", "1", "y", "1", "y", "n"]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
 
       expect(code).toBe(0);
       const written = await readConfig(
         resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        configIo,
       );
       expect(written?.vendors[0]?.defaultModel).toBe("gpt-5.6-sol");
       expect(written?.vendors[0]?.models).toEqual([
@@ -1125,6 +1362,7 @@ describe("re-running init", () => {
         ],
         secretsConsent: true,
         linkedSecretPaths: [".env", "config/secrets.env"],
+        guiRegistrationConsent: false,
         allowDegradedRouting: true,
       };
       await writeConfig(path, prior);
@@ -1484,6 +1722,10 @@ describe("command line", () => {
 
   test("a closed stdin answers every prompt with its default instead of hanging", async () => {
     await withScratchHome(async (scratchHome) => {
+      const configIo = {
+        ...nodeConfigIo,
+        exists: () => Promise.resolve(false),
+      };
       const code = await runInit({
         discoverer: fakeDiscoverer(BOTH_VENDORS_REPORT),
         env: { BRIGADIER_HOME: scratchHome },
@@ -1492,10 +1734,14 @@ describe("command line", () => {
         stdin: scriptedInput([]),
         assumeYes: false,
         printConfig: false,
+        io: configIo,
       });
       expect(code).toBe(0);
       expect(
-        await readConfig(resolveConfigPath({ BRIGADIER_HOME: scratchHome })),
+        await readConfig(
+          resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+          configIo,
+        ),
       ).toEqual(BOTH_VENDORS_CONFIG);
     });
   });

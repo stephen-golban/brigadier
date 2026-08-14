@@ -30,7 +30,8 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "scripts/postinstall.mjs"
   ],
   "publishConfig": {
     "access": "public"
@@ -44,6 +45,7 @@
     "build:unsigned": "bun run build:dist && bun run build:binary",
     "check": "biome check .",
     "format": "biome format --write .",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepack": "bun run build",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
