@@ -131,11 +131,13 @@ main() {
   esac
 
   installed_binary="${install_directory}/brigadier"
-  installed_version="$($installed_binary --version)"
+  installed_version="$("$installed_binary" --version)"
   printf '%s\n' "Installed brigadier ${installed_version} to ${installed_binary}"
 
   if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then
-    "$installed_binary" init </dev/tty
+    if ! "$installed_binary" init </dev/tty; then
+      printf '%s\n' "brigadier setup did not finish. Run brigadier init to try again." >&2
+    fi
   else
     printf '%s\n' "No terminal is available; run brigadier init yourself to choose which detected hosts brigadier should work inside."
   fi
