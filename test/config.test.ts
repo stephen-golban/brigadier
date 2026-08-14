@@ -186,7 +186,35 @@ describe("effort ladder narrowing", () => {
 describe("parseConfig", () => {
   test("accepts a canonical config unchanged", () => {
     expect(parseConfig(structuredClone(CANONICAL))).toEqual(CANONICAL);
+    expect(parseConfig(structuredClone(CANONICAL)).enabledHosts).toEqual([]);
     expect(serializeConfig(CANONICAL)).toBe(CANONICAL_BYTES);
+    expect(serializeConfig(parseConfig(structuredClone(CANONICAL)))).toBe(
+      CANONICAL_BYTES,
+    );
+  });
+
+  test("validates and canonically orders enabled hosts", () => {
+    const parsed = parseConfig({
+      ...CANONICAL,
+      enabledHosts: ["claude-desktop", "codex", "cursor"],
+    });
+
+    expect(parsed.enabledHosts).toEqual(["codex", "cursor", "claude-desktop"]);
+    expect(JSON.parse(serializeConfig(parsed)).enabledHosts).toEqual([
+      "codex",
+      "cursor",
+      "claude-desktop",
+    ]);
+    expect(() =>
+      parseConfig({ ...CANONICAL, enabledHosts: ["codex", "not-a-host"] }),
+    ).toThrow(
+      'invalid brigadier config: enabledHosts[1] must be one of claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop, received "not-a-host"',
+    );
+    expect(() =>
+      parseConfig({ ...CANONICAL, enabledHosts: ["codex", "codex"] }),
+    ).toThrow(
+      'invalid brigadier config: enabledHosts contains duplicate host "codex"',
+    );
   });
 
   /**
@@ -653,6 +681,7 @@ describe("lazy config", () => {
           linkedSecretPaths: [".env"],
           guiRegistrationConsent: true,
           allowDegradedRouting: true,
+          enabledHosts: ["claude-desktop", "codex"],
         }),
       );
       const stderr = collector();
@@ -668,6 +697,7 @@ describe("lazy config", () => {
       expect(result.config.linkedSecretPaths).toEqual([".env"]);
       expect(result.config.allowDegradedRouting).toBe(true);
       expect(result.config.guiRegistrationConsent).toBe(false);
+      expect(result.config.enabledHosts).toEqual(["codex", "claude-desktop"]);
       expect((await readConfig(path))?.version).toBe(CONFIG_VERSION);
       expect(stderr.text()).toContain("has version 2");
     });
