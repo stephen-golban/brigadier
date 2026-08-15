@@ -13,8 +13,8 @@ fail() {
 }
 
 cleanup() {
-  if [ -n "${staged_binary:-}" ] && [ -e "$staged_binary" ]; then
-    rm -f "$staged_binary"
+  if [ -n "${staging_directory:-}" ] && { [ -e "$staging_directory" ] || [ -L "$staging_directory" ]; }; then
+    rm -rf "$staging_directory"
   fi
   if [ -n "${temporary_directory:-}" ] && [ -d "$temporary_directory" ]; then
     rm -rf "$temporary_directory"
@@ -122,10 +122,17 @@ main() {
   install_directory="${BRIGADIER_INSTALL_DIR:-${HOME:-}/.local/bin}"
   [ -n "$install_directory" ] || fail "HOME is unset; set BRIGADIER_INSTALL_DIR to choose an install location."
   mkdir -p "$install_directory"
-  staged_binary="${install_directory}/.brigadier.install.$$"
+  staging_directory="$(mktemp -d "${install_directory}/.brigadier.install.XXXXXX")" || fail "could not create a staging directory in ${install_directory}."
+  staged_binary="${staging_directory}/brigadier"
   cp "${temporary_directory}/brigadier" "$staged_binary"
   chmod +x "$staged_binary"
-  mv "$staged_binary" "${install_directory}/brigadier"
+  destination="${install_directory}/brigadier"
+  if [ -L "$destination" ]; then
+    rm -f "$destination"
+  elif [ -d "$destination" ]; then
+    fail "cannot install brigadier: ${destination} is a directory."
+  fi
+  mv "$staged_binary" "$destination"
 
   case ":${PATH:-}:" in
     *":${install_directory}:"*) ;;

@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -181,6 +182,118 @@ main "$@"`,
     expect(await readFile(target, "utf8")).toBe(targetContents);
     expect((await lstat(destination)).isSymbolicLink()).toBe(false);
     expect(await readFile(destination, "utf8")).toContain("#!/bin/sh");
+    expect(
+      (await readdir(installDirectory)).filter((entry) =>
+        entry.startsWith(".brigadier.install."),
+      ),
+    ).toEqual([]);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("installer replaces a destination symlink to a directory", async () => {
+  const source = await readFile(join(root, "install.sh"), "utf8");
+  const scratch = await mkdtemp(
+    join(tmpdir(), "brigadier-installer-dir-link-"),
+  );
+  const installDirectory = join(scratch, "bin");
+  const linkedDirectory = join(scratch, "package-manager-bin");
+  const destination = join(installDirectory, "brigadier");
+  const script = source
+    .replace(
+      "if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then",
+      "if false; then",
+    )
+    .replace(
+      'main "$@"',
+      `download() { :; }
+verify_checksum() { :; }
+tar() {
+  printf '%s\\n' '#!/bin/sh' 'case "$1" in' '--version) printf "%s\\n" "0.0.0" ;;' 'esac' > "$temporary_directory/brigadier"
+}
+main "$@"`,
+    );
+
+  try {
+    await mkdir(installDirectory);
+    await mkdir(linkedDirectory);
+    await symlink(linkedDirectory, destination);
+
+    const child = Bun.spawn(["sh", "-c", script], {
+      env: {
+        ...process.env,
+        BRIGADIER_INSTALL_DIR: installDirectory,
+        BRIGADIER_VERSION: "0.0.0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+
+    expect(await child.exited, stderr).toBe(0);
+    const destinationStat = await lstat(destination);
+    expect(destinationStat.isSymbolicLink()).toBe(false);
+    expect(destinationStat.isFile()).toBe(true);
+    expect(destinationStat.mode & 0o111).not.toBe(0);
+    expect(await readdir(linkedDirectory)).toEqual([]);
+    expect(
+      (await readdir(installDirectory)).filter((entry) =>
+        entry.startsWith(".brigadier.install."),
+      ),
+    ).toEqual([]);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("installer refuses to replace a real destination directory", async () => {
+  const source = await readFile(join(root, "install.sh"), "utf8");
+  const scratch = await mkdtemp(join(tmpdir(), "brigadier-installer-dir-"));
+  const installDirectory = join(scratch, "bin");
+  const destination = join(installDirectory, "brigadier");
+  const preservedFile = join(destination, "owned-by-user");
+  const preservedContents = "leave this alone\n";
+  const script = source
+    .replace(
+      "if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then",
+      "if false; then",
+    )
+    .replace(
+      'main "$@"',
+      `download() { :; }
+verify_checksum() { :; }
+tar() {
+  printf '%s\\n' '#!/bin/sh' 'case "$1" in' '--version) printf "%s\\n" "0.0.0" ;;' 'esac' > "$temporary_directory/brigadier"
+}
+main "$@"`,
+    );
+
+  try {
+    await mkdir(destination, { recursive: true });
+    await writeFile(preservedFile, preservedContents);
+
+    const child = Bun.spawn(["sh", "-c", script], {
+      env: {
+        ...process.env,
+        BRIGADIER_INSTALL_DIR: installDirectory,
+        BRIGADIER_VERSION: "0.0.0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+
+    expect(await child.exited).not.toBe(0);
+    expect(stderr).toContain(`${destination} is a directory`);
+    expect((await lstat(destination)).isDirectory()).toBe(true);
+    expect(await readFile(preservedFile, "utf8")).toBe(preservedContents);
+    expect(await readdir(destination)).toEqual(["owned-by-user"]);
+    expect(
+      (await readdir(installDirectory)).filter((entry) =>
+        entry.startsWith(".brigadier.install."),
+      ),
+    ).toEqual([]);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
