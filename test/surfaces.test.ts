@@ -935,6 +935,102 @@ describe("brigadier install", () => {
     }
   });
 
+  /**
+   * THE CONFIG IS READ ONCE PER INSTALL, and this is what that buys.
+   *
+   * It used to be read twice — once to resolve `enabledHosts`, once again for
+   * `guiRegistrationConsent` — and `writeConfig` publishes by renaming over the
+   * file, which `brigadier init` does. Two reads could therefore see two
+   * different files, and the installer would act on a permission assembled from
+   * one field of each: cursor from the file that withheld consent, consent from
+   * the file that had already dropped cursor. Neither file said yes.
+   *
+   * The swap is driven through the injected detection seam rather than by real
+   * concurrency, so it lands at exactly the instant between the old two reads
+   * every time this runs. A test that depended on timing would be worse than no
+   * test at all.
+   */
+  test("reads the config once, so a mid-install swap authorizes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      const configPath = join(home, ".brigadier/config.json");
+      // Snapshot A: cursor enabled, registration consent withheld.
+      await writeFile(configPath, configBytes(false, ["cursor"]), "utf8");
+
+      let stdout = "";
+      let stderr = "";
+      const io: InstallIo = {
+        env: { HOME: home },
+        stdout: {
+          write: (chunk: string) => {
+            stdout += chunk;
+          },
+        },
+        stderr: {
+          write: (chunk: string) => {
+            stderr += chunk;
+          },
+        },
+        // The detection seam is the moment between what used to be two reads.
+        detectHosts: async (environment) => {
+          // Snapshot B: consent granted, cursor dropped.
+          await writeFile(configPath, configBytes(true, ["codex"]), "utf8");
+          return hostDetections(environment, ["cursor"]);
+        },
+      };
+      const code = await runInstall([], io);
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      // The one snapshot that was read enabled cursor and withheld consent, so
+      // cursor is installed and its registration is skipped.
+      expect(stdout).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable config fails a bare install but not a named one", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      const configPath = join(home, ".brigadier/config.json");
+      await writeFile(configPath, "{ not json", "utf8");
+      const env = { HOME: home };
+
+      // "enabled" mode: a config that exists and cannot be parsed must not
+      // degrade into "no hosts enabled", which would be an empty selection the
+      // user never made.
+      const bare = await install([], env, undefined, ["cursor"]);
+      expect(bare.code).toBe(1);
+      expect(bare.stderr).toContain(
+        `brigadier install: could not read enabled hosts from ${configPath}`,
+      );
+      expect(bare.stderr).toContain(
+        "Run `brigadier init` to record them again.",
+      );
+
+      // The consent policy is the opposite one, deliberately: every failure is
+      // a no, and the install itself still runs.
+      for (const argv of [["cursor"], ["cursor", "--all"]]) {
+        const named = await install(argv, env, undefined, ["cursor"]);
+        expect(named.code).toBe(0);
+        expect(named.stdout).toContain(
+          "brigadier writes into another application's configuration only on an explicit yes",
+        );
+        expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test("a named undetected host is skipped unless --force overrides presence", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {

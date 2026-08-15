@@ -151,6 +151,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
     "EFFORT_CEILING_WARNING",
     "ROUTER_NOTE",
     "DEGRADED_ROUTING_QUESTION",
+    "NO_HOSTS_DETECTED",
     // Routing internals. `COMPETENCE_TABLE` and `DIFFICULTY_FLOORS` are API
     // because the routing policy promises the ranking is auditable data; the scoring
     // path that reads them is how the router and `init` stay in agreement, and
@@ -164,7 +165,7 @@ test("root barrel leaks neither internals nor CLI and discovery plumbing", () =>
   for (const name of mustNotLeak) {
     expect(exports).not.toContain(name);
   }
-  expect(mustNotLeak).toHaveLength(44);
+  expect(mustNotLeak).toHaveLength(45);
 });
 
 test("built dist output executes the Codex quota oracle under Node", () => {

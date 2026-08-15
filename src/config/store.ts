@@ -17,7 +17,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import type { BrigadierConfig } from "./contracts.js";
+import type { BrigadierConfig, ParsedBrigadierConfig } from "./contracts.js";
 import { ConfigValidationError, parseConfig } from "./contracts.js";
 
 export const CONFIG_HOME_VARIABLE = "BRIGADIER_HOME";
@@ -147,11 +147,16 @@ export function serializeConfig(config: BrigadierConfig): string {
 /**
  * Reads and validates the config. Returns `null` when no config exists yet and
  * throws `ConfigValidationError` when one exists but cannot be trusted.
+ *
+ * The result is the `ParsedBrigadierConfig` `parseConfig` actually produces
+ * rather than the looser input shape, so a caller reading `enabledHosts` gets a
+ * required array and never has to defend against an `undefined` that this
+ * function cannot return.
  */
 export async function readConfig(
   path: string,
   io: ConfigIo = nodeConfigIo,
-): Promise<BrigadierConfig | null> {
+): Promise<ParsedBrigadierConfig | null> {
   let contents: string;
   try {
     contents = await io.readFile(path);
@@ -177,12 +182,16 @@ export async function readConfig(
  * Validates, then writes through a temp file in the same directory and renames
  * over the target, so an interrupted write can never leave a partial or
  * unreadable config behind. Returns the config exactly as persisted.
+ *
+ * The PARAMETER stays `BrigadierConfig` — a caller may legitimately hand over a
+ * config with no `enabledHosts` key — while the result is what was validated
+ * and written, which always has one.
  */
 export async function writeConfig(
   path: string,
   config: BrigadierConfig,
   io: ConfigIo = nodeConfigIo,
-): Promise<BrigadierConfig> {
+): Promise<ParsedBrigadierConfig> {
   const validated = parseConfig(config);
   const directory = dirname(path);
   await io.mkdir(directory);

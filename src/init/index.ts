@@ -1,5 +1,11 @@
 /**
- * `brigadier init`: probe, propose, confirm, write.
+ * `brigadier init`: probe, propose, confirm, write, install.
+ *
+ * It is THE setup step. Besides the model configuration it asks which of the AI
+ * hosts detected on this machine to set brigadier up for, records that as
+ * `enabledHosts`, and only then hands those hosts to `brigadier install` — in
+ * that order, because the installer reads the config to decide what it is
+ * allowed to write.
  *
  * The command takes its `Discoverer`, its environment, and its streams by
  * injection, so the whole flow runs against a fake report, a scripted stdin,
@@ -13,6 +19,17 @@
 
 import { readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
+// Direct-module imports on purpose: the host vocabulary and `parseConfig` are
+// config internals `init` composes with, in the same style `src/init/propose.ts`
+// already uses, and `src/config/index.ts` does not republish them.
+import type {
+  GuiHost,
+  Host,
+  ParsedBrigadierConfig,
+} from "../config/contracts.js";
+import { GUI_HOSTS, HOSTS, parseConfig } from "../config/contracts.js";
+import type { HostDetection } from "../config/ensure.js";
+import { detectHosts } from "../config/ensure.js";
 import type {
   BrigadierConfig,
   ConfigEnvironment,
@@ -21,7 +38,6 @@ import type {
 } from "../config/index.js";
 import {
   ConfigValidationError,
-  detectGuiHosts,
   ensureConfig,
   readConfig,
   resolveConfigPath,
@@ -126,6 +142,13 @@ const LINKED_SECRET_PATHS_QUESTION =
 
 const LINKED_SECRET_PATH_ATTEMPTS = 3;
 
+/** Printed instead of the host questions when the probe found nothing. */
+export const NO_HOSTS_DETECTED =
+  "No supported AI host was detected on this machine, so there is nothing to set up. Install one of claude-code, codex, opencode, cursor, windsurf, antigravity, or claude-desktop and run `brigadier init` again.";
+
+/** The heading above the per-host questions. */
+const HOSTS_DETECTED_HEADING = "Hosts detected on this machine";
+
 export interface InitOptions {
   readonly discoverer: Discoverer;
   readonly env: ConfigEnvironment;
@@ -197,7 +220,18 @@ export async function runInit(options: InitOptions): Promise<number> {
     renderProposal(stdout, proposal);
   }
 
+  // ONE DETECTION PASS, SHARED BY EVERYTHING BELOW: the hosts offered here, the
+  // GUI-registration question's list, and the installer this run hands off to.
+  // A second pass could disagree with the first, and the user would have
+  // consented against a machine that no longer matched.
+  const detections = await detectInstalledHosts(options, stderr);
+  const detected = detections.filter(isPresent);
+  const detectedHosts = new Set(detected.map((entry) => entry.host));
+  const priorHosts: readonly Host[] =
+    existing === null ? [] : existing.enabledHosts;
+
   let config = proposal.config;
+  let chosenHosts: readonly Host[];
   const interactive =
     !options.assumeYes && !quiet && options.stdin !== undefined;
   if (interactive && options.stdin !== undefined) {
@@ -205,10 +239,47 @@ export async function runInit(options: InitOptions): Promise<number> {
       reader: new LineReader(options.stdin),
       output: stdout,
     };
-    const guiHosts = await detectGuiHosts(options.env, options.io);
+    const guiHosts = detected.map((entry) => entry.host).filter(isGuiHost);
     config = await confirmInteractively(io, proposal, config, guiHosts);
-  } else if (!quiet) {
-    stdout.write("\nAccepting every proposed default (--yes).\n");
+    renderDetectedHosts(stdout, detected);
+    chosenHosts = await selectHosts(io, detected, priorHosts);
+  } else {
+    if (!quiet) {
+      stdout.write("\nAccepting every proposed default (--yes).\n");
+    }
+    // WITHOUT A HUMAN AT THE KEYBOARD ONLY THE SKILL HOSTS ARE ENABLED. `--yes`
+    // accepts brigadier's defaults, and no default may put brigadier inside
+    // another product's configuration file: that takes an explicit yes, which
+    // `--yes` is not. A GUI host already recorded in `enabledHosts` got one
+    // once, so it stays; a newly detected one does not.
+    chosenHosts = detected
+      .map((entry) => entry.host)
+      .filter((host) => !isGuiHost(host) || priorHosts.includes(host));
+    if (!quiet) {
+      renderDetectedHosts(stdout, detected);
+      renderHostSelection(stdout, detected, chosenHosts);
+    }
+  }
+
+  // A host recorded earlier that this machine no longer shows was never offered
+  // and so was never answered. It keeps its recorded value rather than being
+  // dropped by a probe the user did not run: `brigadier install` skips an
+  // undetected host anyway, and reinstalling the host should not also cost the
+  // user their choice.
+  const enabledHosts = HOSTS.filter((host) =>
+    detectedHosts.has(host)
+      ? chosenHosts.includes(host)
+      : priorHosts.includes(host),
+  );
+  config = withEnabledHosts(config, enabledHosts);
+  if (!quiet) {
+    for (const host of enabledHosts) {
+      if (!detectedHosts.has(host)) {
+        stdout.write(
+          `  note: ${host} stays enabled in your config but was not detected on this machine.\n`,
+        );
+      }
+    }
   }
 
   if (quiet) {
@@ -225,14 +296,140 @@ export async function runInit(options: InitOptions): Promise<number> {
     return 1;
   }
   stdout.write(`\nWrote ${configPath}\n`);
-  return 0;
+
+  if (chosenHosts.length === 0) {
+    return 0;
+  }
+  // AFTER THE WRITE, NEVER BEFORE. The installer reads the recorded config to
+  // decide what it is allowed to do — GUI registration consent above all — so
+  // it must see the answers this run just collected rather than the previous
+  // run's. The chosen hosts are named explicitly instead of letting the
+  // installer re-derive them, and the detection pass is handed over intact so
+  // both halves agree about what is on this machine.
+  return runInstall([...chosenHosts], {
+    env: options.env,
+    stdout,
+    stderr,
+    detectHosts: () => Promise.resolve(detections),
+  });
+}
+
+/** Every detection whose host is actually here, with its evidence. */
+type PresentDetection = Extract<HostDetection, { readonly present: true }>;
+
+function isPresent(detection: HostDetection): detection is PresentDetection {
+  return detection.present;
+}
+
+function isGuiHost(host: Host): host is GuiHost {
+  return (GUI_HOSTS as readonly string[]).includes(host);
+}
+
+/**
+ * Probes for installed hosts, reporting a failure rather than failing the run.
+ *
+ * Detection is an input to a question, not a precondition for one: a probe that
+ * cannot answer means no host is offered, and the rest of `init` still has a
+ * config to write.
+ */
+async function detectInstalledHosts(
+  options: InitOptions,
+  stderr: OutputStream,
+): Promise<readonly HostDetection[]> {
+  try {
+    return options.io === undefined
+      ? await detectHosts(options.env)
+      : await detectHosts(options.env, options.io);
+  } catch (error) {
+    stderr.write(
+      `brigadier init: could not detect installed AI hosts: ${describe(error)}\n`,
+    );
+    return [];
+  }
+}
+
+function renderDetectedHosts(
+  stdout: OutputStream,
+  detected: readonly PresentDetection[],
+): void {
+  stdout.write(
+    detected.length === 0
+      ? `\n${NO_HOSTS_DETECTED}\n`
+      : `\n${HOSTS_DETECTED_HEADING}\n`,
+  );
+}
+
+/** The non-interactive transcript of what was found and what was taken. */
+function renderHostSelection(
+  stdout: OutputStream,
+  detected: readonly PresentDetection[],
+  chosen: readonly Host[],
+): void {
+  for (const detection of detected) {
+    stdout.write(
+      `  ${chosen.includes(detection.host) ? "enabled" : "skipped"}  ${detection.host}  (${describeEvidence(detection)})\n`,
+    );
+  }
+}
+
+/**
+ * Asks, once per detected host, whether to set brigadier up for it.
+ *
+ * ONLY DETECTED HOSTS ARE OFFERED, and every question carries the evidence that
+ * proved the host is here — the absolute path, and what kind of thing it was —
+ * so "why does brigadier think Codex is installed?" is answered on the same
+ * line that asks the question.
+ *
+ * The three skill hosts default yes and the four GUI hosts default no: dropping
+ * a skill file into a directory brigadier already owns is a smaller thing to
+ * ask than writing into another product's configuration file. A host already
+ * recorded in `enabledHosts` defaults yes whichever group it is in, so pressing
+ * enter on a re-run never discards a choice the user already made.
+ */
+async function selectHosts(
+  io: PromptIo,
+  detected: readonly PresentDetection[],
+  prior: readonly Host[],
+): Promise<readonly Host[]> {
+  const chosen: Host[] = [];
+  for (const detection of detected) {
+    const accepted = await confirmPrompt(
+      io,
+      hostQuestion(detection),
+      prior.includes(detection.host) || !isGuiHost(detection.host),
+    );
+    if (accepted) {
+      chosen.push(detection.host);
+    }
+  }
+  return chosen;
+}
+
+function hostQuestion(detection: PresentDetection): string {
+  return `Set brigadier up for ${detection.host}? (${describeEvidence(detection)})`;
+}
+
+function describeEvidence(detection: PresentDetection): string {
+  return `detected by ${detection.evidenceKind} ${detection.evidence}`;
+}
+
+/**
+ * Records the selection. An empty one is written as no key at all, which is
+ * exactly what `parseConfig` does with it and what every reader already
+ * expects.
+ */
+function withEnabledHosts(
+  config: BrigadierConfig,
+  hosts: readonly Host[],
+): BrigadierConfig {
+  return parseConfig({ ...config, enabledHosts: hosts });
 }
 
 async function loadExisting(
   configPath: string,
   io: ConfigIo | undefined,
   stderr: OutputStream,
-): Promise<BrigadierConfig | null> {
+): Promise<ParsedBrigadierConfig | null> {
   try {
     return io === undefined
       ? await readConfig(configPath)
@@ -399,7 +596,7 @@ async function confirmInteractively(
   io: PromptIo,
   proposal: Proposal,
   initial: BrigadierConfig,
-  guiHosts: readonly import("../config/index.js").GuiHost[],
+  guiHosts: readonly GuiHost[],
 ): Promise<BrigadierConfig> {
   let config = initial;
   for (const vendor of proposal.vendors) {

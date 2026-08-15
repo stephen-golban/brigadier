@@ -42,6 +42,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, sep } from "node:path";
+import type { Host, ParsedBrigadierConfig } from "../config/contracts.js";
 import type { HostDetection } from "../config/ensure.js";
 import { detectHosts } from "../config/ensure.js";
 import type { ConfigEnvironment } from "../config/store.js";
@@ -703,18 +704,29 @@ export async function runInstall(
     return 1;
   }
 
+  // ONE READ, ONE SNAPSHOT, FOR THE WHOLE INSTALL. The config used to be read
+  // twice — once for `enabledHosts` and again for `guiRegistrationConsent` —
+  // and `writeConfig` renames over the file, which `brigadier init` does. Two
+  // reads could therefore see two different files: the first enabling cursor
+  // while withholding consent, the second granting consent while dropping
+  // cursor, and the installer registering Cursor's MCP server although neither
+  // complete file authorized it. Everything below derives from this one value.
+  const snapshot = await readConfigSnapshot(io.env);
+
   let candidates: readonly SurfaceHost[];
   if (parsed.selection === "enabled") {
-    let enabledHosts: readonly SurfaceHost[];
-    try {
-      const config = await readConfig(resolveConfigPath(io.env));
-      enabledHosts = (config?.enabledHosts ?? []).filter(isHost);
-    } catch (error) {
+    // A config that exists but cannot be read or parsed is a HARD ERROR here,
+    // deliberately unlike the consent policy below: silently degrading to "no
+    // hosts enabled" would report an empty selection the user never made.
+    if (snapshot.kind === "unreadable") {
       io.stderr.write(
-        `brigadier install: could not read enabled hosts from ${resolveConfigPath(io.env)}: ${describe(error)}. Run \`brigadier init\` to record them again.\n`,
+        `brigadier install: could not read enabled hosts from ${snapshot.path}: ${snapshot.reason}. Run \`brigadier init\` to record them again.\n`,
       );
       return 1;
     }
+    const recorded: readonly Host[] =
+      snapshot.kind === "ok" ? snapshot.config.enabledHosts : [];
+    const enabledHosts = recorded.filter(isHost);
     if (enabledHosts.length === 0) {
       io.stderr.write(
         "brigadier install: no enabled hosts are recorded; run `brigadier init` to choose which detected hosts to install.\n",
@@ -811,7 +823,7 @@ export async function runInstall(
     codexHook = prepared;
   }
 
-  const consent = await readGuiConsent(io.env);
+  const consent = guiConsentFrom(snapshot);
   const mcpCommand = resolveMcpCommand(io.env);
 
   let refused = 0;
@@ -931,6 +943,51 @@ export async function runInstall(
 }
 
 /**
+ * The one config `runInstall` reads, and everything it could not read.
+ *
+ * The three arms exist because the two readers below hold two different
+ * policies about failure, and collapsing them into one would be a regression
+ * rather than a simplification.
+ */
+type ConfigSnapshot =
+  | {
+      readonly kind: "ok";
+      readonly path: string;
+      readonly config: ParsedBrigadierConfig;
+    }
+  | { readonly kind: "missing"; readonly path: string }
+  | {
+      readonly kind: "unreadable";
+      readonly path: string;
+      readonly reason: string;
+    };
+
+async function readConfigSnapshot(
+  env: ConfigEnvironment,
+): Promise<ConfigSnapshot> {
+  let path: string;
+  try {
+    path = resolveConfigPath(env);
+  } catch (error) {
+    // Unreachable while `resolveRoots` runs first — it makes the same refusal
+    // through `resolveConfigHome` — but this stays total rather than throwing.
+    return {
+      kind: "unreadable",
+      path: "$BRIGADIER_HOME/config.json",
+      reason: describe(error),
+    };
+  }
+  try {
+    const config = await readConfig(path);
+    return config === null
+      ? { kind: "missing", path }
+      : { kind: "ok", path, config };
+  } catch (error) {
+    return { kind: "unreadable", path, reason: describe(error) };
+  }
+}
+
+/**
  * Whether the user has said yes, once, to brigadier writing into a third-party
  * application's configuration.
  *
@@ -939,13 +996,10 @@ export async function runInstall(
  * the same thing here: nobody said yes. Only `guiRegistrationConsent === true`
  * in a config that actually parsed is a yes.
  */
-async function readGuiConsent(env: ConfigEnvironment): Promise<boolean> {
-  try {
-    const config = await readConfig(resolveConfigPath(env));
-    return config?.guiRegistrationConsent === true;
-  } catch {
-    return false;
-  }
+function guiConsentFrom(snapshot: ConfigSnapshot): boolean {
+  return (
+    snapshot.kind === "ok" && snapshot.config.guiRegistrationConsent === true
+  );
 }
 
 /**

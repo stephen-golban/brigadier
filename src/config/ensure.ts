@@ -138,10 +138,10 @@ type EnsureLoad =
 
 async function loadForEnsure(path: string, io: ConfigIo): Promise<EnsureLoad> {
   try {
+    // `readConfig` already returns what `parseConfig` produced, so there is
+    // nothing left to normalize here.
     const config = await readConfig(path, io);
-    return config === null
-      ? { kind: "missing" }
-      : { kind: "current", config: parseConfig(config) };
+    return config === null ? { kind: "missing" } : { kind: "current", config };
   } catch (error) {
     let raw: unknown;
     try {

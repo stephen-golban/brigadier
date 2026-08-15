@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ParsedBrigadierConfig } from "../src/config/contracts.ts";
+import type { Host, ParsedBrigadierConfig } from "../src/config/contracts.ts";
 import type { BrigadierConfig, ConfigIo } from "../src/config/index.ts";
 import {
   CONFIG_VERSION,
@@ -41,7 +41,8 @@ const REAL_HOME_TOKENS: readonly string[] = [
   "process.env.".concat("HOME"),
 ];
 
-const CANONICAL: BrigadierConfig = {
+/** The canonical config exactly as a caller writes it, with no enabledHosts. */
+const CANONICAL_LITERAL: BrigadierConfig = {
   version: CONFIG_VERSION,
   vendors: [
     {
@@ -60,6 +61,13 @@ const CANONICAL: BrigadierConfig = {
   guiRegistrationConsent: false,
   allowDegradedRouting: false,
 };
+
+/**
+ * The same config in the shape a reader gets back. `readConfig` and
+ * `writeConfig` both return `ParsedBrigadierConfig`, so an expectation typed as
+ * the looser input shape is not comparable to one.
+ */
+const CANONICAL = parseConfig(CANONICAL_LITERAL);
 
 const CANONICAL_BYTES = `{
   "version": 3,
@@ -520,6 +528,31 @@ describe("atomic config write", () => {
 
       await writeFile(path, "{ not json", "utf8");
       await expect(readConfig(path)).rejects.toThrow(ConfigValidationError);
+    });
+  });
+
+  /**
+   * The store's two functions declare what `parseConfig` actually produces, so
+   * `enabledHosts` arrives as a required array. The annotations below are the
+   * assertion: neither compiles if either function goes back to promising the
+   * input shape, whose `enabledHosts` is optional.
+   */
+  test("hands back a required enabledHosts, with no undefined to defend against", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const persisted = await writeConfig(path, {
+        ...CANONICAL,
+        enabledHosts: ["codex"],
+      });
+      const written: readonly Host[] = persisted.enabledHosts;
+      expect(written).toEqual(["codex"]);
+
+      const read = await readConfig(path);
+      if (read === null) {
+        throw new Error("the config just written could not be read back");
+      }
+      const hosts: readonly Host[] = read.enabledHosts;
+      expect(hosts).toEqual(["codex"]);
     });
   });
 });
