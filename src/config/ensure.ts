@@ -6,7 +6,7 @@ import type { OutputStream } from "../init/prompt.js";
 import { proposeConfig } from "../init/propose.js";
 import type { GuiHost, Host, ParsedBrigadierConfig } from "./contracts.js";
 import { CONFIG_VERSION, GUI_HOSTS, HOSTS, parseConfig } from "./contracts.js";
-import type { ConfigEnvironment, ConfigIo } from "./store.js";
+import type { ConfigEnvironment, ConfigIo, PathKind } from "./store.js";
 import {
   nodeConfigIo,
   readConfig,
@@ -45,7 +45,7 @@ export type HostDetection =
       readonly host: Host;
       readonly present: true;
       readonly evidence: string;
-      readonly evidenceKind: "executable" | "directory";
+      readonly evidenceKind: "executable" | "file" | "directory";
     }
   | {
       readonly host: Host;
@@ -241,17 +241,24 @@ export async function detectHosts(
       }
     }
 
-    let evidence: string | null = null;
+    let evidence: { readonly path: string; readonly kind: MarkerKind } | null =
+      null;
     for (const candidate of pathCandidates[host]) {
-      if (await pathExists(io, candidate)) {
-        evidence = resolve(candidate);
+      const kind = await detectedPathKind(io, candidate);
+      if (kind === candidate.kind) {
+        evidence = { path: resolve(candidate.path), kind };
         break;
       }
     }
     detected.push(
       evidence === null
         ? { host, present: false, evidence: null, evidenceKind: null }
-        : { host, present: true, evidence, evidenceKind: "directory" },
+        : {
+            host,
+            present: true,
+            evidence: evidence.path,
+            evidenceKind: evidence.kind,
+          },
     );
   }
   return detected;
@@ -273,16 +280,29 @@ export async function detectGuiHosts(
     .map((entry) => entry.host);
 }
 
-async function pathExists(io: ConfigIo, path: string): Promise<boolean> {
+type MarkerKind = Extract<PathKind, "file" | "directory">;
+
+interface PathCandidate {
+  readonly path: string;
+  readonly kind: MarkerKind;
+}
+
+async function detectedPathKind(
+  io: ConfigIo,
+  candidate: PathCandidate,
+): Promise<PathKind | null> {
   try {
-    if (io.exists !== undefined) {
-      return (await io.exists(path)) === true;
+    if (io.pathKind !== undefined) {
+      return await io.pathKind(candidate.path);
     }
-    await io.readFile(path);
-    return true;
+    if (io.exists !== undefined) {
+      return (await io.exists(candidate.path)) === true ? candidate.kind : null;
+    }
+    await io.readFile(candidate.path);
+    return candidate.kind;
   } catch {
     // Missing, inaccessible, and every other failure are not positive evidence.
-    return false;
+    return null;
   }
 }
 
@@ -327,32 +347,37 @@ function hostCommand(host: Host): string | null {
 
 function hostPathCandidates(
   environment: ConfigEnvironment,
-): Readonly<Record<Host, readonly string[]>> {
+): Readonly<Record<Host, readonly PathCandidate[]>> {
   const home = environment.HOME ?? "";
-  const fromEnvironment = (name: string, ...parts: string[]): string[] => {
+  const fileFromEnvironment = (
+    name: string,
+    ...parts: string[]
+  ): PathCandidate[] => {
     const root = environment[name] ?? "";
-    return root.length === 0 ? [] : [resolve(root, ...parts)];
+    return root.length === 0
+      ? []
+      : [{ path: resolve(root, ...parts), kind: "file" }];
   };
-  const fromHome = (...parts: string[]): string[] =>
-    home.length === 0 ? [] : [resolve(home, ...parts)];
+  const fileFromHome = (...parts: string[]): PathCandidate[] =>
+    home.length === 0 ? [] : [{ path: resolve(home, ...parts), kind: "file" }];
 
   // Brigadier creates each bare skill-host root itself. Only host-owned marker
   // files count as fallback evidence; the installer writes none of these.
   return {
     "claude-code": [
-      ...fromEnvironment("CLAUDE_CONFIG_DIR", "settings.json"),
-      ...fromHome(".claude", "settings.json"),
-      ...fromHome(".claude.json"),
+      ...fileFromEnvironment("CLAUDE_CONFIG_DIR", "settings.json"),
+      ...fileFromHome(".claude", "settings.json"),
+      ...fileFromHome(".claude.json"),
     ],
     codex: [
-      ...fromEnvironment("CODEX_HOME", "config.toml"),
-      ...fromEnvironment("CODEX_HOME", "auth.json"),
-      ...fromHome(".codex", "config.toml"),
-      ...fromHome(".codex", "auth.json"),
+      ...fileFromEnvironment("CODEX_HOME", "config.toml"),
+      ...fileFromEnvironment("CODEX_HOME", "auth.json"),
+      ...fileFromHome(".codex", "config.toml"),
+      ...fileFromHome(".codex", "auth.json"),
     ],
     opencode: [
-      ...fromEnvironment("XDG_CONFIG_HOME", "opencode", "opencode.json"),
-      ...fromHome(".config", "opencode", "opencode.json"),
+      ...fileFromEnvironment("XDG_CONFIG_HOME", "opencode", "opencode.json"),
+      ...fileFromHome(".config", "opencode", "opencode.json"),
     ],
     // ~/.agents/skills is deliberately absent: Codex and opencode both read
     // it, and brigadier itself creates it when installing either host.
@@ -362,21 +387,25 @@ function hostPathCandidates(
 
 function guiHostCandidates(
   environment: ConfigEnvironment,
-): Readonly<Record<GuiHost, readonly string[]>> {
+): Readonly<Record<GuiHost, readonly PathCandidate[]>> {
   const home = environment.HOME ?? "";
   const appData = environment.APPDATA ?? "";
   const localAppData = environment.LOCALAPPDATA ?? "";
-  const fromHome = (...parts: string[]): string[] =>
-    home.length === 0 ? [] : [resolve(home, ...parts)];
-  const fromAppData = (root: string, ...parts: string[]): string[] =>
-    root.length === 0 ? [] : [resolve(root, ...parts)];
+  const fromHome = (...parts: string[]): PathCandidate[] =>
+    home.length === 0
+      ? []
+      : [{ path: resolve(home, ...parts), kind: "directory" }];
+  const fromAppData = (root: string, ...parts: string[]): PathCandidate[] =>
+    root.length === 0
+      ? []
+      : [{ path: resolve(root, ...parts), kind: "directory" }];
 
   return {
     cursor: [
       ...fromHome(".cursor"),
       ...fromHome(".config", "Cursor"),
       ...fromHome("Applications", "Cursor.app"),
-      "/Applications/Cursor.app",
+      { path: "/Applications/Cursor.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Cursor"),
       ...fromAppData(appData, "Cursor"),
     ],
@@ -384,7 +413,7 @@ function guiHostCandidates(
       ...fromHome(".codeium", "windsurf"),
       ...fromHome(".config", "Windsurf"),
       ...fromHome("Applications", "Windsurf.app"),
-      "/Applications/Windsurf.app",
+      { path: "/Applications/Windsurf.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Windsurf"),
       ...fromAppData(appData, "Windsurf"),
     ],
@@ -393,14 +422,14 @@ function guiHostCandidates(
       ...fromHome(".gemini", "antigravity"),
       ...fromHome(".config", "Antigravity"),
       ...fromHome("Applications", "Antigravity.app"),
-      "/Applications/Antigravity.app",
+      { path: "/Applications/Antigravity.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Antigravity"),
       ...fromAppData(appData, "Antigravity"),
       ...fromAppData(localAppData, "Antigravity"),
     ],
     "claude-desktop": [
       ...fromHome("Applications", "Claude.app"),
-      "/Applications/Claude.app",
+      { path: "/Applications/Claude.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Claude"),
       ...fromHome(".config", "Claude"),
       ...fromAppData(appData, "Claude"),

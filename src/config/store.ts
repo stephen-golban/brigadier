@@ -30,6 +30,9 @@ const FILE_MODE = 0o600;
 /** The subset of the process environment config resolution consults. */
 export type ConfigEnvironment = Readonly<Record<string, string | undefined>>;
 
+/** The filesystem node kinds host detection can use as evidence. */
+export type PathKind = "file" | "directory" | "other";
+
 /**
  * The filesystem operations the store needs. Injecting this port keeps the
  * atomic-write sequence observable in tests without a test-only code path in
@@ -43,6 +46,8 @@ export interface ConfigIo {
   unlink(path: string): Promise<void>;
   /** Optional because older injected stores predate GUI-host detection. */
   exists?(path: string): Promise<boolean>;
+  /** Optional so injected stores that only provide kind-blind existence work. */
+  pathKind?(path: string): Promise<PathKind | null>;
 }
 
 export const nodeConfigIo: ConfigIo = {
@@ -89,6 +94,30 @@ export const nodeConfigIo: ConfigIo = {
     }
   },
 };
+
+// Keep this optional capability out of object spreads. Existing injected fakes
+// commonly spread nodeConfigIo and replace only `exists`; inheriting the real
+// pathKind probe would bypass their fake filesystem entirely.
+Object.defineProperty(nodeConfigIo, "pathKind", {
+  enumerable: false,
+  async value(path: string): Promise<PathKind | null> {
+    try {
+      const metadata = await stat(path);
+      if (metadata.isFile()) {
+        return "file";
+      }
+      if (metadata.isDirectory()) {
+        return "directory";
+      }
+      return "other";
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return null;
+      }
+      throw error;
+    }
+  },
+});
 
 /** `$BRIGADIER_HOME`, defaulting to `$HOME/.brigadier`. POSIX paths only. */
 export function resolveConfigHome(environment: ConfigEnvironment): string {
