@@ -18,11 +18,8 @@
  * lines are therefore captured into the tool's own result text, where the model
  * can actually read them, and diagnostics go to stderr.
  *
- * `bin/brigadier-mcp.js` (owned elsewhere) is expected to do exactly this and
- * nothing else:
- *
- *     import { runMcpServer } from "../dist/mcp/server.js";
- *     process.exitCode = await runMcpServer();
+ * The compiled binary's `mcp` subcommand calls `runMcpServer` below and does
+ * nothing else with stdout.
  */
 
 import packageJson from "../../package.json";
@@ -74,8 +71,8 @@ interface RealDependenciesControl extends Pick<McpRunControl, "signal"> {
 }
 
 /**
- * The entry point `bin/brigadier-mcp.js` calls. Wires the real process streams,
- * the real config store, and the real supervisor.
+ * The entry point the compiled binary's `mcp` subcommand calls. Wires the real
+ * process streams, the real config store, and the real supervisor.
  *
  * Resolves 0 when stdin reached end of input, which for a stdio MCP server means
  * the client closed the pipe — an ordinary shutdown, not a fault.

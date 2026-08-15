@@ -1,12 +1,5 @@
 import { expect, test } from "bun:test";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import packageJson from "../package.json";
@@ -24,7 +17,10 @@ const AD_HOC_CONTROL_STEP_NAME =
   "Prove notarization requirement rejects ad-hoc binary";
 const NOTARIZED_BINARY_GATE_STEP_NAME =
   "Verify release binary is Developer ID signed and notarized";
-const ASSEMBLY_STEP_NAME = "Assemble release archive and platform npm package";
+const ASSEMBLY_STEP_NAME = "Assemble release archive";
+const CHECKSUMS_STEP_NAME = "Assemble combined checksums";
+const CREATE_RELEASE_STEP_NAME = "Create GitHub release";
+const FORMULA_STEP_NAME = "Update Homebrew formula from release artifacts";
 
 /**
  * The guard's whole output is one line of a few dozen bytes, so this is three
@@ -187,53 +183,58 @@ test("the release workflow's tag guard fails when no tag name reaches it", () =>
   );
 });
 
-test("the release workflow's tag guard fails when a platform pin drifts from the packaged version", () => {
-  const checkout = syntheticCheckout({
-    name: "@stephen-golban/brigadier",
-    version: "1.2.3",
-    optionalDependencies: {
-      "@stephen-golban/brigadier-darwin-arm64": "1.2.3",
-      "@stephen-golban/brigadier-darwin-x64": "1.2.2",
-      "@stephen-golban/brigadier-linux-arm64": "1.2.3",
-    },
-  });
+test("the release workflow creates and uploads a checksum manifest for every artifact", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const checksumsIndex = workflow.indexOf(`- name: ${CHECKSUMS_STEP_NAME}`);
+  const releaseIndex = workflow.indexOf(`- name: ${CREATE_RELEASE_STEP_NAME}`);
 
-  try {
-    const result = runGuardStep({ cwd: checkout, tagName: "v1.2.3" });
-
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe(
-      "verify-tag-version: optionalDependencies must pin every platform package to 1.2.3: " +
-        "@stephen-golban/brigadier-darwin-x64 is pinned to 1.2.2, " +
-        "@stephen-golban/brigadier-linux-x64 is not pinned\n",
-    );
-  } finally {
-    rmSync(checkout, { recursive: true, force: true });
-  }
+  expect(checksumsIndex).toBeGreaterThan(-1);
+  expect(releaseIndex).toBeGreaterThan(checksumsIndex);
+  expect(extractStepRun(workflow, CHECKSUMS_STEP_NAME)).toBe(
+    [
+      "cd release-packages",
+      "shopt -s nullglob",
+      "release_assets=(*.tar.gz *.tar.gz.sha256 *.dmg)",
+      `if (( \${#release_assets[@]} == 0 )); then`,
+      '  echo "No release artifacts were downloaded" >&2',
+      "  exit 1",
+      "fi",
+      `shasum -a 256 "\${release_assets[@]}" > checksums.txt`,
+    ].join("\n"),
+  );
+  expect(extractStepRun(workflow, CREATE_RELEASE_STEP_NAME)).toContain(
+    "release-packages/checksums.txt",
+  );
 });
 
-test("the release workflow's tag guard passes when every platform pin moves with the version", () => {
-  const checkout = syntheticCheckout({
-    name: "@stephen-golban/brigadier",
-    version: "1.2.3",
-    optionalDependencies: {
-      "@stephen-golban/brigadier-darwin-arm64": "1.2.3",
-      "@stephen-golban/brigadier-darwin-x64": "1.2.3",
-      "@stephen-golban/brigadier-linux-arm64": "1.2.3",
-      "@stephen-golban/brigadier-linux-x64": "1.2.3",
-    },
-  });
+test("the release workflow bumps the Homebrew formula from real artifact checksums", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const releaseIndex = workflow.indexOf(`- name: ${CREATE_RELEASE_STEP_NAME}`);
+  const formulaIndex = workflow.indexOf(`- name: ${FORMULA_STEP_NAME}`);
 
-  try {
-    const result = runGuardStep({ cwd: checkout, tagName: "v1.2.3" });
+  expect(releaseIndex).toBeGreaterThan(-1);
+  expect(formulaIndex).toBeGreaterThan(releaseIndex);
+  expect(extractStepRun(workflow, FORMULA_STEP_NAME)).toBe(
+    [
+      `version="\${GITHUB_REF_NAME#v}"`,
+      `bun ./scripts/update-homebrew-formula.ts "\${version}" ./release-packages`,
+      'git config user.name "github-actions[bot]"',
+      'git config user.email "41898282+github-actions[bot]@users.noreply.github.com"',
+      "git add Formula/brigadier.rb",
+      `git commit -m "Update Homebrew formula to \${GITHUB_REF_NAME}"`,
+      `git push origin "HEAD:\${{ github.event.repository.default_branch }}"`,
+    ].join("\n"),
+  );
+});
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("");
-  } finally {
-    rmSync(checkout, { recursive: true, force: true });
-  }
+test("the release workflow contains no npm packaging or publication jobs", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+
+  expect(workflow).not.toContain("package-root:");
+  expect(workflow).not.toContain("publish-npm:");
+  expect(workflow).not.toContain("npm pack");
+  expect(workflow).not.toContain("npm publish");
+  expect(workflow).not.toContain("assemble-platform-package.ts");
 });
 
 test("the workflow step reader recovers a block-scalar run: body verbatim", () => {
@@ -418,27 +419,6 @@ test("a step that streams without stopping is killed by the output cap", () => {
   expect(result.exitCode).toBe(null);
   expect(result.exitedDueToTimeout).toBe(false);
 });
-
-/**
- * A throwaway checkout carrying only what the guard reads: a package.json, and
- * the real guard script at the path the workflow names. The script is symlinked
- * rather than copied so these cases exercise the same bytes CI runs.
- */
-function syntheticCheckout(manifest: unknown): string {
-  const directory = mkdtempSync(
-    join(tmpdir(), "brigadier-release-guard-repo-"),
-  );
-  writeFileSync(
-    join(directory, "package.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-  );
-  mkdirSync(join(directory, "scripts"));
-  symlinkSync(
-    join(repositoryRoot, "scripts", "verify-tag-version.sh"),
-    join(directory, "scripts", "verify-tag-version.sh"),
-  );
-  return directory;
-}
 
 function extractStepRun(workflow: string, stepName: string): string {
   const lines = workflow.split("\n");

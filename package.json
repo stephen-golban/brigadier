@@ -1,6 +1,7 @@
 {
   "name": "@stephen-golban/brigadier",
   "version": "0.1.1",
+  "private": true,
   "description": "Orchestrate AI coding work from the command line",
   "repository": {
     "type": "git",
@@ -12,10 +13,6 @@
   },
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "brigadier": "./bin/brigadier.js",
-    "brigadier-mcp": "./bin/brigadier-mcp.js"
-  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -29,13 +26,8 @@
     }
   },
   "files": [
-    "bin",
-    "dist",
-    "scripts/postinstall.mjs"
+    "dist"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "bun run build:dist && bun run build:mcp && bun run build:binary && bun run build:codesign",
     "build:binary": "bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier",
@@ -45,16 +37,8 @@
     "build:unsigned": "bun run build:dist && bun run build:binary",
     "check": "biome check .",
     "format": "biome format --write .",
-    "postinstall": "node scripts/postinstall.mjs",
-    "prepack": "bun run build",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
-  },
-  "optionalDependencies": {
-    "@stephen-golban/brigadier-darwin-arm64": "0.1.1",
-    "@stephen-golban/brigadier-darwin-x64": "0.1.1",
-    "@stephen-golban/brigadier-linux-arm64": "0.1.1",
-    "@stephen-golban/brigadier-linux-x64": "0.1.1"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

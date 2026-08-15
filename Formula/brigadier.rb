@@ -4,8 +4,8 @@ class Brigadier < Formula
   version "0.0.0"
   license "MIT"
 
-  # Update this release template with scripts/update-homebrew-formula.ts before
-  # publishing a release. GitHub has not published an archive yet.
+  # The release workflow replaces this template with the checksums from its
+  # built archives. GitHub has not published an archive yet.
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/stephen-golban/brigadier/releases/download/v0.0.0/brigadier-0.0.0-darwin-arm64.tar.gz"

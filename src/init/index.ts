@@ -13,8 +13,8 @@
  * home directory involved.
  *
  * The CLI dispatch lives here rather than in `src/cli.ts` because `src/cli.ts`
- * must stay a side-effecting executable shim: `bin/brigadier.js` runs it with a
- * bare `import`, so it cannot also be an importable module for tests.
+ * must stay the compiled binary's side-effecting executable entry point, so it
+ * cannot also be an importable module for tests.
  */
 
 import { readFile } from "node:fs/promises";

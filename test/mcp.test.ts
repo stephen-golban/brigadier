@@ -201,7 +201,7 @@ function scratchEnv(scratchHome: string): Record<string, string> {
 /* ------------------------------------------------------------------------ */
 
 /**
- * The real exported entry, exactly as `bin/brigadier-mcp.js` will call it.
+ * The real exported entry used by the compiled binary's `mcp` subcommand.
  *
  * Nothing is faked here. `brigadier_run` reaches the real supervisor path, and
  * the test keeps it bounded by pointing `$BRIGADIER_HOME` at an empty directory:
@@ -967,8 +967,8 @@ describe("the MCP server over stdio", () => {
       const lines = responses(session);
       expect(lines.length).toBe(4);
 
-      // The entry point `bin/brigadier-mcp.js` will call, with no injection at
-      // all, reporting the version out of package.json.
+      // The server entry point used by the compiled binary's `mcp` subcommand,
+      // called here with no injection, reports the version out of package.json.
       expect(lines[0]).toBe(
         '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );
