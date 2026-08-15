@@ -110,11 +110,46 @@ test("every host is detected by its ordered path fallback", async () => {
     "claude-desktop",
   ]);
   expect(detections.every((entry) => entry.present)).toBe(true);
-  expect(
-    detections.every(
-      (entry) => entry.evidenceKind === "directory" && entry.evidence !== null,
-    ),
-  ).toBe(true);
+  for (const host of ["claude-code", "codex", "opencode"] as const) {
+    expect(detection(detections, host).evidenceKind).toBe("file");
+  }
+  for (const host of [
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "claude-desktop",
+  ] as const) {
+    expect(detection(detections, host).evidenceKind).toBe("directory");
+  }
+});
+
+test("a marker path must be a file and reports file evidence", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "brigadier-host-marker-"));
+  const marker = join(scratch, ".codex", "config.toml");
+  try {
+    await mkdir(marker, { recursive: true });
+
+    const withDirectory = await detectHosts({ HOME: scratch, PATH: "" });
+    expect(detection(withDirectory, "codex")).toEqual({
+      host: "codex",
+      present: false,
+      evidence: null,
+      evidenceKind: null,
+    });
+
+    await rm(marker, { recursive: true });
+    await writeFile(marker, 'model = "gpt-5.6-sol"\n');
+
+    const withFile = await detectHosts({ HOME: scratch, PATH: "" });
+    expect(detection(withFile, "codex")).toEqual({
+      host: "codex",
+      present: true,
+      evidence: marker,
+      evidenceKind: "file",
+    });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });
 
 test("absent hosts have null evidence and shared agents skills prove nothing", async () => {
@@ -225,7 +260,7 @@ test("a missing override remains additive with the home fallback", async () => {
     host: "claude-code",
     present: true,
     evidence: "/machine/home/.claude/settings.json",
-    evidenceKind: "directory",
+    evidenceKind: "file",
   });
 });
 
@@ -253,7 +288,7 @@ test("permission errors are not presence and do not hide later evidence", async 
     host: "claude-code",
     present: true,
     evidence: "/machine/home/.claude/settings.json",
-    evidenceKind: "directory",
+    evidenceKind: "file",
   });
   expect(detection(detections, "codex").present).toBe(false);
 });

@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -128,5 +136,52 @@ main "$@"`,
     expect(stderr).toContain("brigadier setup did not finish");
   } finally {
     await rm(installDirectory, { recursive: true, force: true });
+  }
+});
+
+test("installer replaces a destination symlink without writing through it", async () => {
+  const source = await readFile(join(root, "install.sh"), "utf8");
+  const scratch = await mkdtemp(join(tmpdir(), "brigadier-installer-link-"));
+  const installDirectory = join(scratch, "bin");
+  const target = join(scratch, "package-manager-brigadier");
+  const destination = join(installDirectory, "brigadier");
+  const targetContents = "package-manager-owned\n";
+  const script = source
+    .replace(
+      "if [ -e /dev/tty ] && (: </dev/tty) 2>/dev/null; then",
+      "if false; then",
+    )
+    .replace(
+      'main "$@"',
+      `download() { :; }
+verify_checksum() { :; }
+tar() {
+  printf '%s\\n' '#!/bin/sh' 'case "$1" in' '--version) printf "%s\\n" "0.0.0" ;;' 'esac' > "$temporary_directory/brigadier"
+}
+main "$@"`,
+    );
+
+  try {
+    await mkdir(installDirectory);
+    await writeFile(target, targetContents);
+    await symlink(target, destination);
+
+    const child = Bun.spawn(["sh", "-c", script], {
+      env: {
+        ...process.env,
+        BRIGADIER_INSTALL_DIR: installDirectory,
+        BRIGADIER_VERSION: "0.0.0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+
+    expect(await child.exited, stderr).toBe(0);
+    expect(await readFile(target, "utf8")).toBe(targetContents);
+    expect((await lstat(destination)).isSymbolicLink()).toBe(false);
+    expect(await readFile(destination, "utf8")).toContain("#!/bin/sh");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
   }
 });

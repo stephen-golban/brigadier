@@ -16,7 +16,7 @@ export {
 } from "./contracts.js";
 export type { EnsureConfigOptions, EnsureConfigResult } from "./ensure.js";
 export { detectGuiHosts, ensureConfig } from "./ensure.js";
-export type { ConfigEnvironment, ConfigIo } from "./store.js";
+export type { ConfigEnvironment, ConfigIo, PathKind } from "./store.js";
 export {
   CONFIG_FILE_NAME,
   CONFIG_HOME_VARIABLE,
