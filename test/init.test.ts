@@ -23,6 +23,7 @@ import {
   parseConfig,
   readConfig,
   resolveConfigPath,
+  serializeConfig,
   writeConfig,
 } from "../src/config/index.ts";
 import { nodeConfigIo } from "../src/config/store.ts";
@@ -2027,7 +2028,64 @@ describe("host selection", () => {
     });
   });
 
-  test("installs after the config is written, so it sees this run's yes", async () => {
+  test("installs from the config snapshot returned by the write, not a replacement file", async () => {
+    await withScratchHome(async (scratchHome) => {
+      await mkdir(join(scratchHome, ".cursor"), { recursive: true });
+      const configPath = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const baseIo = markerIo(scratchHome, ["cursor"]);
+      const configReads: string[] = [];
+      const replacement = parseConfig({
+        ...BOTH_VENDORS_LITERAL,
+        enabledHosts: ["cursor"],
+        guiRegistrationConsent: true,
+      });
+      const io: ConfigIo = {
+        ...baseIo,
+        readFile: async (path) => {
+          configReads.push(path);
+          return baseIo.readFile(path);
+        },
+        rename: async (from, to) => {
+          await baseIo.rename(from, to);
+          if (to === configPath) {
+            // Deterministically replace the file after init publishes its
+            // consent=false config but before writeConfig returns to runInit.
+            await writeFile(to, serializeConfig(replacement), "utf8");
+          }
+        },
+      };
+      const stdout = collector();
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, GUI consent NO, secrets, cursor YES
+        stdin: scriptedInput(["", "", "", "n", "n", "y"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      // Init's injected store performed its one pre-write read. The installer
+      // did not ask that store for config again after the write.
+      expect(configReads).toEqual([configPath]);
+      expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual(
+        replacement,
+      );
+      // The replacement file says yes. Only the exact parsed value returned by
+      // writeConfig says no, so this skipped registration proves which value
+      // the installer used.
+      expect(existsSync(join(scratchHome, ".cursor/mcp.json"))).toBe(false);
+      expect(stdout.text()).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+    });
+  });
+
+  test("installs from the handed-over snapshot when this run records yes", async () => {
     await withScratchHome(async (scratchHome) => {
       await mkdir(join(scratchHome, ".cursor"), { recursive: true });
       const io = markerIo(scratchHome, ["cursor"]);
@@ -2045,8 +2103,8 @@ describe("host selection", () => {
       });
 
       expect(code).toBe(0);
-      // There was no consent on disk before this run. The registration exists
-      // only because the installer read the config written moments earlier.
+      // There was no consent before this run. The registration exists because
+      // the exact config returned by this run's write carried consent.
       const registration = JSON.parse(
         await readFile(join(scratchHome, ".cursor/mcp.json"), "utf8"),
       ) as { mcpServers: { brigadier: { args: readonly string[] } } };

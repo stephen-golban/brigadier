@@ -304,6 +304,11 @@ export interface InstallIo {
   readonly stdout: OutputStream;
   readonly stderr: OutputStream;
   readonly fs?: SurfaceIo;
+  /**
+   * The parsed config a caller already persisted. When present, installation
+   * derives every config-backed decision from it and does not read config.json.
+   */
+  readonly configSnapshot?: ParsedBrigadierConfig;
   /** Optional so existing callers use real host detection without changing. */
   readonly detectHosts?: (
     environment: ConfigEnvironment,
@@ -704,14 +709,21 @@ export async function runInstall(
     return 1;
   }
 
-  // ONE READ, ONE SNAPSHOT, FOR THE WHOLE INSTALL. The config used to be read
-  // twice — once for `enabledHosts` and again for `guiRegistrationConsent` —
-  // and `writeConfig` renames over the file, which `brigadier init` does. Two
-  // reads could therefore see two different files: the first enabling cursor
-  // while withholding consent, the second granting consent while dropping
-  // cursor, and the installer registering Cursor's MCP server although neither
-  // complete file authorized it. Everything below derives from this one value.
-  const snapshot = await readConfigSnapshot(io.env);
+  // ONE VALUE, ONE SNAPSHOT, FOR THE WHOLE INSTALL. A caller that has just
+  // persisted a parsed config can hand that exact value over; every other
+  // caller keeps the existing single read. The config used to be read twice —
+  // once for `enabledHosts` and again for `guiRegistrationConsent` — and
+  // `writeConfig` renames over the file, which `brigadier init` does. Multiple
+  // reads could assemble authorization from two different files. Everything
+  // below derives from this one value.
+  const snapshot: ConfigSnapshot =
+    io.configSnapshot === undefined
+      ? await readConfigSnapshot(io.env)
+      : {
+          kind: "ok",
+          path: resolveConfigPath(io.env),
+          config: io.configSnapshot,
+        };
 
   let candidates: readonly SurfaceHost[];
   if (parsed.selection === "enabled") {
@@ -943,7 +955,7 @@ export async function runInstall(
 }
 
 /**
- * The one config `runInstall` reads, and everything it could not read.
+ * The one config snapshot `runInstall` uses, and everything it could not read.
  *
  * The three arms exist because the two readers below hold two different
  * policies about failure, and collapsing them into one would be a regression
