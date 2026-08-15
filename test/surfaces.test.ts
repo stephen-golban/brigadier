@@ -34,9 +34,20 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { HostDetection } from "../src/config/ensure.ts";
 import { createTools } from "../src/mcp/tools.ts";
-import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
-import { nodeSurfaceIo, runInstall, sha256 } from "../src/surfaces/install.ts";
+import type {
+  InstallIo,
+  SurfaceHost,
+  SurfaceIo,
+} from "../src/surfaces/install.ts";
+import {
+  nodeSurfaceIo,
+  parseArguments,
+  runInstall,
+  SURFACE_HOSTS,
+  sha256,
+} from "../src/surfaces/install.ts";
 import { SURFACE_TEMPLATES } from "../src/surfaces/templates.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -173,6 +184,7 @@ async function install(
   argv: readonly string[],
   env: Record<string, string | undefined>,
   fs?: SurfaceIo,
+  detectedHosts: readonly SurfaceHost[] = detectedHostsFor(argv),
 ): Promise<Collected> {
   let stdout = "";
   let stderr = "";
@@ -188,6 +200,7 @@ async function install(
         stderr += chunk;
       },
     },
+    detectHosts: () => Promise.resolve(hostDetections(env, detectedHosts)),
     ...(fs === undefined ? {} : { fs }),
   };
   const code = await runInstall(argv, io);
@@ -202,12 +215,13 @@ async function installWithin(
   argv: readonly string[],
   env: Record<string, string | undefined>,
   fs?: SurfaceIo,
+  detectedHosts: readonly SurfaceHost[] = detectedHostsFor(argv),
 ): Promise<BoundedInstall> {
   const started = Date.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const result = await Promise.race([
-      install(argv, env, fs),
+      install(argv, env, fs, detectedHosts),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("install exceeded 5,000 ms")),
@@ -221,6 +235,33 @@ async function installWithin(
       clearTimeout(timer);
     }
   }
+}
+
+function detectedHostsFor(argv: readonly string[]): readonly SurfaceHost[] {
+  if (argv.includes("--all")) {
+    return SURFACE_HOSTS;
+  }
+  return argv.filter((argument): argument is SurfaceHost =>
+    (SURFACE_HOSTS as readonly string[]).includes(argument),
+  );
+}
+
+function hostDetections(
+  env: Record<string, string | undefined>,
+  detectedHosts: readonly SurfaceHost[],
+): readonly HostDetection[] {
+  const detected = new Set(detectedHosts);
+  const evidenceRoot = env.HOME ?? "/test-home";
+  return SURFACE_HOSTS.map((host) =>
+    detected.has(host)
+      ? {
+          host,
+          present: true,
+          evidence: resolve(evidenceRoot, ".host-detection", host),
+          evidenceKind: "file",
+        }
+      : { host, present: false, evidence: null, evidenceKind: null },
+  );
 }
 
 function outcomeDetail(stdout: string, path: string): string {
@@ -268,7 +309,10 @@ function verdictLines(stdout: string): readonly string[] {
 }
 
 /** A complete, valid config whose only interesting field is the consent. */
-function configBytes(guiRegistrationConsent: boolean): string {
+function configBytes(
+  guiRegistrationConsent: boolean,
+  enabledHosts?: readonly SurfaceHost[],
+): string {
   return `${JSON.stringify(
     {
       version: 3,
@@ -283,6 +327,7 @@ function configBytes(guiRegistrationConsent: boolean): string {
       ],
       secretsConsent: false,
       linkedSecretPaths: [],
+      ...(enabledHosts === undefined ? {} : { enabledHosts }),
       guiRegistrationConsent,
       allowDegradedRouting: false,
     },
@@ -715,6 +760,280 @@ describe("the surface templates", () => {
 });
 
 describe("brigadier install", () => {
+  test("arguments preserve all, enabled, and explicit selection modes", () => {
+    expect(parseArguments([])).toEqual({
+      kind: "install",
+      selection: "enabled",
+      hosts: [],
+      dryRun: false,
+      force: false,
+    });
+    expect(parseArguments(["--all", "--force"])).toEqual({
+      kind: "install",
+      selection: "all",
+      hosts: [],
+      dryRun: false,
+      force: true,
+    });
+    expect(parseArguments(["codex", "--dry-run"])).toEqual({
+      kind: "install",
+      selection: "explicit",
+      hosts: ["codex"],
+      dryRun: true,
+      force: false,
+    });
+  });
+
+  test("--all installs only the three detected hosts and names the other four", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(["--all"], { HOME: home }, undefined, [
+        "claude-code",
+        "codex",
+        "opencode",
+      ]);
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(
+        result.stdout
+          .split("\n")
+          .filter((line) => line.includes("not detected on this machine")),
+      ).toEqual([
+        "  skipped    cursor (not detected on this machine)",
+        "  skipped    windsurf (not detected on this machine)",
+        "  skipped    antigravity (not detected on this machine)",
+        "  skipped    claude-desktop (not detected on this machine)",
+      ]);
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(true);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(true);
+      for (const path of guiRegistrationPaths(home)) {
+        expect(existsSync(path)).toBe(false);
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("--all with no detected hosts exits 1 and writes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(["--all"], { HOME: home }, undefined, []);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: no supported AI hosts were detected on this machine.\n",
+      );
+      expect(
+        result.stdout
+          .split("\n")
+          .filter((line) => line.includes("not detected on this machine")),
+      ).toHaveLength(7);
+      expect(readdirSync(home)).toEqual([]);
+
+      const forced = await install(
+        ["--all", "--force"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(forced.code).toBe(1);
+      expect(forced.stderr).toBe(result.stderr);
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install without recorded enabled hosts exits 1 and points to init", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install([], { HOME: home }, undefined, ["codex"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: no enabled hosts are recorded; run `brigadier init` to choose which detected hosts to install.\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install writes only the detected intersection of enabled hosts", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false, ["claude-code", "codex"]),
+        "utf8",
+      );
+
+      const result = await install([], { HOME: home }, undefined, [
+        "claude-code",
+        "opencode",
+      ]);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine)\n",
+      );
+      expect(result.stdout).not.toContain("brigadier install opencode");
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(false);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install names enabled hosts when none are currently detected", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false, ["codex", "cursor"]),
+        "utf8",
+      );
+
+      const result = await install([], { HOME: home }, undefined, ["opencode"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: none of the enabled hosts are currently detected: codex, cursor.\n",
+      );
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine)\n",
+      );
+      expect(result.stdout).toContain(
+        "  skipped    cursor (not detected on this machine)\n",
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(false);
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+
+      const forced = await install(["--force"], { HOME: home }, undefined, [
+        "opencode",
+      ]);
+      expect(forced.code).toBe(1);
+      expect(forced.stderr).toBe(result.stderr);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a named undetected host is skipped unless --force overrides presence", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const skipped = await install(
+        ["claude-code"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(skipped.code).toBe(0);
+      expect(skipped.stdout).toContain(
+        "  skipped    claude-code (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+
+      const forced = await install(
+        ["claude-code", "--force"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(forced.code).toBe(0);
+      expect(forced.stdout).not.toContain("not detected");
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("GUI presence and registration consent are independent gates", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false),
+        "utf8",
+      );
+
+      const detectedWithoutConsent = await install(
+        ["cursor"],
+        { HOME: home },
+        undefined,
+        ["cursor"],
+      );
+      expect(detectedWithoutConsent.stdout).toContain(
+        "Nothing else, including --force, grants it.",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+      const consentWithoutDetection = await install(
+        ["cursor"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(consentWithoutDetection.stdout).toContain(
+        "  skipped    cursor (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(consentWithoutDetection.stdout).not.toContain(
+        "Nothing else, including --force, grants it.",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("--dry-run reports presence gating and writes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(
+        ["claude-code", "codex", "--dry-run"],
+        { HOME: home },
+        undefined,
+        ["claude-code"],
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(result.stdout).toContain(
+        "dry run: 6 written, 0 unchanged, 1 skipped, 0 refused.\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test("--all --dry-run names every destination and writes nothing", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
@@ -1588,17 +1907,22 @@ describe("brigadier install", () => {
         "utf8",
       );
 
-      const result = await install(["cursor", "windsurf"], {
-        HOME: home,
-        BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
-      });
+      const result = await install(
+        ["cursor", "windsurf"],
+        {
+          HOME: home,
+          BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
+        },
+        undefined,
+        ["cursor"],
+      );
       expect(result.code).toBe(0);
       expect(verdictLines(result.stdout)).toEqual([
+        "  skipped    windsurf (not detected on this machine; re-run with --force to install it anyway)",
         `  created    ${home}/.cursor/mcp.json`,
-        `  skipped    ${home}/.codeium/windsurf/mcp_config.json`,
       ]);
       expect(result.stdout).toContain(
-        `${home}/.codeium/windsurf does not exist, so this host is not installed on this machine. brigadier does not create another product's configuration directory.`,
+        "windsurf (not detected on this machine; re-run with --force to install it anyway)",
       );
       expect(existsSync(join(home, ".codeium"))).toBe(false);
     } finally {
@@ -1699,19 +2023,13 @@ describe("brigadier install", () => {
     }
   });
 
-  test("usage errors exit 2 and help exits 0", async () => {
+  test("unknown arguments exit 2 and help exits 0", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
       const unknown = await install(["emacs"], { HOME: home });
       expect(unknown.code).toBe(2);
       expect(unknown.stderr.split("\n")[0]).toBe(
         'brigadier install: unknown host "emacs"; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop',
-      );
-
-      const none = await install([], { HOME: home });
-      expect(none.code).toBe(2);
-      expect(none.stderr.split("\n")[0]).toBe(
-        "brigadier install: name at least one host, or pass --all; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop",
       );
 
       const badOption = await install(["--frobnicate"], { HOME: home });
@@ -1724,7 +2042,7 @@ describe("brigadier install", () => {
       expect(help.code).toBe(0);
       expect(help.stderr).toBe("");
       expect(help.stdout.split("\n")[0]).toBe(
-        "Usage: brigadier install <host>... [options]",
+        "Usage: brigadier install [<host>...] [options]",
       );
     } finally {
       await rm(home, { recursive: true, force: true });

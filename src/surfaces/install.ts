@@ -42,6 +42,8 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, sep } from "node:path";
+import type { HostDetection } from "../config/ensure.js";
+import { detectHosts } from "../config/ensure.js";
 import type { ConfigEnvironment } from "../config/store.js";
 import {
   readConfig,
@@ -301,6 +303,10 @@ export interface InstallIo {
   readonly stdout: OutputStream;
   readonly stderr: OutputStream;
   readonly fs?: SurfaceIo;
+  /** Optional so existing callers use real host detection without changing. */
+  readonly detectHosts?: (
+    environment: ConfigEnvironment,
+  ) => Promise<readonly HostDetection[]>;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -613,7 +619,10 @@ const HOST_PLANS: readonly HostPlan[] = [
 /* The command                                                               */
 /* ------------------------------------------------------------------------ */
 
-const USAGE = `Usage: brigadier install <host>... [options]
+const USAGE = `Usage: brigadier install [<host>...] [options]
+
+With no host names, installs the hosts selected by \`brigadier init\` that are
+currently detected on this machine.
 
 Hosts that read a skill directory:
   claude-code      a skill at ~/.claude/skills/brigadier, auto-loading as a plugin
@@ -630,12 +639,13 @@ skipped unless guiRegistrationConsent is recorded in your brigadier config:
                    plus an .mcpb bundle staged at ~/.brigadier/surfaces/claude-desktop
 
 Options:
-      --all        install every host above
+      --all        install every host above that is currently detected
       --dry-run    report what would be written and write nothing
       --force      replace a file that brigadier did not write, or that was
                    edited after brigadier wrote it (written with mode 0644 or
-                   0755, not the replaced file's mode). It does not grant
-                   registration consent, and nothing here does.
+                   0755, not the replaced file's mode). For explicitly named
+                   hosts only, it also overrides failed host detection. It does
+                   not grant registration consent, and nothing here does.
   -h, --help       print this message
 
 Environment:
@@ -693,6 +703,77 @@ export async function runInstall(
     return 1;
   }
 
+  let candidates: readonly SurfaceHost[];
+  if (parsed.selection === "enabled") {
+    let enabledHosts: readonly SurfaceHost[];
+    try {
+      const config = await readConfig(resolveConfigPath(io.env));
+      enabledHosts = (config?.enabledHosts ?? []).filter(isHost);
+    } catch (error) {
+      io.stderr.write(
+        `brigadier install: could not read enabled hosts from ${resolveConfigPath(io.env)}: ${describe(error)}. Run \`brigadier init\` to record them again.\n`,
+      );
+      return 1;
+    }
+    if (enabledHosts.length === 0) {
+      io.stderr.write(
+        "brigadier install: no enabled hosts are recorded; run `brigadier init` to choose which detected hosts to install.\n",
+      );
+      return 1;
+    }
+    candidates = enabledHosts;
+  } else if (parsed.selection === "all") {
+    candidates = SURFACE_HOSTS;
+  } else {
+    candidates = parsed.hosts;
+  }
+
+  let detections: readonly HostDetection[];
+  try {
+    detections = await (io.detectHosts ?? detectHosts)(io.env);
+  } catch (error) {
+    io.stderr.write(
+      `brigadier install: could not detect installed hosts: ${describe(error)}\n`,
+    );
+    return 1;
+  }
+  const present = new Set(
+    detections.filter((entry) => entry.present).map((entry) => entry.host),
+  );
+  const forcePresence = parsed.selection === "explicit" && parsed.force;
+  const hosts = candidates.filter((host) => present.has(host) || forcePresence);
+  const undetected = candidates.filter(
+    (host) => !present.has(host) && !forcePresence,
+  );
+  for (const host of undetected) {
+    const forceHint =
+      parsed.selection === "explicit" && !parsed.force
+        ? "; re-run with --force to install it anyway"
+        : "";
+    io.stdout.write(
+      `  skipped    ${host} (not detected on this machine${forceHint})\n`,
+    );
+  }
+
+  if (hosts.length === 0) {
+    io.stdout.write(
+      `\n${parsed.dryRun ? "dry run: " : ""}0 written, 0 unchanged, ${undetected.length} skipped, 0 refused.\n`,
+    );
+    if (parsed.selection === "all") {
+      io.stderr.write(
+        "brigadier install: no supported AI hosts were detected on this machine.\n",
+      );
+      return 1;
+    }
+    if (parsed.selection === "enabled") {
+      io.stderr.write(
+        `brigadier install: none of the enabled hosts are currently detected: ${candidates.join(", ")}.\n`,
+      );
+      return 1;
+    }
+    return 0;
+  }
+
   const fs = io.fs ?? nodeSurfaceIo;
   const manifestPath = appendPath(roots.brigadierHome, MANIFEST_FILE_NAME);
   let manifest: ManifestRead;
@@ -721,7 +802,7 @@ export async function runInstall(
   const written = new Map(recorded);
 
   let codexHook: CodexHookPreparation | null = null;
-  if (parsed.hosts.includes("codex")) {
+  if (hosts.includes("codex")) {
     const prepared = await prepareCodexHookRegistration(fs, roots);
     if (!prepared.ok) {
       io.stderr.write(`brigadier install: ${prepared.message}\n`);
@@ -736,9 +817,9 @@ export async function runInstall(
   let refused = 0;
   let changed = 0;
   let unchanged = 0;
-  let skipped = 0;
+  let skipped = undetected.length;
 
-  for (const host of parsed.hosts) {
+  for (const host of hosts) {
     const plan = HOST_PLANS.find((candidate) => candidate.host === host);
     if (plan === undefined) {
       // Unreachable: `parseArguments` only yields members of SURFACE_HOSTS.
@@ -1691,6 +1772,7 @@ async function writeManifest(
 type Arguments =
   | {
       readonly kind: "install";
+      readonly selection: "all" | "enabled" | "explicit";
       readonly hosts: readonly SurfaceHost[];
       readonly dryRun: boolean;
       readonly force: boolean;
@@ -1739,15 +1821,24 @@ export function parseArguments(argv: readonly string[]): Arguments {
   }
 
   if (all) {
-    return { kind: "install", hosts: SURFACE_HOSTS, dryRun, force };
+    return {
+      kind: "install",
+      selection: "all",
+      hosts: [],
+      dryRun,
+      force,
+    };
   }
   if (hosts.length === 0) {
     return {
-      kind: "usage-error",
-      message: `brigadier install: name at least one host, or pass --all; known hosts are ${SURFACE_HOSTS.join(", ")}`,
+      kind: "install",
+      selection: "enabled",
+      hosts: [],
+      dryRun,
+      force,
     };
   }
-  return { kind: "install", hosts, dryRun, force };
+  return { kind: "install", selection: "explicit", hosts, dryRun, force };
 }
 
 function isHost(value: string): value is SurfaceHost {
