@@ -20,6 +20,11 @@
  *
  * The compiled binary's `mcp` subcommand calls `runMcpServer` below and does
  * nothing else with stdout.
+ *
+ * THIS FILE STARTS NOTHING. It only exports, so importing it — from the binary,
+ * from `dist/`, from a test — never touches the real stdin. The program Claude
+ * Desktop launches is `./entry.ts`, which calls `runMcpServer` and is built to
+ * `dist/mcp/server.js`.
  */
 
 import packageJson from "../../package.json";
