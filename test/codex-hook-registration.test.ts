@@ -11,8 +11,13 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { HostDetection } from "../src/config/ensure.ts";
 import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
-import { nodeSurfaceIo, runInstall } from "../src/surfaces/install.ts";
+import {
+  nodeSurfaceIo,
+  runInstall,
+  SURFACE_HOSTS,
+} from "../src/surfaces/install.ts";
 
 const OPERATION_BUDGET = 400;
 const CANARY_BYTES = "outside the install boundary\n";
@@ -111,11 +116,22 @@ async function installCodex(
 ): Promise<Collected> {
   let stdout = "";
   let stderr = "";
+  const detections: readonly HostDetection[] = SURFACE_HOSTS.map((host) =>
+    host === "codex"
+      ? {
+          host,
+          present: true,
+          evidence: join(harness.home, ".host-detection", host),
+          evidenceKind: "file",
+        }
+      : { host, present: false, evidence: null, evidenceKind: null },
+  );
   const io: InstallIo = {
     env: { HOME: harness.home },
     fs,
     stdout: { write: (chunk) => (stdout += chunk) },
     stderr: { write: (chunk) => (stderr += chunk) },
+    detectHosts: () => Promise.resolve(detections),
   };
   const code = await runInstall(argv, io);
   return { stdout, stderr, code };
