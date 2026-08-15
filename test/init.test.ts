@@ -1937,9 +1937,9 @@ describe("host selection", () => {
       expect(written?.enabledHosts).toEqual(["claude-code", "opencode"]);
 
       const transcript = stdout.text();
-      expect(transcript).toContain("brigadier install claude-code");
-      expect(transcript).toContain("brigadier install opencode");
-      expect(transcript).not.toContain("brigadier install codex");
+      expect(transcript).toContain("\nbrigadier install claude-code\n\n");
+      expect(transcript).toContain("\nbrigadier install opencode\n\n");
+      expect(transcript).not.toContain("\nbrigadier install codex\n\n");
 
       // The files, not just the transcript: the two chosen hosts got their
       // doctrine and the refused one got nothing.
