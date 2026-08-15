@@ -3,9 +3,9 @@
  *
  * It is THE setup step. Besides the model configuration it asks which of the AI
  * hosts detected on this machine to set brigadier up for, records that as
- * `enabledHosts`, and only then hands those hosts to `brigadier install` — in
- * that order, because the installer reads the config to decide what it is
- * allowed to write.
+ * `enabledHosts`, and only then hands those hosts and the persisted config to
+ * `brigadier install` — in that order, because the installer decides what it is
+ * allowed to write from the exact value the config writer accepted.
  *
  * The command takes its `Discoverer`, its environment, and its streams by
  * injection, so the whole flow runs against a fake report, a scripted stdin,
@@ -287,8 +287,9 @@ export async function runInit(options: InitOptions): Promise<number> {
     return 0;
   }
 
+  let writtenConfig: ParsedBrigadierConfig;
   try {
-    await writeConfig(configPath, config, options.io);
+    writtenConfig = await writeConfig(configPath, config, options.io);
   } catch (error) {
     stderr.write(
       `brigadier init: could not write config: ${describe(error)}\n`,
@@ -300,16 +301,17 @@ export async function runInit(options: InitOptions): Promise<number> {
   if (chosenHosts.length === 0) {
     return 0;
   }
-  // AFTER THE WRITE, NEVER BEFORE. The installer reads the recorded config to
-  // decide what it is allowed to do — GUI registration consent above all — so
-  // it must see the answers this run just collected rather than the previous
-  // run's. The chosen hosts are named explicitly instead of letting the
-  // installer re-derive them, and the detection pass is handed over intact so
-  // both halves agree about what is on this machine.
+  // AFTER THE WRITE, NEVER BEFORE. The installer receives the exact parsed
+  // value `writeConfig` returned, so GUI registration and every other
+  // config-backed decision use what this run persisted even if config.json is
+  // replaced before installation starts. The chosen hosts are named explicitly
+  // instead of letting the installer re-derive them, and the detection pass is
+  // handed over intact so both halves agree about what is on this machine.
   return runInstall([...chosenHosts], {
     env: options.env,
     stdout,
     stderr,
+    configSnapshot: writtenConfig,
     detectHosts: () => Promise.resolve(detections),
   });
 }

@@ -34,6 +34,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { parseConfig } from "../src/config/contracts.ts";
 import type { HostDetection } from "../src/config/ensure.ts";
 import { createTools } from "../src/mcp/tools.ts";
 import type {
@@ -860,6 +861,47 @@ describe("brigadier install", () => {
         "brigadier install: no enabled hosts are recorded; run `brigadier init` to choose which detected hosts to install.\n",
       );
       expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a provided config snapshot bypasses the on-disk config read", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        "{ unreadable if consulted",
+        "utf8",
+      );
+      let stdout = "";
+      let stderr = "";
+      const code = await runInstall([], {
+        env: { HOME: home },
+        stdout: {
+          write: (chunk) => {
+            stdout += chunk;
+          },
+        },
+        stderr: {
+          write: (chunk) => {
+            stderr += chunk;
+          },
+        },
+        configSnapshot: parseConfig(JSON.parse(configBytes(false, ["cursor"]))),
+        detectHosts: (environment) =>
+          Promise.resolve(hostDetections(environment, ["cursor"])),
+      });
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("brigadier install cursor");
+      expect(stdout).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
