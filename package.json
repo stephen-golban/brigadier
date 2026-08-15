@@ -33,7 +33,7 @@
     "build:binary": "bun build ./src/cli.ts --compile --bytecode --minify --sourcemap --outfile ./brigadier",
     "build:codesign": "codesign --force --sign - ./brigadier && codesign -v --strict ./brigadier",
     "build:dist": "bun build ./src/index.ts ./src/contracts.ts ./src/cli.ts --target=node --minify --sourcemap --outdir ./dist && tsc --project ./tsconfig.build.json",
-    "build:mcp": "mkdir -p ./dist/mcp && bun build ./src/mcp/entry.ts --target=node --minify --sourcemap --outfile ./dist/mcp/server.js",
+    "build:mcp": "bun build ./src/mcp/bundle/server.ts --target=node --minify --sourcemap --outdir ./dist/mcp",
     "build:unsigned": "bun run build:dist && bun run build:binary",
     "check": "biome check .",
     "format": "biome format --write .",

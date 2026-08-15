@@ -60,14 +60,12 @@ test("build:mcp writes only the distribution bundle and the package build includ
   expect(existsSync(sourceBundle)).toBe(false);
   expect(existsSync(sourceMap)).toBe(false);
   expect(existsSync(distributionBundle)).toBe(true);
-  // THE ENTRY IS `entry.ts` AND THE OUTPUT IS STILL `server.js`. `--outfile`
-  // rather than `--outdir`, because the file Desktop launches has to be a
-  // program and the path it is launched from is named by a manifest and a README
-  // that are not ours to change. `mkdir -p` first so the very first build in a
-  // fresh checkout, where no `dist/` exists yet, does not depend on how `bun
-  // build --outfile` treats a missing parent directory.
+  // THE ENTRY IS `bundle/server.ts` AND THE OUTPUT IS STILL `server.js`.
+  // `--outdir` is required here: Bun 1.3.14 writes beside the entry when
+  // `--outfile` and `--sourcemap` are combined. Keeping the entry basename
+  // `server.ts` makes the output path named by the manifest and README natural.
   expect(packageJson.scripts["build:mcp"]).toBe(
-    "mkdir -p ./dist/mcp && bun build ./src/mcp/entry.ts --target=node --minify --sourcemap --outfile ./dist/mcp/server.js",
+    "bun build ./src/mcp/bundle/server.ts --target=node --minify --sourcemap --outdir ./dist/mcp",
   );
   expect(packageJson.scripts.build).toBe(
     "bun run build:dist && bun run build:mcp && bun run build:binary && bun run build:codesign",
