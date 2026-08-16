@@ -69,7 +69,7 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+    sha256: "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
     bytes: 5480,
   },
   "claude-code/hooks/README.md": {
@@ -93,11 +93,11 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3722,
   },
   "claude-desktop/manifest.json": {
-    sha256: "5ee29923ff3dae4d32960611ac9835c7bb6e1da1526e44551335c69e12bdff3f",
+    sha256: "7e5ee646c0257185887731d9324f6d8316cc28a2c2e08b6140a4e16f56142af2",
     bytes: 2873,
   },
   "codex/AGENTS.md": {
-    sha256: "5e7e861ee00bee3015160c018e6da36f466038f8e40058ba99f22cfad3dd917a",
+    sha256: "770215deaa9f0d80069c9c7ddab1953b3b308bbe55b4f9777c36c14a1813d273",
     bytes: 4576,
   },
   "codex/hooks/README.md": {
@@ -109,7 +109,7 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 5445,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+    sha256: "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
     bytes: 5480,
   },
   "opencode/README.md": {
@@ -1313,7 +1313,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+        "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -1341,7 +1341,7 @@ describe("brigadier install", () => {
         `${skill}/hooks/nudge.mjs`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+        "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
       );
     } finally {
       await rm(home, { recursive: true, force: true });
