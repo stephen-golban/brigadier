@@ -540,12 +540,16 @@ install directory is absent from `PATH`. Finally, it hands `brigadier init` to
 digests because no release exists. This is the second install path and will work
 only after the first release workflow fills the formula from real artifacts:
 
+Homebrew 6 requires third-party taps to be trusted before it will load their
+formulae.
+
 ```sh
 brew tap stephen-golban/tap
+brew trust stephen-golban/tap
 brew install brigadier
 ```
 
-After the release and formula commit both exist, run both commands on clean
+After the release and formula commit both exist, run all three commands on clean
 machines for every supported operating-system and architecture pair. Confirm
 `brigadier --version` prints `VERSION`, then run `brigadier init` and exercise a
 real host installation.
