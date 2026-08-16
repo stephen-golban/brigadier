@@ -38,8 +38,13 @@ questions can still be answered when the installer is run through a pipe.
 
 The Homebrew path is:
 
+Homebrew 6 requires third-party taps to be trusted before it will load their
+formulae.
+
 ```sh
-brew install stephen-golban/tap/brigadier
+brew tap stephen-golban/tap
+brew trust stephen-golban/tap
+brew install brigadier
 ```
 
 **This command does not work yet: no GitHub release has been cut, and the
@@ -288,8 +293,9 @@ first verifies that the tag matches the package version, then builds compiled
 binaries for `darwin-arm64`, `darwin-x64`, `linux-arm64`, and `linux-x64`.
 The macOS binaries are signed and notarized. The release contains one `.tar.gz`
 archive and one `.sha256` file per platform, a combined `checksums.txt`, and a
-`.dmg` for macOS. After the release is created, the workflow updates
-`Formula/brigadier.rb` with the real artifacts and pushes that change.
+`.dmg` for macOS. After the release is created, the workflow checks out
+`stephen-golban/homebrew-tap`, updates its `Formula/brigadier.rb` with the real
+artifacts, then pushes that change using `HOMEBREW_TAP_TOKEN`.
 
 Until the first release exists, the release installer has no archive to
 download and the Homebrew formula's digests must remain placeholders.

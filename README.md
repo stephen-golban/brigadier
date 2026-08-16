@@ -43,8 +43,13 @@ still work when the script is piped from `curl`.
 
 Homebrew will also be available from the first release:
 
+Homebrew 6 requires third-party taps to be trusted before it will load their
+formulae.
+
 ```sh
-brew install stephen-golban/tap/brigadier
+brew tap stephen-golban/tap
+brew trust stephen-golban/tap
+brew install brigadier
 ```
 
 **This command does not work yet: no GitHub release has been cut, and the
