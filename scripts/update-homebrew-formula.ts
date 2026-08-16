@@ -36,12 +36,14 @@ export function rewriteFormula(
   formula: string,
   version: string,
   checksums: Record<(typeof platforms)[number], string>,
+  formulaPath = "Formula/brigadier.rb",
 ) {
   let updatedFormula = replaceExactlyOnce(
     formula,
     /^ {2}version "[^"]+"$/m,
     `  version "${version}"`,
     "formula version",
+    formulaPath,
   );
 
   for (const platform of platforms) {
@@ -54,6 +56,7 @@ export function rewriteFormula(
       blockPattern,
       `$1${releaseDownloadUrl(version, platform)}$2${checksums[platform]}$3`,
       platform,
+      formulaPath,
     );
   }
 
@@ -77,7 +80,10 @@ export async function updateFormula(
     );
   }
 
-  await writeFile(formulaPath, rewriteFormula(formula, version, checksums));
+  await writeFile(
+    formulaPath,
+    rewriteFormula(formula, version, checksums, formulaPath),
+  );
 }
 
 async function main() {
@@ -103,6 +109,7 @@ function replaceExactlyOnce(
   pattern: RegExp,
   replacement: string,
   label: string,
+  formulaPath: string,
 ): string {
   const flags = pattern.flags.includes("g")
     ? pattern.flags
@@ -110,12 +117,12 @@ function replaceExactlyOnce(
   const matches = contents.match(new RegExp(pattern.source, flags)) ?? [];
   if (matches.length !== 1) {
     fail(
-      `expected one ${label} block in Formula/brigadier.rb, found ${matches.length}`,
+      `expected one ${label} block in ${formulaPath}, found ${matches.length}`,
     );
   }
   const replaced = contents.replace(pattern, replacement);
   if (replaced === contents) {
-    fail(`failed to replace ${label} block in Formula/brigadier.rb`);
+    fail(`failed to replace ${label} block in ${formulaPath}`);
   }
   return replaced;
 }

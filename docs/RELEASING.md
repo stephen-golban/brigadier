@@ -6,10 +6,12 @@ distribution channel: the first release will publish four compiled binaries in
 per-platform archives, their checksums, and the notarized macOS disk images.
 The package manifest is private and is not itself a distribution artifact.
 
-`Formula/brigadier.rb` therefore still carries version `0.0.0` and deliberately
-fake placeholder digests. Do not "fix" them before the first release exists.
-The release workflow replaces them from the checksums of the artifacts it
-actually built, then pushes that formula update to the default branch.
+The public `stephen-golban/homebrew-tap` repository owns
+`Formula/brigadier.rb`; this repository does not carry a formula. The seeded tap
+formula still has version `0.0.0` and deliberately fake placeholder digests. Do
+not "fix" them before the first release exists. The release workflow replaces
+them from the checksums of the artifacts it actually built, then pushes that
+formula update to the tap's default branch.
 
 A complete release contains:
 
@@ -35,12 +37,15 @@ The workflow triggers on any pushed `v*` tag. Every matrix job runs
 `scripts/verify-tag-version.sh` before compiling and refuses a tag whose name,
 after removing the leading `v`, does not equal `package.json`'s `version`.
 Building and publishing are separate: the four platform artifacts are always
-built, while the GitHub release and the Homebrew formula update run only when
-the repository secret `RELEASE_PUBLISH_ENABLED` is exactly `true`. Apple
-credentials are another independent gate. Missing any one of the seven Apple
-secrets silently skips the Developer ID and notarization steps, leaving only the
-initial ad-hoc signature. Before pushing a public tag, verify both gates; the
-workflow does not infer that publication should wait for Apple credentials.
+built, while the GitHub release runs only when the repository secret
+`RELEASE_PUBLISH_ENABLED` is exactly `true`. The Homebrew formula update also
+requires `HOMEBREW_TAP_TOKEN`; without it, the already-created release remains
+published and the workflow loudly skips the tap update. Apple credentials are
+another independent gate. Missing any one of the seven Apple secrets silently
+skips the Developer ID and notarization steps, leaving only the initial ad-hoc
+signature. Before pushing a public tag, verify the publication switch, the tap
+credential, and the Apple gate; the workflow does not infer that publication
+should wait for Apple credentials.
 
 ---
 
@@ -180,12 +185,14 @@ workflow artifacts only.
 
 ### 6. Update Homebrew from the files just released
 
-Immediately after release creation, in the same conditional job, the workflow
-runs:
+Immediately after release creation, when `HOMEBREW_TAP_TOKEN` is present, the
+workflow checks out `stephen-golban/homebrew-tap` into `./homebrew-tap` with
+that token and runs:
 
 ```sh
 version="${GITHUB_REF_NAME#v}"
-bun ./scripts/update-homebrew-formula.ts "${version}" ./release-packages
+bun ./scripts/update-homebrew-formula.ts \
+  "${version}" ./release-packages ./homebrew-tap/Formula/brigadier.rb
 ```
 
 The script's complete interface is:
@@ -200,10 +207,20 @@ whose filename does not exactly name its expected archive, then replaces the
 formula version, four release URLs, and four digests exactly once. It refuses a
 missing, duplicate, malformed, or no-op replacement.
 
-The workflow commits only `Formula/brigadier.rb` as
-`Update Homebrew formula to vVERSION` and pushes that commit to the repository's
-default branch. The formula is therefore derived from the real release
-artifacts, not precomputed values.
+The workflow commits only `Formula/brigadier.rb` in the tap checkout as
+`Update Homebrew formula to vVERSION` and pushes the checked-out tap branch.
+This works with a newly created default branch and requires no long history.
+The formula is therefore derived from the real release artifacts, not
+precomputed values.
+
+When `HOMEBREW_TAP_TOKEN` is absent, both the tap checkout and formula update
+are skipped and the workflow prints:
+
+```text
+HOMEBREW_TAP_TOKEN is unset; Homebrew formula update is disabled
+```
+
+That is a successful skip: it never blocks or rolls back the GitHub release.
 
 ---
 
@@ -214,13 +231,24 @@ Secrets and variables → Actions → the `Secrets` tab → Repository secrets �
 repository secret**. Names are case-sensitive. Values are never echoed back, so
 a typo appears only as a skipped or failed release step.
 
-### `RELEASE_PUBLISH_ENABLED` — enables the GitHub release and formula update
+### `RELEASE_PUBLISH_ENABLED` — enables the GitHub release
 
 Value: the literal five characters `true`—lowercase, unquoted, with no
 surrounding whitespace. It is compared as a string against `'true'`; `True`,
-`TRUE`, `1`, and `yes` all leave publication disabled. GitHub supplies the token
-used to create the release and push the formula commit; no personal access token
-is involved.
+`TRUE`, `1`, and `yes` all leave publication disabled. GitHub's default token
+creates the release but cannot push to the separate tap repository.
+
+### `HOMEBREW_TAP_TOKEN` — enables the tap formula update
+
+Configure this repository secret before the first release. It is a fine-grained
+personal access token with **Contents: write** access to only
+`stephen-golban/homebrew-tap`. The workflow uses it to check out that repository
+and to authenticate the formula commit push. Never use or rename the default
+`GITHUB_TOKEN` for this purpose; its permissions do not cross repositories.
+
+If the secret is absent, GitHub release publication still succeeds. The tap
+checkout and formula update skip, the workflow prints the disabled message
+shown above, and the formula must be recovered manually after the release.
 
 ### The seven Apple secrets — enable Developer ID signing and notarization
 
@@ -291,10 +319,10 @@ The seven values are:
   openssl rand -base64 24
   ```
 
-Before the first public tag, use `gh secret list` and confirm all eight names—
-the publication switch plus all seven Apple secrets—are present. Presence does
-not prove the values are correct; the first workflow execution remains the
-decisive test.
+Before the first public tag, use `gh secret list` and confirm all nine names—the
+publication switch, `HOMEBREW_TAP_TOKEN`, and all seven Apple secrets—are
+present. Presence does not prove the values are correct; the first workflow
+execution remains the decisive test.
 
 ---
 
@@ -338,9 +366,9 @@ and update the `sha256` and `bytes` values for
 `"claude-desktop/manifest.json"` in the `PINNED` map in
 `test/surfaces.test.ts`. The pin is deliberate: update it; never delete it.
 
-Do **not** move the formula's `0.0.0` or placeholder digests in the release
-commit. The workflow updates them only after it has created the release from
-real artifacts.
+Do **not** move the tap formula's `0.0.0` or placeholder digests in the release
+commit. The workflow updates the separate tap only after it has created the
+release from real artifacts.
 
 ---
 
@@ -378,12 +406,14 @@ Run:
 gh secret list
 ```
 
-Confirm the `RELEASE_PUBLISH_ENABLED` name and all seven Apple secret names above
-are present. Secret values cannot be read back; if the publication switch was
-not recorded as the literal `true` or there is any doubt, set it again before
-tagging. If any Apple secret is missing, stop: the workflow would still be able
-to create a public release, but its Darwin archives would contain only
-ad-hoc-signed executables and it would upload no DMGs.
+Confirm `RELEASE_PUBLISH_ENABLED`, `HOMEBREW_TAP_TOKEN`, and all seven Apple
+secret names above are present. Secret values cannot be read back; if the
+publication switch was not recorded as the literal `true` or there is any doubt,
+set it again before tagging. If the tap token is missing, set it before the first
+release; otherwise the release will publish while the formula bump skips. If any
+Apple secret is missing, stop: the workflow would still be able to create a
+public release, but its Darwin archives would contain only ad-hoc-signed
+executables and it would upload no DMGs.
 
 ### Step 3 — create the tag locally
 
@@ -402,8 +432,9 @@ git push origin "v${VERSION}"
 ```
 
 That push starts `.github/workflows/release.yml`. With publication enabled, a
-successful run creates the GitHub release and then commits and pushes the
-Homebrew formula update. Treat the push as the publication boundary.
+successful run creates the GitHub release and, when the tap token is present,
+commits and pushes the Homebrew formula update to
+`stephen-golban/homebrew-tap`. Treat the push as the publication boundary.
 
 ### Step 5 — watch every workflow step
 
@@ -421,12 +452,15 @@ Inspect the run as well as its final status. Confirm:
 - both `=notarized` positive gates passed before archive assembly;
 - all four `release-PLATFORM` artifacts were uploaded;
 - `Assemble combined checksums` ran after all four downloads;
-- `Create GitHub release` ran rather than `Publication disabled`; and
-- `Update Homebrew formula from release artifacts` committed and pushed.
+- `Create GitHub release` ran rather than `Publication disabled`;
+- `Check out Homebrew tap` ran; and
+- `Update Homebrew formula from release artifacts` committed and pushed to the
+  tap.
 
 Any failed `build-platform` job blocks the publish job entirely. A failure after
 `Create GitHub release` but during the formula update is different: the release
-already exists and the formula needs the manual recovery below.
+already exists and the formula needs the manual recovery below. A missing tap
+token produces the same recovery need but deliberately does not fail the job.
 
 ### Step 6 — verify the public release assets
 
@@ -463,23 +497,24 @@ spctl -a -t open --context context:primary-signature PATH_TO_DMG
 
 ### Step 7 — verify or recover the Homebrew formula update
 
-Confirm the default branch now contains `Formula/brigadier.rb` at `VERSION`,
-with four `vVERSION` release URLs and four non-placeholder digests matching the
-downloaded `.sha256` files.
+Confirm the default branch of `stephen-golban/homebrew-tap` now contains
+`Formula/brigadier.rb` at `VERSION`, with four `vVERSION` release URLs and four
+non-placeholder digests matching the downloaded `.sha256` files.
 
 If the GitHub release exists but the workflow failed before pushing the formula
 commit, recover from the downloaded release artifacts:
 
 ```sh
+gh repo clone stephen-golban/homebrew-tap ./homebrew-tap
 bun ./scripts/update-homebrew-formula.ts \
-  "${VERSION}" "release-assets-${VERSION}"
-git add Formula/brigadier.rb
-git commit -m "Update Homebrew formula to v${VERSION}"
-git push origin HEAD
+  "${VERSION}" "release-assets-${VERSION}" \
+  ./homebrew-tap/Formula/brigadier.rb
+git -C ./homebrew-tap add Formula/brigadier.rb
+git -C ./homebrew-tap commit -m "Update Homebrew formula to v${VERSION}"
+git -C ./homebrew-tap push origin HEAD
 ```
 
-The optional third argument may name a formula elsewhere; omit it for this
-repository's `Formula/brigadier.rb`.
+The third argument deliberately names the formula in the separate tap checkout.
 
 ### Step 8 — verify both public installation paths
 
@@ -506,7 +541,8 @@ digests because no release exists. This is the second install path and will work
 only after the first release workflow fills the formula from real artifacts:
 
 ```sh
-brew install stephen-golban/tap/brigadier
+brew tap stephen-golban/tap
+brew install brigadier
 ```
 
 After the release and formula commit both exist, run both commands on clean
@@ -545,10 +581,14 @@ These release-path measurements have been made, and their limits matter:
   `test/release-guard.test.ts` runs the workflow's guard against the real
   package version, a mismatched version, and an absent tag name. The script now
   compares only the tag with `package.json`'s version.
-- **The formula rewrite is exercised without network access.**
-  `test/installer.test.ts` checks all four deterministic asset names and URLs,
-  rejects a checksum naming the wrong archive, and proves the formula rewrite
-  replaces the version, URLs, and digests.
+- **The release asset helpers are exercised without network access.**
+  `test/installer.test.ts` checks all four deterministic asset names and URLs
+  and rejects a checksum naming the wrong archive. The repository no longer
+  tests against a local formula because the tap owns that file.
+- **The tap delivery wiring is pinned by the workflow test.**
+  `test/release-guard.test.ts` requires the PAT-authenticated tap checkout, the
+  explicit third formula-path argument, the tap-local commit and push, and the
+  successful skip when `HOMEBREW_TAP_TOKEN` is absent.
 - **Notarization rehearsal 1 ran locally on 2026-08-11, mirroring the credential
   path.** `xcrun notarytool submit --wait` returned **Accepted** for submission
   `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` in roughly four minutes. It proved the
@@ -582,11 +622,11 @@ These release-path measurements have been made, and their limits matter:
   therefore deliberately says the check *may* consult Apple and treats an
   outage as a release failure.
 - **No release has been cut.** The current four-binary publication workflow,
-  its live seven-secret runner path, GitHub release creation, formula push, and
-  both public installation paths have never completed together. This runbook is
-  the procedure for that first end-to-end execution, not a report that it has
-  already succeeded.
+  its live seven-secret Apple runner path, GitHub release creation, tap formula
+  push, and both public installation paths have never completed together. This
+  runbook is the procedure for that first end-to-end execution, not a report
+  that it has already succeeded.
 
 The accountable release owner reviews the workflow run, notarization gates,
-release-asset checksums, formula commit, and clean-machine installs before
+release-asset checksums, tap formula commit, and clean-machine installs before
 announcing the release.
