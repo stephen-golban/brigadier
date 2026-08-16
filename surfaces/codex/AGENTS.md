@@ -65,14 +65,15 @@ into brigadier's own workers, so it is talking to you.
   ambiguity it exits 4 with `status: "needs_human"` and structured questions; no
   worktree is created and no slice worker is spawned.
 
-There is no setup step. Configuration is automatic: `brigadier run` probes this
+A run needs no setup. Configuration is automatic: `brigadier run` probes this
 machine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)
-when none is there, and carries on. Never run `brigadier init` to make a config
-appear; it is not a prerequisite. Its one real job belongs to a human: recording
+when none is there, and carries on. Never send the user to `brigadier init`
+before a run; it is not a prerequisite for one. Init is the setup step for HOSTS
+instead, and that belongs to a human: it records which detected hosts to enable —
+a bare `brigadier install` exits 1 pointing at it when none are recorded — and
 the explicit yes that lets brigadier register its MCP server into a GUI
-application's own configuration. If `brigadier install` reports a registration
-skipped for want of consent, pass that sentence to the user and let them run
-`brigadier init` once themselves.
+application's own configuration. Pass either sentence to the user and let them
+run `brigadier init` once themselves.
 
 ## A note specific to Codex
 

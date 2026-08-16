@@ -70,7 +70,7 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
   },
   "claude-code/SKILL.md": {
     sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
-    bytes: 5396,
+    bytes: 5480,
   },
   "claude-code/hooks/README.md": {
     sha256: "45a6b3f3cf3e3da1be8e3d654ac15d4867c5c01c9df70bea4421996764f6d92f",
@@ -94,11 +94,11 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
   },
   "claude-desktop/manifest.json": {
     sha256: "5ee29923ff3dae4d32960611ac9835c7bb6e1da1526e44551335c69e12bdff3f",
-    bytes: 2798,
+    bytes: 2873,
   },
   "codex/AGENTS.md": {
     sha256: "5e7e861ee00bee3015160c018e6da36f466038f8e40058ba99f22cfad3dd917a",
-    bytes: 4490,
+    bytes: 4576,
   },
   "codex/hooks/README.md": {
     sha256: "c30e3f94b875af45a988e063d692b7bb2ef17d45bd9ed75b32d0867eb1c4bb1a",
@@ -110,7 +110,7 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
   },
   "codex/skills/brigadier/SKILL.md": {
     sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
-    bytes: 5396,
+    bytes: 5480,
   },
   "opencode/README.md": {
     sha256: "53feacbb72b7f667b7e280d815058e2753bf72f48e6f849fce54aa2604f1ed92",
@@ -468,7 +468,7 @@ describe("the surface templates", () => {
         textBetween(
           doctrine,
           "- Do not invent commands.",
-          "\n\n## There is no setup step",
+          "\n\n## A run needs no setup",
         ),
       ).toBe(
         '- Do not invent commands. brigadier has exactly four: `run`, `install`, `mcp`,\n  and `init`. `brigadier run "<task description>"` asks a model to decompose the\n  task, then sends the result through the same validator used for `--plan`. On\n  genuine ambiguity it exits 4 with `status: "needs_human"` and structured\n  questions; no worktree is created and no slice worker is spawned.',
@@ -502,7 +502,7 @@ describe("the surface templates", () => {
       textBetween(
         codexAgents,
         "- Invent commands.",
-        "\n\nThere is no setup step.",
+        "\n\nA run needs no setup.",
       ),
     ).toBe(
       '- Invent commands. brigadier has exactly four: `run`, `install`, `mcp`, and\n  `init`. `brigadier run "<task description>"` asks a model to decompose the task\n  and sends the result through the same validator used for `--plan`. On genuine\n  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no\n  worktree is created and no slice worker is spawned.',
@@ -534,33 +534,42 @@ describe("the surface templates", () => {
   });
 
   test("every installed doctrine says configuration is automatic", () => {
-    // `brigadier init` stopped being a prerequisite when `ensureConfig` landed.
-    // A doctrine that still sends the host model to an init step sends it to a
-    // step that does nothing it needs.
+    // A RUN needs no setup: `ensureConfig` writes `config.json` on first
+    // use, so a doctrine that sends the host model to an init step before a
+    // run sends it to a step that does nothing it needs.
     //
-    // THE ONE CARVE-OUT IS PINNED TOO. `consentInstructions` in
-    // `src/surfaces/install.ts` — the only remedy offered when a GUI
-    // registration is skipped for want of consent — tells the reader to run
-    // interactive `brigadier init`. A doctrine that forbade that outright would
-    // forbid the single step consent recovery requires, so the exception is
-    // stated here rather than left to collide.
+    // THAT CLAIM IS NARROW NOW, AND THE NARROWING IS THE POINT. `brigadier
+    // init` IS the setup step for hosts: `runInit` in `src/init/index.ts`
+    // asks which detected hosts to enable and records `enabledHosts`, and a
+    // bare `brigadier install` exits 1 pointing at it when none are recorded
+    // (`runInstall`, selection "enabled"). `consentInstructions` in
+    // `src/surfaces/install.ts`, the only remedy offered when a GUI
+    // registration is skipped for want of consent, sends the reader to the
+    // same interactive init. A doctrine that said "there is no setup step"
+    // would contradict all three and forbid the one step consent recovery
+    // requires — so what init is for is stated here rather than left to
+    // collide, while the agent is still told never to spend a turn on it
+    // before a run, and never to hand over a command it could run itself.
     const skill = SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "";
     expect(paragraphContaining(skill, "Configuration is automatic")).toBe(
-      "Configuration is automatic. `brigadier run` probes this machine for installed\nworker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by\ndefault — when none is there, and carries on. Never run `brigadier init` to make\na config appear: it has never been a prerequisite for a run, and a turn spent on\nit is a turn wasted. The one exception is not yours to take. Registering\nbrigadier's MCP server into a GUI application's own configuration takes a human's\nexplicit yes, and only the interactive question can ask for it — so if\n`brigadier install` reports a registration skipped for want of consent, pass that\nsentence to the user and let them run `brigadier init` once themselves.",
+      "Configuration is automatic. `brigadier run` probes this machine for installed\nworker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by\ndefault — when none is there, and carries on. Never send the user to\n`brigadier init` before a run: it has never been a prerequisite for one, and a\nturn spent on it is a turn wasted. Init is the setup step for HOSTS, not for\nruns, and that part is not yours to take: it asks which detected hosts to enable\nand records them, so a bare `brigadier install` exits 1 pointing at it when none\nare recorded, and registering brigadier's MCP server into a GUI application's own\nconfiguration takes a human's explicit yes that only its interactive question can\nask for. Pass either sentence to the user and let them run it once themselves.",
     );
     expect(
       paragraphContaining(
         SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
-        "There is no setup step",
+        "A run needs no setup",
       ),
     ).toBe(
-      "There is no setup step. Configuration is automatic: `brigadier run` probes this\nmachine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)\nwhen none is there, and carries on. Never run `brigadier init` to make a config\nappear; it is not a prerequisite. Its one real job belongs to a human: recording\nthe explicit yes that lets brigadier register its MCP server into a GUI\napplication's own configuration. If `brigadier install` reports a registration\nskipped for want of consent, pass that sentence to the user and let them run\n`brigadier init` once themselves.",
+      "A run needs no setup. Configuration is automatic: `brigadier run` probes this\nmachine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)\nwhen none is there, and carries on. Never send the user to `brigadier init`\nbefore a run; it is not a prerequisite for one. Init is the setup step for HOSTS\ninstead, and that belongs to a human: it records which detected hosts to enable —\na bare `brigadier install` exits 1 pointing at it when none are recorded — and\nthe explicit yes that lets brigadier register its MCP server into a GUI\napplication's own configuration. Pass either sentence to the user and let them\nrun `brigadier init` once themselves.",
     );
     for (const doctrine of [
       skill,
       SURFACE_TEMPLATES["codex/skills/brigadier/SKILL.md"] ?? "",
       SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
     ]) {
+      // Both are claims about `brigadier run`, and both are still false of it.
+      // `brigadier install` is the command that exits 1 pointing at init, and
+      // the doctrine above says so in its own words rather than these.
       expect(doctrine).not.toContain("must have been run once on this machine");
       expect(doctrine).not.toContain("exits 1 and tells you to run `init`");
     }
