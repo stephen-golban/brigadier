@@ -6,7 +6,6 @@ import { join, resolve } from "node:path";
 import packageJson from "../package.json";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
-const executable = join(repositoryRoot, "bin", "brigadier-mcp.js");
 const sourceBundle = join(repositoryRoot, "src", "mcp", "server.js");
 const sourceMap = `${sourceBundle}.map`;
 const distributionBundle = join(repositoryRoot, "dist", "mcp", "server.js");
@@ -61,15 +60,30 @@ test("build:mcp writes only the distribution bundle and the package build includ
   expect(existsSync(sourceBundle)).toBe(false);
   expect(existsSync(sourceMap)).toBe(false);
   expect(existsSync(distributionBundle)).toBe(true);
+  // THE ENTRY IS `bundle/server.ts` AND THE OUTPUT IS STILL `server.js`.
+  // `--outdir` is required here: Bun 1.3.14 writes beside the entry when
+  // `--outfile` and `--sourcemap` are combined. Keeping the entry basename
+  // `server.ts` makes the output path named by the manifest and README natural.
   expect(packageJson.scripts["build:mcp"]).toBe(
-    "bun build ./src/mcp/server.ts --target=node --minify --sourcemap --outdir ./dist/mcp",
+    "bun build ./src/mcp/bundle/server.ts --target=node --minify --sourcemap --outdir ./dist/mcp",
   );
   expect(packageJson.scripts.build).toBe(
     "bun run build:dist && bun run build:mcp && bun run build:binary && bun run build:codesign",
   );
 }, 10_000);
 
-test("the packaged executable answers initialize over its real stdio transport", async () => {
+/**
+ * The exact file, run by the exact command, that Claude Desktop runs.
+ *
+ * `surfaces/claude-desktop/manifest.json` launches `node
+ * .../server/brigadier-mcp.js`, and that file is a copy of the bundle asserted
+ * here. If this bundle is ever a pure module again it will load, export, exit 0
+ * without answering, and Desktop will watch its server die on every launch —
+ * which is what happened for as long as a separate `bin/` shim was the only
+ * thing that ever called `runMcpServer`. `node`, not `bun`, because a Desktop
+ * user has no bun.
+ */
+test("the shipped bundle answers initialize over its real stdio transport", async () => {
   const build = await runBounded(["bun", "run", "build:mcp"]);
   expect(build.timedOut).toBe(false);
   expect(build.exitCode).toBe(0);
@@ -77,7 +91,7 @@ test("the packaged executable answers initialize over its real stdio transport",
   const scratchHome = await mkdtemp(join(tmpdir(), "brigadier-mcp-entry-"));
   try {
     const session = await runBounded(
-      [executable],
+      ["node", distributionBundle],
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}\n',
       {
         PATH: process.env.PATH,

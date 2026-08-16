@@ -201,7 +201,7 @@ function scratchEnv(scratchHome: string): Record<string, string> {
 /* ------------------------------------------------------------------------ */
 
 /**
- * The real exported entry, exactly as `bin/brigadier-mcp.js` will call it.
+ * The real exported entry used by the compiled binary's `mcp` subcommand.
  *
  * Nothing is faked here. `brigadier_run` reaches the real supervisor path, and
  * the test keeps it bounded by pointing `$BRIGADIER_HOME` at an empty directory:
@@ -453,8 +453,9 @@ describe("the MCP server over stdio", () => {
       // Antigravity, and Claude Desktop read no skill directory, so this
       // metadata is the only thing brigadier ever says to their model: when to
       // delegate, that the work goes here rather than inline, how to shape a
-      // plan, that configuration is automatic and `brigadier init` is only for
-      // GUI-registration consent, and that a worker must never call back in.
+      // plan, that a run needs no setup while `brigadier init` is the user's
+      // step for enabling hosts and recording GUI-registration consent, and
+      // that a worker must never call back in.
       // A GUI host reads no skill file, so if the configuration sentence is not
       // here it reaches that host nowhere at all. They are pinned whole,
       // and `test/surfaces.test.ts` holds the .mcpb manifest to the same bytes.
@@ -465,7 +466,7 @@ describe("the MCP server over stdio", () => {
         "Report which vendor, model, and effort this machine would give each slice of a plan, or why no model can take it. Creates no worktree and spawns no worker. Worth a call before brigadier_run, because a slice no model can take is worth knowing about before a worker is spent on its siblings.",
       );
       expect(tools[2]?.description).toBe(
-        "Hand multi-part coding work to brigadier instead of doing it inline: it routes every slice, gives each its own git worktree and worker, commits what each produced, and merges the lot. Reach for this whenever the work has more than one independent piece — a feature, a cross-file refactor, a migration, a bug with several call sites, a batch of mechanical edits — and route that work here rather than editing the files yourself. Build the plan as the plan argument documents: one slice per independent piece, exclusive ownedPaths (no two slices may claim the same path, or a directory containing another's), and dependsOn naming any slice whose committed output another slice needs. There is no setup step: brigadier configures itself on first use, so never tell the user to run brigadier init — the one exception is registering brigadier with a GUI host, which needs a consent only an interactive brigadier init, run by the user, can record. Never call this if you are yourself a brigadier worker running one slice: re-entry spends the whole slice and lands nothing.",
+        "Hand multi-part coding work to brigadier instead of doing it inline: it routes every slice, gives each its own git worktree and worker, commits what each produced, and merges the lot. Reach for this whenever the work has more than one independent piece — a feature, a cross-file refactor, a migration, a bug with several call sites, a batch of mechanical edits — and route that work here rather than editing the files yourself. Build the plan as the plan argument documents: one slice per independent piece, exclusive ownedPaths (no two slices may claim the same path, or a directory containing another's), and dependsOn naming any slice whose committed output another slice needs. A run needs no setup: brigadier configures itself on first use, so never tell the user to run brigadier init before one. Init is instead the setup step for AI hosts — it records which detected hosts to enable, and the consent that registers brigadier with a GUI host — and only the user, running it interactively, can record either. Never call this if you are yourself a brigadier worker running one slice: re-entry spends the whole slice and lands nothing.",
       );
 
       // This MCP contract accepts plan documents. Task-to-plan is available on
@@ -967,8 +968,8 @@ describe("the MCP server over stdio", () => {
       const lines = responses(session);
       expect(lines.length).toBe(4);
 
-      // The entry point `bin/brigadier-mcp.js` will call, with no injection at
-      // all, reporting the version out of package.json.
+      // The server entry point used by the compiled binary's `mcp` subcommand,
+      // called here with no injection, reports the version out of package.json.
       expect(lines[0]).toBe(
         '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.1.1"}}}',
       );

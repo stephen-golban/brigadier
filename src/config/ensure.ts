@@ -1,10 +1,12 @@
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { delimiter, join, resolve } from "node:path";
 import type { Discoverer, DiscoveryReport } from "../discovery/contracts.js";
 import type { OutputStream } from "../init/prompt.js";
 import { proposeConfig } from "../init/propose.js";
-import type { BrigadierConfig, GuiHost } from "./contracts.js";
-import { CONFIG_VERSION, GUI_HOSTS, parseConfig } from "./contracts.js";
-import type { ConfigEnvironment, ConfigIo } from "./store.js";
+import type { GuiHost, Host, ParsedBrigadierConfig } from "./contracts.js";
+import { CONFIG_VERSION, GUI_HOSTS, HOSTS, parseConfig } from "./contracts.js";
+import type { ConfigEnvironment, ConfigIo, PathKind } from "./store.js";
 import {
   nodeConfigIo,
   readConfig,
@@ -20,7 +22,7 @@ export interface EnsureConfigOptions {
 }
 
 export interface EnsureConfigResult {
-  readonly config: BrigadierConfig;
+  readonly config: ParsedBrigadierConfig;
   readonly path: string;
   /** false when an existing, current, valid config was reused as-is. */
   readonly written: boolean;
@@ -32,6 +34,25 @@ export interface EnsureConfigResult {
    */
   readonly inMemory: boolean;
 }
+
+/** Injectable executable resolution keeps host detection machine-independent. */
+export interface ExecutableLookup {
+  resolve(command: string): Promise<string | null>;
+}
+
+export type HostDetection =
+  | {
+      readonly host: Host;
+      readonly present: true;
+      readonly evidence: string;
+      readonly evidenceKind: "executable" | "file" | "directory";
+    }
+  | {
+      readonly host: Host;
+      readonly present: false;
+      readonly evidence: null;
+      readonly evidenceKind: null;
+    };
 
 /**
  * Returns a usable config, creating one from the same discovery report as
@@ -65,6 +86,9 @@ export async function ensureConfig(
   // untrusted old-version file happened to contain a truthy value for it.
   const config = parseConfig({
     ...proposal.config,
+    ...(prior !== null && prior.enabledHosts.length > 0
+      ? { enabledHosts: prior.enabledHosts }
+      : {}),
     secretsConsent: prior?.secretsConsent ?? proposal.config.secretsConsent,
     linkedSecretPaths:
       prior?.linkedSecretPaths ?? proposal.config.linkedSecretPaths,
@@ -91,9 +115,9 @@ export async function ensureConfig(
   }
 
   try {
-    const written = await writeConfig(path, config, io);
+    await writeConfig(path, config, io);
     stderr.write(`brigadier: wrote config to ${path}\n`);
-    return { config: written, path, written: true, inMemory: false };
+    return { config, path, written: true, inMemory: false };
   } catch (error) {
     stderr.write(
       `brigadier: could not write config to ${path}; using the detected configuration in memory for this run: ${describe(error)}\n`,
@@ -103,17 +127,19 @@ export async function ensureConfig(
 }
 
 type EnsureLoad =
-  | { readonly kind: "current"; readonly config: BrigadierConfig }
+  | { readonly kind: "current"; readonly config: ParsedBrigadierConfig }
   | { readonly kind: "missing" }
   | { readonly kind: "invalid"; readonly reason: string }
   | {
       readonly kind: "wrong-version";
       readonly version: unknown;
-      readonly prior: BrigadierConfig | null;
+      readonly prior: ParsedBrigadierConfig | null;
     };
 
 async function loadForEnsure(path: string, io: ConfigIo): Promise<EnsureLoad> {
   try {
+    // `readConfig` already returns what `parseConfig` produced, so there is
+    // nothing left to normalize here.
     const config = await readConfig(path, io);
     return config === null ? { kind: "missing" } : { kind: "current", config };
   } catch (error) {
@@ -136,7 +162,7 @@ async function loadForEnsure(path: string, io: ConfigIo): Promise<EnsureLoad> {
 }
 
 /** Projects only current fields out of an old file before normal validation. */
-function preserveCompatibleFields(raw: unknown): BrigadierConfig | null {
+function preserveCompatibleFields(raw: unknown): ParsedBrigadierConfig | null {
   const old = record(raw);
   if (old === null) {
     return null;
@@ -151,6 +177,9 @@ function preserveCompatibleFields(raw: unknown): BrigadierConfig | null {
         : [],
       guiRegistrationConsent: false,
       allowDegradedRouting: old.allowDegradedRouting === true,
+      ...(Array.isArray(old.enabledHosts) && old.enabledHosts.length > 0
+        ? { enabledHosts: old.enabledHosts }
+        : {}),
     });
   } catch {
     return null;
@@ -184,61 +213,199 @@ async function createRealDiscoverer(): Promise<Discoverer> {
   return discovery.createDiscoverer();
 }
 
+/** Read-only detection of every host brigadier knows how to install into. */
+export async function detectHosts(
+  environment: ConfigEnvironment,
+  io: ConfigIo = nodeConfigIo,
+  lookup: ExecutableLookup = createExecutableLookup(environment),
+): Promise<readonly HostDetection[]> {
+  const pathCandidates = hostPathCandidates(environment);
+  const detected: HostDetection[] = [];
+
+  for (const host of HOSTS) {
+    const command = hostCommand(host);
+    if (command !== null) {
+      try {
+        const executable = await lookup.resolve(command);
+        if (executable !== null && executable.length > 0) {
+          detected.push({
+            host,
+            present: true,
+            evidence: resolve(executable),
+            evidenceKind: "executable",
+          });
+          continue;
+        }
+      } catch {
+        // A failed executable probe is unknown; marker evidence may remain.
+      }
+    }
+
+    let evidence: { readonly path: string; readonly kind: MarkerKind } | null =
+      null;
+    for (const candidate of pathCandidates[host]) {
+      const kind = await detectedPathKind(io, candidate);
+      if (kind === candidate.kind) {
+        evidence = { path: resolve(candidate.path), kind };
+        break;
+      }
+    }
+    detected.push(
+      evidence === null
+        ? { host, present: false, evidence: null, evidenceKind: null }
+        : {
+            host,
+            present: true,
+            evidence: evidence.path,
+            evidenceKind: evidence.kind,
+          },
+    );
+  }
+  return detected;
+}
+
 /** Cheap, read-only detection of GUI hosts. No result is persisted. */
 export async function detectGuiHosts(
   environment: ConfigEnvironment,
   io: ConfigIo = nodeConfigIo,
 ): Promise<readonly GuiHost[]> {
-  const candidates = guiHostCandidates(environment);
-  const detected: GuiHost[] = [];
-  for (const host of GUI_HOSTS) {
-    const paths = candidates[host];
-    for (const path of paths) {
-      try {
-        if (await pathExists(io, path)) {
-          detected.push(host);
-          break;
-        }
-      } catch {
-        // One inaccessible candidate must not hide another host or break init.
-      }
-    }
-  }
-  return detected;
+  const detections = await detectHosts(environment, io, {
+    resolve: () => Promise.resolve(null),
+  });
+  return detections
+    .filter(
+      (entry): entry is HostDetection & { readonly host: GuiHost } =>
+        entry.present && (GUI_HOSTS as readonly string[]).includes(entry.host),
+    )
+    .map((entry) => entry.host);
 }
 
-async function pathExists(io: ConfigIo, path: string): Promise<boolean> {
-  if (io.exists !== undefined) {
-    return io.exists(path);
-  }
+type MarkerKind = Extract<PathKind, "file" | "directory">;
+
+interface PathCandidate {
+  readonly path: string;
+  readonly kind: MarkerKind;
+}
+
+async function detectedPathKind(
+  io: ConfigIo,
+  candidate: PathCandidate,
+): Promise<PathKind | null> {
   try {
-    await io.readFile(path);
-    return true;
-  } catch (error) {
-    return !(
-      error instanceof Error &&
-      (error as { readonly code?: unknown }).code === "ENOENT"
-    );
+    if (io.pathKind !== undefined) {
+      return await io.pathKind(candidate.path);
+    }
+    if (io.exists !== undefined) {
+      return (await io.exists(candidate.path)) === true ? candidate.kind : null;
+    }
+    await io.readFile(candidate.path);
+    return candidate.kind;
+  } catch {
+    // Missing, inaccessible, and every other failure are not positive evidence.
+    return null;
   }
+}
+
+function createExecutableLookup(
+  environment: ConfigEnvironment,
+): ExecutableLookup {
+  return {
+    async resolve(command) {
+      const path = environment.PATH ?? "";
+      for (const directory of path.split(delimiter)) {
+        // PATH entries are POSIX path bytes. Spaces are legal and meaningful.
+        if (directory.length === 0) {
+          // Do not let a checked-out repository impersonate an installed host.
+          continue;
+        }
+        const candidate = resolve(join(directory, command));
+        try {
+          const metadata = await stat(candidate);
+          if (!metadata.isFile()) {
+            continue;
+          }
+          await access(candidate, constants.X_OK);
+          return candidate;
+        } catch {
+          // An unusable candidate does not hide a later PATH entry.
+        }
+      }
+      return null;
+    },
+  };
+}
+
+function hostCommand(host: Host): string | null {
+  if (host === "claude-code") {
+    return "claude";
+  }
+  if (host === "codex" || host === "opencode") {
+    return host;
+  }
+  return null;
+}
+
+function hostPathCandidates(
+  environment: ConfigEnvironment,
+): Readonly<Record<Host, readonly PathCandidate[]>> {
+  const home = environment.HOME ?? "";
+  const fileFromEnvironment = (
+    name: string,
+    ...parts: string[]
+  ): PathCandidate[] => {
+    const root = environment[name] ?? "";
+    return root.length === 0
+      ? []
+      : [{ path: resolve(root, ...parts), kind: "file" }];
+  };
+  const fileFromHome = (...parts: string[]): PathCandidate[] =>
+    home.length === 0 ? [] : [{ path: resolve(home, ...parts), kind: "file" }];
+
+  // Brigadier creates each bare skill-host root itself. Only host-owned marker
+  // files count as fallback evidence; the installer writes none of these.
+  return {
+    "claude-code": [
+      ...fileFromEnvironment("CLAUDE_CONFIG_DIR", "settings.json"),
+      ...fileFromHome(".claude", "settings.json"),
+      ...fileFromHome(".claude.json"),
+    ],
+    codex: [
+      ...fileFromEnvironment("CODEX_HOME", "config.toml"),
+      ...fileFromEnvironment("CODEX_HOME", "auth.json"),
+      ...fileFromHome(".codex", "config.toml"),
+      ...fileFromHome(".codex", "auth.json"),
+    ],
+    opencode: [
+      ...fileFromEnvironment("XDG_CONFIG_HOME", "opencode", "opencode.json"),
+      ...fileFromHome(".config", "opencode", "opencode.json"),
+    ],
+    // ~/.agents/skills is deliberately absent: Codex and opencode both read
+    // it, and brigadier itself creates it when installing either host.
+    ...guiHostCandidates(environment),
+  };
 }
 
 function guiHostCandidates(
   environment: ConfigEnvironment,
-): Readonly<Record<GuiHost, readonly string[]>> {
-  const home = environment.HOME?.trim() ?? "";
-  const appData = environment.APPDATA?.trim() ?? "";
-  const localAppData = environment.LOCALAPPDATA?.trim() ?? "";
-  const fromHome = (...parts: string[]): string[] =>
-    home.length === 0 ? [] : [join(home, ...parts)];
-  const fromAppData = (root: string, ...parts: string[]): string[] =>
-    root.length === 0 ? [] : [join(root, ...parts)];
+): Readonly<Record<GuiHost, readonly PathCandidate[]>> {
+  const home = environment.HOME ?? "";
+  const appData = environment.APPDATA ?? "";
+  const localAppData = environment.LOCALAPPDATA ?? "";
+  const fromHome = (...parts: string[]): PathCandidate[] =>
+    home.length === 0
+      ? []
+      : [{ path: resolve(home, ...parts), kind: "directory" }];
+  const fromAppData = (root: string, ...parts: string[]): PathCandidate[] =>
+    root.length === 0
+      ? []
+      : [{ path: resolve(root, ...parts), kind: "directory" }];
 
   return {
     cursor: [
       ...fromHome(".cursor"),
       ...fromHome(".config", "Cursor"),
       ...fromHome("Applications", "Cursor.app"),
-      "/Applications/Cursor.app",
+      { path: "/Applications/Cursor.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Cursor"),
       ...fromAppData(appData, "Cursor"),
     ],
@@ -246,7 +413,7 @@ function guiHostCandidates(
       ...fromHome(".codeium", "windsurf"),
       ...fromHome(".config", "Windsurf"),
       ...fromHome("Applications", "Windsurf.app"),
-      "/Applications/Windsurf.app",
+      { path: "/Applications/Windsurf.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Windsurf"),
       ...fromAppData(appData, "Windsurf"),
     ],
@@ -255,14 +422,14 @@ function guiHostCandidates(
       ...fromHome(".gemini", "antigravity"),
       ...fromHome(".config", "Antigravity"),
       ...fromHome("Applications", "Antigravity.app"),
-      "/Applications/Antigravity.app",
+      { path: "/Applications/Antigravity.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Antigravity"),
       ...fromAppData(appData, "Antigravity"),
       ...fromAppData(localAppData, "Antigravity"),
     ],
     "claude-desktop": [
       ...fromHome("Applications", "Claude.app"),
-      "/Applications/Claude.app",
+      { path: "/Applications/Claude.app", kind: "directory" },
       ...fromHome("Library", "Application Support", "Claude"),
       ...fromHome(".config", "Claude"),
       ...fromAppData(appData, "Claude"),

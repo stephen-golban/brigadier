@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * Executable shim. `bin/brigadier.js` runs this with a bare `import`, so this
- * module must dispatch as a side effect of being loaded and must therefore stay
- * unimportable from tests. Every testable part of the command line lives in
- * `src/init/index.ts`.
+ * Executable entry point. The compiled binary starts here, so this module must
+ * dispatch as a side effect of being loaded and must therefore stay unimportable
+ * from tests. Every testable part of the command line lives in `src/init/index.ts`.
  *
  * The signal handlers below are the one thing that genuinely cannot live there:
  * they need the real `process`, and a test that installed them would be sending

@@ -82,17 +82,18 @@ refuses a second run, so this paragraph is what prevents it.
   genuine ambiguity it exits 4 with `status: "needs_human"` and structured
   questions; no worktree is created and no slice worker is spawned.
 
-## There is no setup step
+## A run needs no setup
 
 Configuration is automatic. `brigadier run` probes this machine for installed
 worker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by
-default — when none is there, and carries on. Never run `brigadier init` to make
-a config appear: it has never been a prerequisite for a run, and a turn spent on
-it is a turn wasted. The one exception is not yours to take. Registering
-brigadier's MCP server into a GUI application's own configuration takes a human's
-explicit yes, and only the interactive question can ask for it — so if
-`brigadier install` reports a registration skipped for want of consent, pass that
-sentence to the user and let them run `brigadier init` once themselves.
+default — when none is there, and carries on. Never send the user to
+`brigadier init` before a run: it has never been a prerequisite for one, and a
+turn spent on it is a turn wasted. Init is the setup step for HOSTS, not for
+runs, and that part is not yours to take: it asks which detected hosts to enable
+and records them, so a bare `brigadier install` exits 1 pointing at it when none
+are recorded, and registering brigadier's MCP server into a GUI application's own
+configuration takes a human's explicit yes that only its interactive question can
+ask for. Pass either sentence to the user and let them run it once themselves.
 
 ## Exit codes worth branching on
 

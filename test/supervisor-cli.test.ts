@@ -1256,6 +1256,8 @@ describe("brigadier run: the task positional", () => {
 describe("brigadier: the install and mcp subcommands", () => {
   test("install is dispatched and writes its host files", async () => {
     await withScratchHome(async ({ scratchHome, cwd }) => {
+      await mkdir(join(scratchHome, ".claude"), { recursive: true });
+      await writeFile(join(scratchHome, ".claude/settings.json"), "{}\n");
       const result = await invoke({
         argv: ["install", "claude-code"],
         cwd,

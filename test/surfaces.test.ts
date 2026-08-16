@@ -34,9 +34,21 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { parseConfig } from "../src/config/contracts.ts";
+import type { HostDetection } from "../src/config/ensure.ts";
 import { createTools } from "../src/mcp/tools.ts";
-import type { InstallIo, SurfaceIo } from "../src/surfaces/install.ts";
-import { nodeSurfaceIo, runInstall, sha256 } from "../src/surfaces/install.ts";
+import type {
+  InstallIo,
+  SurfaceHost,
+  SurfaceIo,
+} from "../src/surfaces/install.ts";
+import {
+  nodeSurfaceIo,
+  parseArguments,
+  runInstall,
+  SURFACE_HOSTS,
+  sha256,
+} from "../src/surfaces/install.ts";
 import { SURFACE_TEMPLATES } from "../src/surfaces/templates.ts";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -57,8 +69,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 152,
   },
   "claude-code/SKILL.md": {
-    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
-    bytes: 5396,
+    sha256: "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
+    bytes: 5480,
   },
   "claude-code/hooks/README.md": {
     sha256: "45a6b3f3cf3e3da1be8e3d654ac15d4867c5c01c9df70bea4421996764f6d92f",
@@ -81,12 +93,12 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 3722,
   },
   "claude-desktop/manifest.json": {
-    sha256: "5ee29923ff3dae4d32960611ac9835c7bb6e1da1526e44551335c69e12bdff3f",
-    bytes: 2798,
+    sha256: "7e5ee646c0257185887731d9324f6d8316cc28a2c2e08b6140a4e16f56142af2",
+    bytes: 2873,
   },
   "codex/AGENTS.md": {
-    sha256: "5e7e861ee00bee3015160c018e6da36f466038f8e40058ba99f22cfad3dd917a",
-    bytes: 4490,
+    sha256: "770215deaa9f0d80069c9c7ddab1953b3b308bbe55b4f9777c36c14a1813d273",
+    bytes: 4576,
   },
   "codex/hooks/README.md": {
     sha256: "c30e3f94b875af45a988e063d692b7bb2ef17d45bd9ed75b32d0867eb1c4bb1a",
@@ -97,8 +109,8 @@ const PINNED: Readonly<Record<string, { sha256: string; bytes: number }>> = {
     bytes: 5445,
   },
   "codex/skills/brigadier/SKILL.md": {
-    sha256: "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
-    bytes: 5396,
+    sha256: "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
+    bytes: 5480,
   },
   "opencode/README.md": {
     sha256: "53feacbb72b7f667b7e280d815058e2753bf72f48e6f849fce54aa2604f1ed92",
@@ -173,6 +185,7 @@ async function install(
   argv: readonly string[],
   env: Record<string, string | undefined>,
   fs?: SurfaceIo,
+  detectedHosts: readonly SurfaceHost[] = detectedHostsFor(argv),
 ): Promise<Collected> {
   let stdout = "";
   let stderr = "";
@@ -188,6 +201,7 @@ async function install(
         stderr += chunk;
       },
     },
+    detectHosts: () => Promise.resolve(hostDetections(env, detectedHosts)),
     ...(fs === undefined ? {} : { fs }),
   };
   const code = await runInstall(argv, io);
@@ -202,12 +216,13 @@ async function installWithin(
   argv: readonly string[],
   env: Record<string, string | undefined>,
   fs?: SurfaceIo,
+  detectedHosts: readonly SurfaceHost[] = detectedHostsFor(argv),
 ): Promise<BoundedInstall> {
   const started = Date.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const result = await Promise.race([
-      install(argv, env, fs),
+      install(argv, env, fs, detectedHosts),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("install exceeded 5,000 ms")),
@@ -221,6 +236,33 @@ async function installWithin(
       clearTimeout(timer);
     }
   }
+}
+
+function detectedHostsFor(argv: readonly string[]): readonly SurfaceHost[] {
+  if (argv.includes("--all")) {
+    return SURFACE_HOSTS;
+  }
+  return argv.filter((argument): argument is SurfaceHost =>
+    (SURFACE_HOSTS as readonly string[]).includes(argument),
+  );
+}
+
+function hostDetections(
+  env: Record<string, string | undefined>,
+  detectedHosts: readonly SurfaceHost[],
+): readonly HostDetection[] {
+  const detected = new Set(detectedHosts);
+  const evidenceRoot = env.HOME ?? "/test-home";
+  return SURFACE_HOSTS.map((host) =>
+    detected.has(host)
+      ? {
+          host,
+          present: true,
+          evidence: resolve(evidenceRoot, ".host-detection", host),
+          evidenceKind: "file",
+        }
+      : { host, present: false, evidence: null, evidenceKind: null },
+  );
 }
 
 function outcomeDetail(stdout: string, path: string): string {
@@ -268,7 +310,10 @@ function verdictLines(stdout: string): readonly string[] {
 }
 
 /** A complete, valid config whose only interesting field is the consent. */
-function configBytes(guiRegistrationConsent: boolean): string {
+function configBytes(
+  guiRegistrationConsent: boolean,
+  enabledHosts?: readonly SurfaceHost[],
+): string {
   return `${JSON.stringify(
     {
       version: 3,
@@ -283,6 +328,7 @@ function configBytes(guiRegistrationConsent: boolean): string {
       ],
       secretsConsent: false,
       linkedSecretPaths: [],
+      ...(enabledHosts === undefined ? {} : { enabledHosts }),
       guiRegistrationConsent,
       allowDegradedRouting: false,
     },
@@ -422,7 +468,7 @@ describe("the surface templates", () => {
         textBetween(
           doctrine,
           "- Do not invent commands.",
-          "\n\n## There is no setup step",
+          "\n\n## A run needs no setup",
         ),
       ).toBe(
         '- Do not invent commands. brigadier has exactly four: `run`, `install`, `mcp`,\n  and `init`. `brigadier run "<task description>"` asks a model to decompose the\n  task, then sends the result through the same validator used for `--plan`. On\n  genuine ambiguity it exits 4 with `status: "needs_human"` and structured\n  questions; no worktree is created and no slice worker is spawned.',
@@ -456,7 +502,7 @@ describe("the surface templates", () => {
       textBetween(
         codexAgents,
         "- Invent commands.",
-        "\n\nThere is no setup step.",
+        "\n\nA run needs no setup.",
       ),
     ).toBe(
       '- Invent commands. brigadier has exactly four: `run`, `install`, `mcp`, and\n  `init`. `brigadier run "<task description>"` asks a model to decompose the task\n  and sends the result through the same validator used for `--plan`. On genuine\n  ambiguity it exits 4 with `status: "needs_human"` and structured questions; no\n  worktree is created and no slice worker is spawned.',
@@ -488,33 +534,42 @@ describe("the surface templates", () => {
   });
 
   test("every installed doctrine says configuration is automatic", () => {
-    // `brigadier init` stopped being a prerequisite when `ensureConfig` landed.
-    // A doctrine that still sends the host model to an init step sends it to a
-    // step that does nothing it needs.
+    // A RUN needs no setup: `ensureConfig` writes `config.json` on first
+    // use, so a doctrine that sends the host model to an init step before a
+    // run sends it to a step that does nothing it needs.
     //
-    // THE ONE CARVE-OUT IS PINNED TOO. `consentInstructions` in
-    // `src/surfaces/install.ts` — the only remedy offered when a GUI
-    // registration is skipped for want of consent — tells the reader to run
-    // interactive `brigadier init`. A doctrine that forbade that outright would
-    // forbid the single step consent recovery requires, so the exception is
-    // stated here rather than left to collide.
+    // THAT CLAIM IS NARROW NOW, AND THE NARROWING IS THE POINT. `brigadier
+    // init` IS the setup step for hosts: `runInit` in `src/init/index.ts`
+    // asks which detected hosts to enable and records `enabledHosts`, and a
+    // bare `brigadier install` exits 1 pointing at it when none are recorded
+    // (`runInstall`, selection "enabled"). `consentInstructions` in
+    // `src/surfaces/install.ts`, the only remedy offered when a GUI
+    // registration is skipped for want of consent, sends the reader to the
+    // same interactive init. A doctrine that said "there is no setup step"
+    // would contradict all three and forbid the one step consent recovery
+    // requires — so what init is for is stated here rather than left to
+    // collide, while the agent is still told never to spend a turn on it
+    // before a run, and never to hand over a command it could run itself.
     const skill = SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "";
     expect(paragraphContaining(skill, "Configuration is automatic")).toBe(
-      "Configuration is automatic. `brigadier run` probes this machine for installed\nworker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by\ndefault — when none is there, and carries on. Never run `brigadier init` to make\na config appear: it has never been a prerequisite for a run, and a turn spent on\nit is a turn wasted. The one exception is not yours to take. Registering\nbrigadier's MCP server into a GUI application's own configuration takes a human's\nexplicit yes, and only the interactive question can ask for it — so if\n`brigadier install` reports a registration skipped for want of consent, pass that\nsentence to the user and let them run `brigadier init` once themselves.",
+      "Configuration is automatic. `brigadier run` probes this machine for installed\nworker CLIs, writes `$BRIGADIER_HOME/config.json` — `~/.brigadier/config.json` by\ndefault — when none is there, and carries on. Never send the user to\n`brigadier init` before a run: it has never been a prerequisite for one, and a\nturn spent on it is a turn wasted. Init is the setup step for HOSTS, not for\nruns, and that part is not yours to take: it asks which detected hosts to enable\nand records them, so a bare `brigadier install` exits 1 pointing at it when none\nare recorded, and registering brigadier's MCP server into a GUI application's own\nconfiguration takes a human's explicit yes that only its interactive question can\nask for. Pass either sentence to the user and let them run it once themselves.",
     );
     expect(
       paragraphContaining(
         SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
-        "There is no setup step",
+        "A run needs no setup",
       ),
     ).toBe(
-      "There is no setup step. Configuration is automatic: `brigadier run` probes this\nmachine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)\nwhen none is there, and carries on. Never run `brigadier init` to make a config\nappear; it is not a prerequisite. Its one real job belongs to a human: recording\nthe explicit yes that lets brigadier register its MCP server into a GUI\napplication's own configuration. If `brigadier install` reports a registration\nskipped for want of consent, pass that sentence to the user and let them run\n`brigadier init` once themselves.",
+      "A run needs no setup. Configuration is automatic: `brigadier run` probes this\nmachine, writes `$BRIGADIER_HOME/config.json` (default `~/.brigadier/config.json`)\nwhen none is there, and carries on. Never send the user to `brigadier init`\nbefore a run; it is not a prerequisite for one. Init is the setup step for HOSTS\ninstead, and that belongs to a human: it records which detected hosts to enable —\na bare `brigadier install` exits 1 pointing at it when none are recorded — and\nthe explicit yes that lets brigadier register its MCP server into a GUI\napplication's own configuration. Pass either sentence to the user and let them\nrun `brigadier init` once themselves.",
     );
     for (const doctrine of [
       skill,
       SURFACE_TEMPLATES["codex/skills/brigadier/SKILL.md"] ?? "",
       SURFACE_TEMPLATES["codex/AGENTS.md"] ?? "",
     ]) {
+      // Both are claims about `brigadier run`, and both are still false of it.
+      // `brigadier install` is the command that exits 1 pointing at init, and
+      // the doctrine above says so in its own words rather than these.
       expect(doctrine).not.toContain("must have been run once on this machine");
       expect(doctrine).not.toContain("exits 1 and tells you to run `init`");
     }
@@ -715,6 +770,417 @@ describe("the surface templates", () => {
 });
 
 describe("brigadier install", () => {
+  test("arguments preserve all, enabled, and explicit selection modes", () => {
+    expect(parseArguments([])).toEqual({
+      kind: "install",
+      selection: "enabled",
+      hosts: [],
+      dryRun: false,
+      force: false,
+    });
+    expect(parseArguments(["--all", "--force"])).toEqual({
+      kind: "install",
+      selection: "all",
+      hosts: [],
+      dryRun: false,
+      force: true,
+    });
+    expect(parseArguments(["codex", "--dry-run"])).toEqual({
+      kind: "install",
+      selection: "explicit",
+      hosts: ["codex"],
+      dryRun: true,
+      force: false,
+    });
+  });
+
+  test("--all installs only the three detected hosts and names the other four", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(["--all"], { HOME: home }, undefined, [
+        "claude-code",
+        "codex",
+        "opencode",
+      ]);
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(
+        result.stdout
+          .split("\n")
+          .filter((line) => line.includes("not detected on this machine")),
+      ).toEqual([
+        "  skipped    cursor (not detected on this machine)",
+        "  skipped    windsurf (not detected on this machine)",
+        "  skipped    antigravity (not detected on this machine)",
+        "  skipped    claude-desktop (not detected on this machine)",
+      ]);
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(true);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(true);
+      for (const path of guiRegistrationPaths(home)) {
+        expect(existsSync(path)).toBe(false);
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("--all with no detected hosts exits 1 and writes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(["--all"], { HOME: home }, undefined, []);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: no supported AI hosts were detected on this machine.\n",
+      );
+      expect(
+        result.stdout
+          .split("\n")
+          .filter((line) => line.includes("not detected on this machine")),
+      ).toHaveLength(7);
+      expect(readdirSync(home)).toEqual([]);
+
+      const forced = await install(
+        ["--all", "--force"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(forced.code).toBe(1);
+      expect(forced.stderr).toBe(result.stderr);
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install without recorded enabled hosts exits 1 and points to init", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install([], { HOME: home }, undefined, ["codex"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: no enabled hosts are recorded; run `brigadier init` to choose which detected hosts to install.\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a provided config snapshot bypasses the on-disk config read", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        "{ unreadable if consulted",
+        "utf8",
+      );
+      let stdout = "";
+      let stderr = "";
+      const code = await runInstall([], {
+        env: { HOME: home },
+        stdout: {
+          write: (chunk) => {
+            stdout += chunk;
+          },
+        },
+        stderr: {
+          write: (chunk) => {
+            stderr += chunk;
+          },
+        },
+        configSnapshot: parseConfig(JSON.parse(configBytes(false, ["cursor"]))),
+        detectHosts: (environment) =>
+          Promise.resolve(hostDetections(environment, ["cursor"])),
+      });
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("brigadier install cursor");
+      expect(stdout).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install writes only the detected intersection of enabled hosts", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false, ["claude-code", "codex"]),
+        "utf8",
+      );
+
+      const result = await install([], { HOME: home }, undefined, [
+        "claude-code",
+        "opencode",
+      ]);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine)\n",
+      );
+      expect(result.stdout).not.toContain("brigadier install opencode");
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(false);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("bare install names enabled hosts when none are currently detected", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false, ["codex", "cursor"]),
+        "utf8",
+      );
+
+      const result = await install([], { HOME: home }, undefined, ["opencode"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(
+        "brigadier install: none of the enabled hosts are currently detected: codex, cursor.\n",
+      );
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine)\n",
+      );
+      expect(result.stdout).toContain(
+        "  skipped    cursor (not detected on this machine)\n",
+      );
+      expect(existsSync(join(home, ".codex/AGENTS.md"))).toBe(false);
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+
+      const forced = await install(["--force"], { HOME: home }, undefined, [
+        "opencode",
+      ]);
+      expect(forced.code).toBe(1);
+      expect(forced.stderr).toBe(result.stderr);
+      expect(
+        existsSync(join(home, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * THE CONFIG IS READ ONCE PER INSTALL, and this is what that buys.
+   *
+   * It used to be read twice — once to resolve `enabledHosts`, once again for
+   * `guiRegistrationConsent` — and `writeConfig` publishes by renaming over the
+   * file, which `brigadier init` does. Two reads could therefore see two
+   * different files, and the installer would act on a permission assembled from
+   * one field of each: cursor from the file that withheld consent, consent from
+   * the file that had already dropped cursor. Neither file said yes.
+   *
+   * The swap is driven through the injected detection seam rather than by real
+   * concurrency, so it lands at exactly the instant between the old two reads
+   * every time this runs. A test that depended on timing would be worse than no
+   * test at all.
+   */
+  test("reads the config once, so a mid-install swap authorizes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      const configPath = join(home, ".brigadier/config.json");
+      // Snapshot A: cursor enabled, registration consent withheld.
+      await writeFile(configPath, configBytes(false, ["cursor"]), "utf8");
+
+      let stdout = "";
+      let stderr = "";
+      const io: InstallIo = {
+        env: { HOME: home },
+        stdout: {
+          write: (chunk: string) => {
+            stdout += chunk;
+          },
+        },
+        stderr: {
+          write: (chunk: string) => {
+            stderr += chunk;
+          },
+        },
+        // The detection seam is the moment between what used to be two reads.
+        detectHosts: async (environment) => {
+          // Snapshot B: consent granted, cursor dropped.
+          await writeFile(configPath, configBytes(true, ["codex"]), "utf8");
+          return hostDetections(environment, ["cursor"]);
+        },
+      };
+      const code = await runInstall([], io);
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      // The one snapshot that was read enabled cursor and withheld consent, so
+      // cursor is installed and its registration is skipped.
+      expect(stdout).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable config fails a bare install but not a named one", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      const configPath = join(home, ".brigadier/config.json");
+      await writeFile(configPath, "{ not json", "utf8");
+      const env = { HOME: home };
+
+      // "enabled" mode: a config that exists and cannot be parsed must not
+      // degrade into "no hosts enabled", which would be an empty selection the
+      // user never made.
+      const bare = await install([], env, undefined, ["cursor"]);
+      expect(bare.code).toBe(1);
+      expect(bare.stderr).toContain(
+        `brigadier install: could not read enabled hosts from ${configPath}`,
+      );
+      expect(bare.stderr).toContain(
+        "Run `brigadier init` to record them again.",
+      );
+
+      // The consent policy is the opposite one, deliberately: every failure is
+      // a no, and the install itself still runs.
+      for (const argv of [["cursor"], ["cursor", "--all"]]) {
+        const named = await install(argv, env, undefined, ["cursor"]);
+        expect(named.code).toBe(0);
+        expect(named.stdout).toContain(
+          "brigadier writes into another application's configuration only on an explicit yes",
+        );
+        expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a named undetected host is skipped unless --force overrides presence", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const skipped = await install(
+        ["claude-code"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(skipped.code).toBe(0);
+      expect(skipped.stdout).toContain(
+        "  skipped    claude-code (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+
+      const forced = await install(
+        ["claude-code", "--force"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(forced.code).toBe(0);
+      expect(forced.stdout).not.toContain("not detected");
+      expect(existsSync(join(home, ".claude/skills/brigadier/SKILL.md"))).toBe(
+        true,
+      );
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("GUI presence and registration consent are independent gates", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await mkdir(join(home, ".brigadier"), { recursive: true });
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(false),
+        "utf8",
+      );
+
+      const detectedWithoutConsent = await install(
+        ["cursor"],
+        { HOME: home },
+        undefined,
+        ["cursor"],
+      );
+      expect(detectedWithoutConsent.stdout).toContain(
+        "Nothing else, including --force, grants it.",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+
+      await writeFile(
+        join(home, ".brigadier/config.json"),
+        configBytes(true),
+        "utf8",
+      );
+      const consentWithoutDetection = await install(
+        ["cursor"],
+        { HOME: home },
+        undefined,
+        [],
+      );
+      expect(consentWithoutDetection.stdout).toContain(
+        "  skipped    cursor (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(consentWithoutDetection.stdout).not.toContain(
+        "Nothing else, including --force, grants it.",
+      );
+      expect(existsSync(join(home, ".cursor/mcp.json"))).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("--dry-run reports presence gating and writes nothing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
+    try {
+      const result = await install(
+        ["claude-code", "codex", "--dry-run"],
+        { HOME: home },
+        undefined,
+        ["claude-code"],
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(
+        "  skipped    codex (not detected on this machine; re-run with --force to install it anyway)\n",
+      );
+      expect(result.stdout).toContain(
+        "dry run: 6 written, 0 unchanged, 1 skipped, 0 refused.\n",
+      );
+      expect(readdirSync(home)).toEqual([]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test("--all --dry-run names every destination and writes nothing", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
@@ -847,7 +1313,7 @@ describe("brigadier install", () => {
         SURFACE_TEMPLATES["claude-code/SKILL.md"] ?? "",
       );
       expect(hashOf(await readFile(join(skill, "SKILL.md"), "utf8"))).toBe(
-        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+        "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
       );
       expect(
         await readFile(join(skill, ".claude-plugin/plugin.json"), "utf8"),
@@ -875,7 +1341,7 @@ describe("brigadier install", () => {
         `${skill}/hooks/nudge.mjs`,
       ]);
       expect(manifest.files[`${skill}/SKILL.md`]).toBe(
-        "0cb9faa8a75183bb70b6b08e08a819375affcc96558cd56937cc984b08a3da55",
+        "af2708738548ecd5896d74a1c84779f55d9d6c9192079d23e1d5f15f79edbe19",
       );
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -1588,17 +2054,22 @@ describe("brigadier install", () => {
         "utf8",
       );
 
-      const result = await install(["cursor", "windsurf"], {
-        HOME: home,
-        BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
-      });
+      const result = await install(
+        ["cursor", "windsurf"],
+        {
+          HOME: home,
+          BRIGADIER_MCP_COMMAND: "/usr/local/bin/brigadier",
+        },
+        undefined,
+        ["cursor"],
+      );
       expect(result.code).toBe(0);
       expect(verdictLines(result.stdout)).toEqual([
+        "  skipped    windsurf (not detected on this machine; re-run with --force to install it anyway)",
         `  created    ${home}/.cursor/mcp.json`,
-        `  skipped    ${home}/.codeium/windsurf/mcp_config.json`,
       ]);
       expect(result.stdout).toContain(
-        `${home}/.codeium/windsurf does not exist, so this host is not installed on this machine. brigadier does not create another product's configuration directory.`,
+        "windsurf (not detected on this machine; re-run with --force to install it anyway)",
       );
       expect(existsSync(join(home, ".codeium"))).toBe(false);
     } finally {
@@ -1699,19 +2170,13 @@ describe("brigadier install", () => {
     }
   });
 
-  test("usage errors exit 2 and help exits 0", async () => {
+  test("unknown arguments exit 2 and help exits 0", async () => {
     const home = await mkdtemp(join(tmpdir(), "brigadier-install-"));
     try {
       const unknown = await install(["emacs"], { HOME: home });
       expect(unknown.code).toBe(2);
       expect(unknown.stderr.split("\n")[0]).toBe(
         'brigadier install: unknown host "emacs"; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop',
-      );
-
-      const none = await install([], { HOME: home });
-      expect(none.code).toBe(2);
-      expect(none.stderr.split("\n")[0]).toBe(
-        "brigadier install: name at least one host, or pass --all; known hosts are claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop",
       );
 
       const badOption = await install(["--frobnicate"], { HOME: home });
@@ -1724,7 +2189,7 @@ describe("brigadier install", () => {
       expect(help.code).toBe(0);
       expect(help.stderr).toBe("");
       expect(help.stdout.split("\n")[0]).toBe(
-        "Usage: brigadier install <host>... [options]",
+        "Usage: brigadier install [<host>...] [options]",
       );
     } finally {
       await rm(home, { recursive: true, force: true });

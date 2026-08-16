@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Host, ParsedBrigadierConfig } from "../src/config/contracts.ts";
 import type { BrigadierConfig, ConfigIo } from "../src/config/index.ts";
 import {
   CONFIG_VERSION,
@@ -40,7 +41,8 @@ const REAL_HOME_TOKENS: readonly string[] = [
   "process.env.".concat("HOME"),
 ];
 
-const CANONICAL: BrigadierConfig = {
+/** The canonical config exactly as a caller writes it, with no enabledHosts. */
+const CANONICAL_LITERAL: BrigadierConfig = {
   version: CONFIG_VERSION,
   vendors: [
     {
@@ -59,6 +61,13 @@ const CANONICAL: BrigadierConfig = {
   guiRegistrationConsent: false,
   allowDegradedRouting: false,
 };
+
+/**
+ * The same config in the shape a reader gets back. `readConfig` and
+ * `writeConfig` both return `ParsedBrigadierConfig`, so an expectation typed as
+ * the looser input shape is not comparable to one.
+ */
+const CANONICAL = parseConfig(CANONICAL_LITERAL);
 
 const CANONICAL_BYTES = `{
   "version": 3,
@@ -184,9 +193,46 @@ describe("effort ladder narrowing", () => {
 });
 
 describe("parseConfig", () => {
+  test("accepts a literal without enabledHosts and returns a required array", () => {
+    const input: BrigadierConfig = structuredClone(CANONICAL);
+    const output: ParsedBrigadierConfig = parseConfig(input);
+
+    expect(output.enabledHosts).toEqual([]);
+  });
+
   test("accepts a canonical config unchanged", () => {
-    expect(parseConfig(structuredClone(CANONICAL))).toEqual(CANONICAL);
+    expect<BrigadierConfig>(parseConfig(structuredClone(CANONICAL))).toEqual(
+      CANONICAL,
+    );
+    expect(parseConfig(structuredClone(CANONICAL)).enabledHosts).toEqual([]);
     expect(serializeConfig(CANONICAL)).toBe(CANONICAL_BYTES);
+    expect(serializeConfig(parseConfig(structuredClone(CANONICAL)))).toBe(
+      CANONICAL_BYTES,
+    );
+  });
+
+  test("validates and canonically orders enabled hosts", () => {
+    const parsed = parseConfig({
+      ...CANONICAL,
+      enabledHosts: ["claude-desktop", "codex", "cursor"],
+    });
+
+    expect(parsed.enabledHosts).toEqual(["codex", "cursor", "claude-desktop"]);
+    expect(JSON.parse(serializeConfig(parsed)).enabledHosts).toEqual([
+      "codex",
+      "cursor",
+      "claude-desktop",
+    ]);
+    expect(() =>
+      parseConfig({ ...CANONICAL, enabledHosts: ["codex", "not-a-host"] }),
+    ).toThrow(
+      'invalid brigadier config: enabledHosts[1] must be one of claude-code, codex, opencode, cursor, windsurf, antigravity, claude-desktop, received "not-a-host"',
+    );
+    expect(() =>
+      parseConfig({ ...CANONICAL, enabledHosts: ["codex", "codex"] }),
+    ).toThrow(
+      'invalid brigadier config: enabledHosts contains duplicate host "codex"',
+    );
   });
 
   /**
@@ -484,6 +530,31 @@ describe("atomic config write", () => {
       await expect(readConfig(path)).rejects.toThrow(ConfigValidationError);
     });
   });
+
+  /**
+   * The store's two functions declare what `parseConfig` actually produces, so
+   * `enabledHosts` arrives as a required array. The annotations below are the
+   * assertion: neither compiles if either function goes back to promising the
+   * input shape, whose `enabledHosts` is optional.
+   */
+  test("hands back a required enabledHosts, with no undefined to defend against", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const persisted = await writeConfig(path, {
+        ...CANONICAL,
+        enabledHosts: ["codex"],
+      });
+      const written: readonly Host[] = persisted.enabledHosts;
+      expect(written).toEqual(["codex"]);
+
+      const read = await readConfig(path);
+      if (read === null) {
+        throw new Error("the config just written could not be read back");
+      }
+      const hosts: readonly Host[] = read.enabledHosts;
+      expect(hosts).toEqual(["codex"]);
+    });
+  });
 });
 
 describe("lazy config", () => {
@@ -653,6 +724,7 @@ describe("lazy config", () => {
           linkedSecretPaths: [".env"],
           guiRegistrationConsent: true,
           allowDegradedRouting: true,
+          enabledHosts: ["claude-desktop", "codex"],
         }),
       );
       const stderr = collector();
@@ -668,6 +740,7 @@ describe("lazy config", () => {
       expect(result.config.linkedSecretPaths).toEqual([".env"]);
       expect(result.config.allowDegradedRouting).toBe(true);
       expect(result.config.guiRegistrationConsent).toBe(false);
+      expect(result.config.enabledHosts).toEqual(["codex", "claude-desktop"]);
       expect((await readConfig(path))?.version).toBe(CONFIG_VERSION);
       expect(stderr.text()).toContain("has version 2");
     });
@@ -692,7 +765,7 @@ describe("lazy config", () => {
       });
 
       expect(result).toEqual({
-        config: CANONICAL,
+        config: parseConfig(CANONICAL),
         path,
         written: false,
         inMemory: false,

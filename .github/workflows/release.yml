@@ -120,7 +120,7 @@ jobs:
             echo "Release binary did not satisfy the notarization requirement and is not ad-hoc signed" >&2
           fi
           exit 1
-      - name: Assemble release archive and platform npm package
+      - name: Assemble release archive
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -131,70 +131,11 @@ jobs:
           fi
           cd release-packages
           shasum -a 256 "brigadier-${version}-${{ matrix.platform }}.tar.gz" > "brigadier-${version}-${{ matrix.platform }}.tar.gz.sha256"
-          cd ..
-          bun ./scripts/assemble-platform-package.ts "${{ matrix.platform }}" ./release-bin/brigadier ./release-packages
       - uses: actions/upload-artifact@v6.0.0
         with:
           name: release-${{ matrix.platform }}
           path: release-packages/*
           if-no-files-found: error
-
-  package-root:
-    name: Package root npm module
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: oven-sh/setup-bun@v2.2.0
-        with:
-          bun-version: 1.3.14
-      - run: bun install --frozen-lockfile
-      - name: Build MCP output when its source slice is present
-        shell: bash
-        run: |
-          if [[ -f src/mcp/server.ts ]]; then
-            bun run build:mcp
-          else
-            echo "src/mcp/server.ts is not present; packaging the declared MCP shim without its future build output"
-          fi
-      - run: mkdir -p release-packages && npm pack --pack-destination release-packages
-      - uses: actions/upload-artifact@v6.0.0
-        with:
-          name: release-root-npm
-          path: release-packages/*.tgz
-          if-no-files-found: error
-
-  publish-npm:
-    name: Publish npm packages
-    needs:
-      - build-platform
-      - package-root
-    runs-on: ubuntu-latest
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-    steps:
-      - uses: actions/download-artifact@v7.0.0
-        with:
-          pattern: release-*
-          path: release-packages
-          merge-multiple: true
-      - uses: actions/setup-node@v6.5.0
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-      - name: Publish platform packages before root package
-        if: env.NPM_TOKEN != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          for package in release-packages/stephen-golban-brigadier-darwin-*.tgz release-packages/stephen-golban-brigadier-linux-*.tgz; do
-            npm publish "${package}" --access public
-          done
-          npm publish "release-packages/stephen-golban-brigadier-${version}.tgz" --access public
-      - name: Publication disabled
-        if: env.NPM_TOKEN == ''
-        run: echo "NPM_TOKEN is unset; npm publication is disabled"
 
   publish-github:
     name: Publish GitHub release
@@ -204,21 +145,62 @@ jobs:
       contents: write
     env:
       RELEASE_PUBLISH_ENABLED: ${{ secrets.RELEASE_PUBLISH_ENABLED }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.3.14
       - uses: actions/download-artifact@v7.0.0
         with:
           pattern: release-*
           path: release-packages
           merge-multiple: true
+      - name: Assemble combined checksums
+        shell: bash
+        run: |
+          cd release-packages
+          shopt -s nullglob
+          release_assets=(*.tar.gz *.tar.gz.sha256 *.dmg)
+          if (( ${#release_assets[@]} == 0 )); then
+            echo "No release artifacts were downloaded" >&2
+            exit 1
+          fi
+          shasum -a 256 "${release_assets[@]}" > checksums.txt
       - name: Create GitHub release
         if: env.RELEASE_PUBLISH_ENABLED == 'true'
         shell: bash
         run: |
           shopt -s nullglob
-          assets=(release-packages/*.tar.gz release-packages/*.tar.gz.sha256 release-packages/*.dmg)
+          assets=(release-packages/*.tar.gz release-packages/*.tar.gz.sha256 release-packages/*.dmg release-packages/checksums.txt)
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
             --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+      - name: Check out Homebrew tap
+        if: >-
+          env.RELEASE_PUBLISH_ENABLED == 'true' &&
+          env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stephen-golban/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update Homebrew formula from release artifacts
+        if: >-
+          env.RELEASE_PUBLISH_ENABLED == 'true' &&
+          env.HOMEBREW_TAP_TOKEN != ''
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          bun ./scripts/update-homebrew-formula.ts "${version}" ./release-packages ./homebrew-tap/Formula/brigadier.rb
+          git -C ./homebrew-tap config user.name "github-actions[bot]"
+          git -C ./homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C ./homebrew-tap add Formula/brigadier.rb
+          git -C ./homebrew-tap commit -m "Update Homebrew formula to ${GITHUB_REF_NAME}"
+          git -C ./homebrew-tap push origin HEAD
+      - name: Homebrew formula update disabled
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: echo "HOMEBREW_TAP_TOKEN is unset; Homebrew formula update is disabled"
       - name: Publication disabled
         if: env.RELEASE_PUBLISH_ENABLED != 'true'
         run: echo "RELEASE_PUBLISH_ENABLED is not true; GitHub release publication is disabled"

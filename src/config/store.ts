@@ -17,7 +17,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import type { BrigadierConfig } from "./contracts.js";
+import type { BrigadierConfig, ParsedBrigadierConfig } from "./contracts.js";
 import { ConfigValidationError, parseConfig } from "./contracts.js";
 
 export const CONFIG_HOME_VARIABLE = "BRIGADIER_HOME";
@@ -29,6 +29,9 @@ const FILE_MODE = 0o600;
 
 /** The subset of the process environment config resolution consults. */
 export type ConfigEnvironment = Readonly<Record<string, string | undefined>>;
+
+/** The filesystem node kinds host detection can use as evidence. */
+export type PathKind = "file" | "directory" | "other";
 
 /**
  * The filesystem operations the store needs. Injecting this port keeps the
@@ -43,6 +46,8 @@ export interface ConfigIo {
   unlink(path: string): Promise<void>;
   /** Optional because older injected stores predate GUI-host detection. */
   exists?(path: string): Promise<boolean>;
+  /** Optional so injected stores that only provide kind-blind existence work. */
+  pathKind?(path: string): Promise<PathKind | null>;
 }
 
 export const nodeConfigIo: ConfigIo = {
@@ -90,6 +95,30 @@ export const nodeConfigIo: ConfigIo = {
   },
 };
 
+// Keep this optional capability out of object spreads. Existing injected fakes
+// commonly spread nodeConfigIo and replace only `exists`; inheriting the real
+// pathKind probe would bypass their fake filesystem entirely.
+Object.defineProperty(nodeConfigIo, "pathKind", {
+  enumerable: false,
+  async value(path: string): Promise<PathKind | null> {
+    try {
+      const metadata = await stat(path);
+      if (metadata.isFile()) {
+        return "file";
+      }
+      if (metadata.isDirectory()) {
+        return "directory";
+      }
+      return "other";
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return null;
+      }
+      throw error;
+    }
+  },
+});
+
 /** `$BRIGADIER_HOME`, defaulting to `$HOME/.brigadier`. POSIX paths only. */
 export function resolveConfigHome(environment: ConfigEnvironment): string {
   const explicit = environment[CONFIG_HOME_VARIABLE]?.trim() ?? "";
@@ -118,11 +147,16 @@ export function serializeConfig(config: BrigadierConfig): string {
 /**
  * Reads and validates the config. Returns `null` when no config exists yet and
  * throws `ConfigValidationError` when one exists but cannot be trusted.
+ *
+ * The result is the `ParsedBrigadierConfig` `parseConfig` actually produces
+ * rather than the looser input shape, so a caller reading `enabledHosts` gets a
+ * required array and never has to defend against an `undefined` that this
+ * function cannot return.
  */
 export async function readConfig(
   path: string,
   io: ConfigIo = nodeConfigIo,
-): Promise<BrigadierConfig | null> {
+): Promise<ParsedBrigadierConfig | null> {
   let contents: string;
   try {
     contents = await io.readFile(path);
@@ -148,12 +182,16 @@ export async function readConfig(
  * Validates, then writes through a temp file in the same directory and renames
  * over the target, so an interrupted write can never leave a partial or
  * unreadable config behind. Returns the config exactly as persisted.
+ *
+ * The PARAMETER stays `BrigadierConfig` — a caller may legitimately hand over a
+ * config with no `enabledHosts` key — while the result is what was validated
+ * and written, which always has one.
  */
 export async function writeConfig(
   path: string,
   config: BrigadierConfig,
   io: ConfigIo = nodeConfigIo,
-): Promise<BrigadierConfig> {
+): Promise<ParsedBrigadierConfig> {
   const validated = parseConfig(config);
   const directory = dirname(path);
   await io.mkdir(directory);

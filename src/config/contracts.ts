@@ -46,6 +46,15 @@ export const GUI_HOSTS = [
 ] as const;
 export type GuiHost = (typeof GUI_HOSTS)[number];
 
+/** Every AI coding host brigadier can install its doctrine into. */
+export const HOSTS = [
+  "claude-code",
+  "codex",
+  "opencode",
+  ...GUI_HOSTS,
+] as const;
+export type Host = (typeof HOSTS)[number];
+
 /**
  * Brigadier's own effort ladder, ordered lowest to highest. Vendor CLIs report
  * richer ladders (Codex reports `low|medium|high|xhigh|max|ultra`); levels with
@@ -84,6 +93,14 @@ export interface VendorConfig {
 export interface BrigadierConfig {
   readonly version: typeof CONFIG_VERSION;
   readonly vendors: readonly VendorConfig[];
+  /**
+   * Hosts the user selected from the set detected by `brigadier init`.
+   *
+   * Optional only on the input/literal shape so existing callers can supply a
+   * version-3 config written before this field existed. `parseConfig` returns
+   * `ParsedBrigadierConfig`, where the property is always a required array.
+   */
+  readonly enabledHosts?: readonly Host[];
   /** Consent to link secret files into worker worktrees. */
   readonly secretsConsent: boolean;
   /** Repository-relative `.env`-shaped files approved for worker worktrees. */
@@ -115,6 +132,11 @@ export interface BrigadierConfig {
   readonly allowDegradedRouting: boolean;
 }
 
+/** A validated config returned to readers, with every default materialized. */
+export interface ParsedBrigadierConfig extends BrigadierConfig {
+  readonly enabledHosts: readonly Host[];
+}
+
 /** Raised by `parseConfig` and by every config transform in `init`. */
 export class ConfigValidationError extends Error {
   readonly issues: readonly string[];
@@ -132,6 +154,7 @@ const KNOWN_VENDORS: ReadonlySet<string> = new Set(
 const CONFIG_KEYS: ReadonlySet<string> = new Set([
   "version",
   "vendors",
+  "enabledHosts",
   "secretsConsent",
   "linkedSecretPaths",
   "guiRegistrationConsent",
@@ -197,11 +220,12 @@ function isEffort(value: unknown): value is Effort {
 }
 
 /**
- * Validates an untrusted value into a `BrigadierConfig`, rejecting unknown keys
- * so nothing outside the documented surface can be smuggled into the file.
- * Returns a fresh, canonically ordered object.
+ * Validates an untrusted value into a `ParsedBrigadierConfig`, rejecting
+ * unknown keys so nothing outside the documented surface can be smuggled into
+ * the file. Returns a fresh, canonically ordered object with all reader
+ * defaults materialized.
  */
-export function parseConfig(value: unknown): BrigadierConfig {
+export function parseConfig(value: unknown): ParsedBrigadierConfig {
   const root = asRecord(value);
   if (root === null) {
     throw new ConfigValidationError(["config must be a JSON object"]);
@@ -224,6 +248,8 @@ export function parseConfig(value: unknown): BrigadierConfig {
 
   const issues: string[] = [];
   rejectUnknownKeys(root, CONFIG_KEYS, "config", issues);
+
+  const enabledHosts = parseEnabledHosts(root.enabledHosts, issues);
 
   if (typeof root.secretsConsent !== "boolean") {
     issues.push("secretsConsent must be a boolean");
@@ -258,14 +284,56 @@ export function parseConfig(value: unknown): BrigadierConfig {
   if (issues.length > 0) {
     throw new ConfigValidationError(issues);
   }
-  return {
+  const config: ParsedBrigadierConfig = {
     version: CONFIG_VERSION,
     vendors,
+    enabledHosts,
     secretsConsent: root.secretsConsent === true,
     linkedSecretPaths,
     guiRegistrationConsent: root.guiRegistrationConsent === true,
     allowDegradedRouting: root.allowDegradedRouting === true,
   };
+
+  if (enabledHosts.length === 0) {
+    // Readers always receive one shape, while every empty selection stays
+    // byte-for-byte quiet when spread or serialized. This deliberately erases
+    // any distinction between an absent field and an explicitly empty one.
+    Object.defineProperty(config, "enabledHosts", {
+      value: enabledHosts,
+      enumerable: false,
+    });
+  }
+  return config;
+}
+
+function parseEnabledHosts(value: unknown, issues: string[]): readonly Host[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    issues.push("enabledHosts must be an array when present");
+    return [];
+  }
+
+  const knownHosts: ReadonlySet<string> = new Set(HOSTS);
+  const seen = new Set<Host>();
+  for (const [index, host] of value.entries()) {
+    if (typeof host !== "string" || !knownHosts.has(host)) {
+      issues.push(
+        `enabledHosts[${index}] must be one of ${HOSTS.join(", ")}, received ${JSON.stringify(host)}`,
+      );
+      continue;
+    }
+    const known = host as Host;
+    if (seen.has(known)) {
+      issues.push(
+        `enabledHosts contains duplicate host ${JSON.stringify(host)}`,
+      );
+      continue;
+    }
+    seen.add(known);
+  }
+  return HOSTS.filter((host) => seen.has(host));
 }
 
 function parseLinkedSecretPaths(

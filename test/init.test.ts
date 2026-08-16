@@ -13,10 +13,17 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import packageJson from "../package.json";
-import type { BrigadierConfig } from "../src/config/index.ts";
+import type { Host } from "../src/config/contracts.ts";
+import type {
+  BrigadierConfig,
+  ConfigIo,
+  PathKind,
+} from "../src/config/index.ts";
 import {
+  parseConfig,
   readConfig,
   resolveConfigPath,
+  serializeConfig,
   writeConfig,
 } from "../src/config/index.ts";
 import { nodeConfigIo } from "../src/config/store.ts";
@@ -29,6 +36,7 @@ import type { InputStream, OutputStream } from "../src/init/index.ts";
 import {
   DEGRADED_ROUTING_QUESTION,
   EFFORT_CEILING_WARNING,
+  NO_HOSTS_DETECTED,
   proposeConfig,
   runCli,
   runInit,
@@ -187,7 +195,7 @@ const BOTH_VENDORS_REPORT: DiscoveryReport = {
   warnings: [],
 };
 
-const BOTH_VENDORS_CONFIG: BrigadierConfig = {
+const BOTH_VENDORS_LITERAL: BrigadierConfig = {
   version: 3,
   vendors: [
     {
@@ -218,6 +226,13 @@ const BOTH_VENDORS_CONFIG: BrigadierConfig = {
   guiRegistrationConsent: false,
   allowDegradedRouting: false,
 };
+
+/**
+ * The same config in the shape a reader gets back. `readConfig` returns
+ * `ParsedBrigadierConfig`, whose `enabledHosts` is a required array, so an
+ * expectation typed as the looser input shape is not comparable to one.
+ */
+const BOTH_VENDORS_CONFIG = parseConfig(BOTH_VENDORS_LITERAL);
 
 describe("brigadier init --yes", () => {
   test("writes the proposed config to $BRIGADIER_HOME and exits 0", async () => {
@@ -1346,7 +1361,7 @@ describe("re-running init", () => {
   test("shows current values as the defaults and discards nothing", async () => {
     await withScratchHome(async (scratchHome) => {
       const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
-      const prior: BrigadierConfig = {
+      const priorLiteral: BrigadierConfig = {
         version: 3,
         vendors: [
           {
@@ -1365,6 +1380,9 @@ describe("re-running init", () => {
         guiRegistrationConsent: false,
         allowDegradedRouting: true,
       };
+      // Parsed for the same reason BOTH_VENDORS_CONFIG is: this is compared
+      // against what `readConfig` returns, which is a `ParsedBrigadierConfig`.
+      const prior = parseConfig(priorLiteral);
       await writeConfig(path, prior);
 
       const code = await runInit({
@@ -1746,6 +1764,419 @@ describe("command line", () => {
     });
   });
 });
+
+/**
+ * `brigadier init` is the one setup step, so it has to ask which of the hosts
+ * on this machine to set brigadier up for, record the answer, and then install
+ * into exactly those.
+ *
+ * EVERY TEST HERE INJECTS DETECTION, and that is not fussiness. The machine
+ * running this suite has real `claude` and `codex` binaries on PATH and a home
+ * directory full of host markers; a test that let the real probe run would
+ * detect them, pass for the wrong reason, and fail in CI where neither exists.
+ * The environments below therefore carry no PATH at all and point HOME at the
+ * scratch directory, and the probe answers from a fixed map of marker paths.
+ */
+describe("host selection", () => {
+  const SKILL_HOSTS: readonly Host[] = ["claude-code", "codex", "opencode"];
+  const GUI: readonly Host[] = [
+    "cursor",
+    "windsurf",
+    "antigravity",
+    "claude-desktop",
+  ];
+  const EVERY_HOST: readonly Host[] = [...SKILL_HOSTS, ...GUI];
+
+  test("offers each detected host with its evidence and its default", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const markers = hostMarkerPaths(scratchHome);
+      const io = markerIo(scratchHome, EVERY_HOST);
+      const stdout = collector();
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // An empty script answers every prompt with its default, which is what
+        // the recorded selection below is a statement about.
+        stdin: scriptedInput([]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      const transcript = stdout.text();
+      for (const host of SKILL_HOSTS) {
+        const marker = markers[host];
+        expect(transcript).toContain(
+          `Set brigadier up for ${host}? (detected by ${marker.kind} ${marker.path}) [Y/n]`,
+        );
+      }
+      for (const host of GUI) {
+        const marker = markers[host];
+        expect(transcript).toContain(
+          `Set brigadier up for ${host}? (detected by ${marker.kind} ${marker.path}) [y/N]`,
+        );
+      }
+
+      // The defaults were taken, so exactly the three skill hosts are recorded.
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        io,
+      );
+      expect(written?.enabledHosts).toEqual([...SKILL_HOSTS]);
+    });
+  });
+
+  test("never offers a host the probe did not find", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const io = markerIo(scratchHome, ["codex"]);
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, secrets, then codex — the only
+        // host question, because no GUI host was detected either.
+        stdin: scriptedInput(["", "", "", "n", "n"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      const transcript = stdout.text();
+      expect(transcript).toContain("Set brigadier up for codex?");
+      for (const host of EVERY_HOST.filter((entry) => entry !== "codex")) {
+        expect(transcript).not.toContain(`Set brigadier up for ${host}?`);
+      }
+      // Answered no, so nothing was recorded and nothing was installed.
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        io,
+      );
+      expect(written?.enabledHosts).toEqual([]);
+      expect(await readdir(scratchHome)).toEqual(["config.json"]);
+    });
+  });
+
+  test("a host already enabled defaults to yes on a re-run", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const path = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const io = markerIo(scratchHome, ["cursor"]);
+      await writeConfig(
+        path,
+        {
+          version: 3,
+          vendors: [
+            {
+              vendor: "codex",
+              executable: "/opt/homebrew/bin/codex",
+              version: "0.145.0",
+              defaultModel: "gpt-5.6-sol",
+              models: [{ id: "gpt-5.6-sol", effortCeiling: "high" }],
+            },
+          ],
+          enabledHosts: ["cursor"],
+          secretsConsent: false,
+          linkedSecretPaths: [],
+          guiRegistrationConsent: false,
+          allowDegradedRouting: false,
+        },
+        io,
+      );
+      await mkdir(join(scratchHome, ".cursor"), { recursive: true });
+
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, GUI consent, secrets; the cursor
+        // question is left to its default, which is the point.
+        stdin: scriptedInput(["", "", "", "n", "n"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      // `[Y/n]`, not the fresh-config `[y/N]`: a recorded choice is never
+      // discarded by pressing enter.
+      expect(stdout.text()).toContain(
+        `Set brigadier up for cursor? (detected by directory ${join(scratchHome, ".cursor")}) [Y/n]`,
+      );
+      expect((await readConfig(path, io))?.enabledHosts).toEqual(["cursor"]);
+    });
+  });
+
+  test("records exactly the hosts answered yes, and installs exactly those", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const io = markerIo(scratchHome, SKILL_HOSTS);
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, secrets, then yes / no / yes.
+        stdin: scriptedInput(["", "", "", "n", "y", "n", "y"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        io,
+      );
+      expect(written?.enabledHosts).toEqual(["claude-code", "opencode"]);
+
+      const transcript = stdout.text();
+      expect(transcript).toContain("\nbrigadier install claude-code\n\n");
+      expect(transcript).toContain("\nbrigadier install opencode\n\n");
+      expect(transcript).not.toContain("\nbrigadier install codex\n\n");
+
+      // The files, not just the transcript: the two chosen hosts got their
+      // doctrine and the refused one got nothing.
+      expect(
+        existsSync(join(scratchHome, ".claude/skills/brigadier/SKILL.md")),
+      ).toBe(true);
+      expect(
+        existsSync(join(scratchHome, ".config/opencode/plugin/brigadier.js")),
+      ).toBe(true);
+      expect(existsSync(join(scratchHome, ".codex/AGENTS.md"))).toBe(false);
+      expect(existsSync(join(scratchHome, ".agents/skills/brigadier"))).toBe(
+        false,
+      );
+    });
+  });
+
+  test("--yes enables the detected skill hosts and leaves every GUI host out", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const io = markerIo(scratchHome, EVERY_HOST);
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        assumeYes: true,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        io,
+      );
+      // Writing into another product's configuration file needs an explicit
+      // human yes, and --yes is not one.
+      expect(written?.enabledHosts).toEqual([...SKILL_HOSTS]);
+      for (const host of GUI) {
+        expect(written?.enabledHosts).not.toContain(host);
+      }
+      expect(existsSync(join(scratchHome, ".cursor/mcp.json"))).toBe(false);
+
+      const transcript = stdout.text();
+      expect(transcript).toContain(
+        `  enabled  codex  (detected by file ${join(scratchHome, ".codex/config.toml")})`,
+      );
+      expect(transcript).toContain(
+        `  skipped  cursor  (detected by directory ${join(scratchHome, ".cursor")})`,
+      );
+    });
+  });
+
+  test("an enabled GUI host is still not written without registration consent", async () => {
+    await withScratchHome(async (scratchHome) => {
+      await mkdir(join(scratchHome, ".cursor"), { recursive: true });
+      const io = markerIo(scratchHome, ["cursor"]);
+      const stdout = collector();
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, GUI consent NO, secrets, cursor YES
+        stdin: scriptedInput(["", "", "", "n", "n", "y"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      const written = await readConfig(
+        resolveConfigPath({ BRIGADIER_HOME: scratchHome }),
+        io,
+      );
+      expect(written?.enabledHosts).toEqual(["cursor"]);
+      expect(written?.guiRegistrationConsent).toBe(false);
+      // Enabling a host says where brigadier may be set up. It does not say
+      // brigadier may write into that product's own configuration file.
+      expect(existsSync(join(scratchHome, ".cursor/mcp.json"))).toBe(false);
+      expect(stdout.text()).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+    });
+  });
+
+  test("installs from the config snapshot returned by the write, not a replacement file", async () => {
+    await withScratchHome(async (scratchHome) => {
+      await mkdir(join(scratchHome, ".cursor"), { recursive: true });
+      const configPath = resolveConfigPath({ BRIGADIER_HOME: scratchHome });
+      const baseIo = markerIo(scratchHome, ["cursor"]);
+      const configReads: string[] = [];
+      const replacement = parseConfig({
+        ...BOTH_VENDORS_LITERAL,
+        enabledHosts: ["cursor"],
+        guiRegistrationConsent: true,
+      });
+      const io: ConfigIo = {
+        ...baseIo,
+        readFile: async (path) => {
+          configReads.push(path);
+          return baseIo.readFile(path);
+        },
+        rename: async (from, to) => {
+          await baseIo.rename(from, to);
+          if (to === configPath) {
+            // Deterministically replace the file after init publishes its
+            // consent=false config but before writeConfig returns to runInit.
+            await writeFile(to, serializeConfig(replacement), "utf8");
+          }
+        },
+      };
+      const stdout = collector();
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        // model, ceilings, degraded routing, GUI consent NO, secrets, cursor YES
+        stdin: scriptedInput(["", "", "", "n", "n", "y"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      // Init's injected store performed its one pre-write read. The installer
+      // did not ask that store for config again after the write.
+      expect(configReads).toEqual([configPath]);
+      expect(JSON.parse(await readFile(configPath, "utf8"))).toEqual(
+        replacement,
+      );
+      // The replacement file says yes. Only the exact parsed value returned by
+      // writeConfig says no, so this skipped registration proves which value
+      // the installer used.
+      expect(existsSync(join(scratchHome, ".cursor/mcp.json"))).toBe(false);
+      expect(stdout.text()).toContain(
+        "brigadier writes into another application's configuration only on an explicit yes",
+      );
+    });
+  });
+
+  test("installs from the handed-over snapshot when this run records yes", async () => {
+    await withScratchHome(async (scratchHome) => {
+      await mkdir(join(scratchHome, ".cursor"), { recursive: true });
+      const io = markerIo(scratchHome, ["cursor"]);
+
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout: collector(),
+        stderr: collector(),
+        // model, ceilings, degraded routing, GUI consent YES, secrets, cursor YES
+        stdin: scriptedInput(["", "", "", "y", "n", "y"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      // There was no consent before this run. The registration exists because
+      // the exact config returned by this run's write carried consent.
+      const registration = JSON.parse(
+        await readFile(join(scratchHome, ".cursor/mcp.json"), "utf8"),
+      ) as { mcpServers: { brigadier: { args: readonly string[] } } };
+      expect(registration.mcpServers.brigadier.args).toEqual(["mcp"]);
+    });
+  });
+
+  test("says so plainly when nothing was detected, and finishes anyway", async () => {
+    await withScratchHome(async (scratchHome) => {
+      const io = markerIo(scratchHome, []);
+      const stdout = collector();
+      const code = await runInit({
+        discoverer: fakeDiscoverer(CODEX_REPORT),
+        env: { BRIGADIER_HOME: scratchHome, HOME: scratchHome },
+        stdout,
+        stderr: collector(),
+        stdin: scriptedInput(["", "", "", "n"]),
+        assumeYes: false,
+        printConfig: false,
+        io,
+      });
+
+      expect(code).toBe(0);
+      expect(stdout.text()).toContain(NO_HOSTS_DETECTED);
+      expect(stdout.text()).not.toContain("Set brigadier up for");
+      // Nothing was installed, so the config is the only thing written.
+      expect(await readdir(scratchHome)).toEqual(["config.json"]);
+    });
+  });
+});
+
+/** The marker each host is detected by, and what kind of thing it is. */
+function hostMarkerPaths(
+  home: string,
+): Readonly<Record<Host, { readonly path: string; readonly kind: PathKind }>> {
+  return {
+    "claude-code": { path: join(home, ".claude/settings.json"), kind: "file" },
+    codex: { path: join(home, ".codex/config.toml"), kind: "file" },
+    opencode: {
+      path: join(home, ".config/opencode/opencode.json"),
+      kind: "file",
+    },
+    cursor: { path: join(home, ".cursor"), kind: "directory" },
+    windsurf: { path: join(home, ".codeium/windsurf"), kind: "directory" },
+    antigravity: { path: join(home, ".antigravity"), kind: "directory" },
+    "claude-desktop": {
+      path: join(home, "Library/Application Support/Claude"),
+      kind: "directory",
+    },
+  };
+}
+
+/**
+ * A config io whose host probe answers only for the named hosts' markers.
+ *
+ * `pathKind` is set explicitly rather than inherited: `nodeConfigIo` defines it
+ * as a non-enumerable property precisely so a spread cannot carry the real
+ * filesystem probe into a fake. Everything else — reading and writing the
+ * config itself — stays real, against the scratch home.
+ */
+function markerIo(home: string, hosts: readonly Host[]): ConfigIo {
+  const markers = hostMarkerPaths(home);
+  const present = new Map<string, PathKind>();
+  for (const host of hosts) {
+    present.set(markers[host].path, markers[host].kind);
+  }
+  return {
+    ...nodeConfigIo,
+    pathKind: (path: string): Promise<PathKind | null> =>
+      Promise.resolve(present.get(path) ?? null),
+  };
+}
 
 function fakeDiscoverer(report: DiscoveryReport): Discoverer {
   return {

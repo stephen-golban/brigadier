@@ -1,647 +1,632 @@
 # Releasing Brigadier
 
-`package.json` says `0.1.1`. This release publishes all five packages to npm and
-creates a GitHub release. Homebrew remains unavailable. Before this release,
-the workflow had completed one secret-less tag run without publishing. The
-section [What had never been proven before 0.1.1](#what-had-never-been-proven-before-011)
-records what remained unproven when the `0.1.1` release began.
+`package.json` says `0.1.1`. No Brigadier release has been cut yet, so this
+runbook has not been executed end to end. GitHub Releases are the only
+distribution channel: the first release will publish four compiled binaries in
+per-platform archives, their checksums, and the notarized macOS disk images.
+The package manifest is private and is not itself a distribution artifact.
 
-A release ships five npm packages and four archives:
+The public `stephen-golban/homebrew-tap` repository owns
+`Formula/brigadier.rb`; this repository does not carry a formula. The seeded tap
+formula still has version `0.0.0` and deliberately fake placeholder digests. Do
+not "fix" them before the first release exists. The release workflow replaces
+them from the checksums of the artifacts it actually built, then pushes that
+formula update to the tap's default branch.
 
-- `@stephen-golban/brigadier` — the JavaScript launchers, the typed `dist/`
-  build, the MCP server bundle, and `scripts/postinstall.mjs`. That script is
-  named by the `postinstall` lifecycle hook, so `files` must keep carrying it: a
-  `postinstall` naming a file the tarball does not contain breaks every published
-  install. `test/packaging.test.ts` derives that assertion from a real
-  `npm pack` rather than from a transcribed list.
-- `@stephen-golban/brigadier-{darwin,linux}-{arm64,x64}` — one native executable
-  each, installed as an `optionalDependency` of the root package so `npm i`
-  fetches only the binary for the current machine.
-- `brigadier-VERSION-PLATFORM.tar.gz` (plus a `.sha256` beside each) — the
-  archives Homebrew downloads.
+A complete release contains:
+
+| Asset | Contents |
+| --- | --- |
+| `brigadier-VERSION-darwin-arm64.tar.gz` | the compiled Apple Silicon executable |
+| `brigadier-VERSION-darwin-x64.tar.gz` | the compiled Intel macOS executable |
+| `brigadier-VERSION-linux-arm64.tar.gz` | the compiled ARM64 Linux executable |
+| `brigadier-VERSION-linux-x64.tar.gz` | the compiled x64 Linux executable |
+| one `.tar.gz.sha256` beside each archive | that archive's SHA-256 digest and filename |
+| `brigadier-vVERSION-darwin-arm64.dmg` | the Developer ID-signed, notarized, and stapled Apple Silicon disk image |
+| `brigadier-vVERSION-darwin-x64.dmg` | the Developer ID-signed, notarized, and stapled Intel disk image |
+| `checksums.txt` | SHA-256 digests for every archive, per-archive checksum file, and disk image |
+
+Each archive contains one file named `brigadier`. The two disk images exist only
+when all seven Apple secrets are present and the notarization path succeeds.
 
 ---
 
 ## The safety design, in one paragraph
 
-The workflow triggers on any `v*` tag. Before tagging, run `gh secret list` to
-check whether `NPM_TOKEN` and `RELEASE_PUBLISH_ENABLED` are present. With both
-absent, the tag builds everything and publishes nothing — run `31513095322`
-measured exactly that state. With `NPM_TOKEN` present or
-`RELEASE_PUBLISH_ENABLED` set to `true`, pushing the tag is the irreversible
-publishing act for that path. Treat a listed publication secret as armed, and
-add one only when you intend to ship.
+The workflow triggers on any pushed `v*` tag. Every matrix job runs
+`scripts/verify-tag-version.sh` before compiling and refuses a tag whose name,
+after removing the leading `v`, does not equal `package.json`'s `version`.
+Building and publishing are separate: the four platform artifacts are always
+built, while the GitHub release runs only when the repository secret
+`RELEASE_PUBLISH_ENABLED` is exactly `true`. The Homebrew formula update also
+requires `HOMEBREW_TAP_TOKEN`; without it, the already-created release remains
+published and the workflow loudly skips the tap update. Apple credentials are
+another independent gate. Missing any one of the seven Apple secrets silently
+skips the Developer ID and notarization steps, leaving only the initial ad-hoc
+signature. Before pushing a public tag, verify the publication switch, the tap
+credential, and the Apple gate; the workflow does not infer that publication
+should wait for Apple credentials.
 
 ---
 
-## What a tag does today, with no secrets set
+## What a tag does
 
-Every one of these artifacts is built, and none of them leave GitHub. They land
-in the **Artifacts** panel at the bottom of the workflow run page
-(`github.com/stephen-golban/brigadier/actions` → the `Release` run), under
-GitHub's default 90-day artifact retention. Nothing reaches npm, nothing reaches
-the Releases page, nothing touches Homebrew.
+`.github/workflows/release.yml` is the authority. It runs these steps in this
+order.
 
-| Uploaded artifact | Contents |
-| --- | --- |
-| `release-darwin-arm64` | `brigadier-VERSION-darwin-arm64.tar.gz`, its `.tar.gz.sha256`, `stephen-golban-brigadier-darwin-arm64-VERSION.tgz` |
-| `release-darwin-x64` | the same three files for `darwin-x64` |
-| `release-linux-arm64` | the same three files for `linux-arm64` |
-| `release-linux-x64` | the same three files for `linux-x64` |
-| `release-root-npm` | `stephen-golban-brigadier-VERSION.tgz` |
+### 1. Build four platform executables
 
-Which steps announce that they are disabled, and which merely vanish:
+The `build-platform` matrix has exactly four entries:
 
-- **npm** — the job `Publish npm packages` runs to completion and its step
-  `Publication disabled` prints `NPM_TOKEN is unset; npm publication is
-  disabled`. The job is green. Nothing was published.
-- **GitHub release** — the job `Publish GitHub release` runs and its step
-  `Publication disabled` prints `RELEASE_PUBLISH_ENABLED is not true; GitHub
-  release publication is disabled`. The job is green. No release was created.
-- **Apple** — the four steps `Prove notarization requirement rejects ad-hoc
-  binary`, `Install Developer ID certificate`, `Developer ID sign and notarize`,
-  and `Verify release binary is Developer ID signed and notarized` are **skipped
-  silently**. Unlike the two cases above there is no else-branch and no message;
-  they show as grey skipped steps and that is the only signal. No `.dmg` is
-  produced, and none is attached anywhere.
+| Platform | Runner | Bun compile target |
+| --- | --- | --- |
+| `darwin-arm64` | `macos-latest` | `bun-darwin-arm64` |
+| `darwin-x64` | `macos-latest` | `bun-darwin-x64` |
+| `linux-arm64` | `ubuntu-latest` | `bun-linux-arm64` |
+| `linux-x64` | `ubuntu-latest` | `bun-linux-x64` |
 
-The Darwin executables are still signed, but only **ad-hoc** (`codesign --force
---sign -`). That satisfies the arm64 requirement that a Mach-O binary carry some
-signature, so the binary runs. It is not notarized, so a tarball downloaded
-through a browser carries a quarantine attribute and Gatekeeper refuses it until
-the user clears it.
+Each job checks out the tagged commit, installs the frozen Bun lockfile, runs
+the tag guard, and then compiles `src/cli.ts`:
 
-The tag guard runs inside the four platform builds, not ahead of the workflow.
-`scripts/verify-tag-version.sh` is the `Verify tag matches package version` step
-of the `build-platform` job, after checkout and `bun install` and before anything
-is compiled, and it fails that job unless the tag, `package.json`'s `version`,
-and all four platform pins in `optionalDependencies` name the same version.
+```sh
+bun build ./src/cli.ts --compile --bytecode --minify --sourcemap \
+  --target=TARGET --outfile ./release-bin/brigadier
+```
 
-`package-root` runs in parallel with no guard of its own, so on a mismatched tag
-that job still packs the root tarball and uploads it as the `release-root-npm`
-artifact. Nothing reaches a registry or a release page, because `publish-npm`
-waits on both build jobs and `publish-github` waits on `build-platform`, and a
-failed guard skips both. The cost of a mismatched tag is therefore one stray
-workflow artifact, never a publication.
+The `TARGET` value comes from the table above. The workflow does not build one
+portable script and relabel it; these are four native executables.
 
-`test/release-guard.test.ts` executes that step's own text out of the workflow
-file, so the guard cannot rot unnoticed.
+### 2. Sign and notarize the macOS executables
+
+Every Darwin build is first ad-hoc signed and strictly verified:
+
+```sh
+codesign --force --sign - ./release-bin/brigadier
+codesign --verify --strict ./release-bin/brigadier
+```
+
+When all seven Apple secrets are present, the workflow immediately proves that
+this freshly ad-hoc-signed control does **not** satisfy the release requirement:
+
+```sh
+codesign --verify -R "=notarized" ./release-bin/brigadier
+```
+
+An unexpected success fails the job. This negative control is load-bearing: it
+proves the later positive result did not pass on the ad-hoc input.
+
+The workflow then decodes the Developer ID certificate, creates and unlocks a
+throwaway keychain, imports the certificate and private key, grants the signing
+tools access, and makes that keychain the runner's user keychain list.
+`scripts/notarize.sh` performs the release signing in this exact order:
+
+1. Copy the executable to a private payload directory.
+2. Sign the payload executable with the Developer ID identity, hardened runtime,
+   and a secure timestamp, then strictly verify it.
+3. Create a compressed HFS+ disk image containing that signed executable.
+4. Sign the disk image with the Developer ID identity and a secure timestamp,
+   then strictly verify it.
+5. Submit the signed disk image with `xcrun notarytool submit --wait`.
+6. Staple the ticket to the disk image and validate the staple.
+7. Copy the signed payload executable back over `release-bin/brigadier`.
+
+The disk image must be signed **before** notarization. Signing only the
+executable is insufficient: an unsigned disk image can pass both `stapler
+staple` and `stapler validate` and still fail Gatekeeper's decisive check:
+
+```sh
+spctl -a -t open --context context:primary-signature PATH_TO_DMG
+```
+
+with `source=no usable signature`. A stapled ticket does not by itself prove the
+disk image has a usable signature.
+
+The copy-back in step 7 is equally load-bearing. It makes the executable placed
+in the tarball byte-for-byte the Developer ID-signed executable Apple saw inside
+the submitted disk image. Removing it would ship the earlier ad-hoc copy instead.
+
+After the script returns, the workflow gates archive assembly on:
+
+```sh
+codesign --verify -R "=notarized" ./release-bin/brigadier
+```
+
+Do not replace this with a `codesign -dv` text search. A binary can be Developer
+ID-signed without being notarized, and diagnostic output can expose the signer
+identity. A bare Mach-O executable cannot carry a stapled ticket, so the
+`=notarized` requirement may consult Apple; an Apple outage must fail the
+release rather than weaken the gate. If the requirement fails, the workflow
+checks only whether `Signature=adhoc` is present so it can print the precise
+failure, then exits nonzero.
+
+### 3. Assemble one archive and checksum per platform
+
+Each successful matrix job creates
+`brigadier-VERSION-PLATFORM.tar.gz` from `release-bin/brigadier`, copies its DMG
+when one exists, and runs:
+
+```sh
+shasum -a 256 "brigadier-VERSION-PLATFORM.tar.gz" \
+  > "brigadier-VERSION-PLATFORM.tar.gz.sha256"
+```
+
+It uploads those files as the workflow artifact `release-PLATFORM`. A Darwin
+artifact contains an archive, its checksum file, and—when notarization ran—a
+DMG. A Linux artifact contains the archive and checksum file.
+
+### 4. Assemble the combined checksum manifest
+
+The `publish-github` job waits for all four platform jobs, downloads every
+`release-*` workflow artifact into one directory, and refuses an empty download.
+It computes `checksums.txt` across every `.tar.gz`, `.tar.gz.sha256`, and `.dmg`:
+
+```sh
+shasum -a 256 "${release_assets[@]}" > checksums.txt
+```
+
+This means `checksums.txt` covers the per-archive checksum files as artifacts in
+their own right as well as the archives and disk images.
+
+### 5. Create the GitHub release
+
+When `RELEASE_PUBLISH_ENABLED` is exactly `true`, the workflow creates a release
+for the pushed tag with every archive, every per-archive checksum, every DMG,
+and `checksums.txt`. `gh release create` uses `--verify-tag` and
+`--generate-notes`.
+
+When the secret is absent or has any other value, the job prints:
+
+```text
+RELEASE_PUBLISH_ENABLED is not true; GitHub release publication is disabled
+```
+
+It creates no release and does not update Homebrew. The assembled files remain
+workflow artifacts only.
+
+### 6. Update Homebrew from the files just released
+
+Immediately after release creation, when `HOMEBREW_TAP_TOKEN` is present, the
+workflow checks out `stephen-golban/homebrew-tap` into `./homebrew-tap` with
+that token and runs:
+
+```sh
+version="${GITHUB_REF_NAME#v}"
+bun ./scripts/update-homebrew-formula.ts \
+  "${version}" ./release-packages ./homebrew-tap/Formula/brigadier.rb
+```
+
+The script's complete interface is:
+
+```text
+update-homebrew-formula.ts <version> <release-assets-directory> [formula-path]
+```
+
+The optional formula path defaults to `Formula/brigadier.rb`. The script reads
+the four `brigadier-VERSION-PLATFORM.tar.gz.sha256` files, rejects a checksum
+whose filename does not exactly name its expected archive, then replaces the
+formula version, four release URLs, and four digests exactly once. It refuses a
+missing, duplicate, malformed, or no-op replacement.
+
+The workflow commits only `Formula/brigadier.rb` in the tap checkout as
+`Update Homebrew formula to vVERSION` and pushes the checked-out tap branch.
+This works with a newly created default branch and requires no long history.
+The formula is therefore derived from the real release artifacts, not
+precomputed values.
+
+When `HOMEBREW_TAP_TOKEN` is absent, both the tap checkout and formula update
+are skipped and the workflow prints:
+
+```text
+HOMEBREW_TAP_TOKEN is unset; Homebrew formula update is disabled
+```
+
+That is a successful skip: it never blocks or rolls back the GitHub release.
 
 ---
 
 ## One-time credentials
 
-All of these are pasted in the same place:
-
-**GitHub → the `brigadier` repository → Settings → Secrets and variables →
-Actions → the `Secrets` tab → `Repository secrets` → `New repository secret`.**
-Enter the exact `Name` below, paste the value into `Secret`, click
-`Add secret`. Names are case-sensitive. Values are never echoed back, so a
-typo shows up only as a failed release.
-
-### `NPM_TOKEN` — enables npm publication
-
-1. Sign in at <https://www.npmjs.com> as the owner of the `@stephen-golban`
-   scope.
-2. Click your profile picture, upper right → **Access Tokens**.
-3. **Generate New Token** → choose **Granular Access Token**.
-4. Name it something like `brigadier-release`, and set an **Expiration**. Note
-   the date; the release breaks silently-ish on the day it lapses.
-5. Under **Packages and scopes**, set **Permissions** to **Read and write**.
-6. Still under **Packages and scopes**, choose **Only select packages and
-   scopes** and select the **scope** `@stephen-golban` — *not* individual
-   packages. This matters on the first release: none of the five packages exist
-   on the registry yet, and a token scoped to specific packages cannot create a
-   package that does not exist. A scope-level token can.
-7. If the account has two-factor authentication required for publishing, tick
-   **Bypass two-factor authentication**. A non-interactive CI publish cannot
-   answer an OTP prompt. (The equivalent with the older token type is a
-   **Classic Token → Automation**, which bypasses 2FA by design; either works.)
-8. **Generate Token**, then copy the value shown once.
-
-Format: the raw token string, which begins `npm_`. Paste it exactly — no
-`Bearer` prefix, no quotes, no base64, no trailing newline.
-
-Two facts about this package that matter and are already handled in the
-repository, so you do not need to configure them: `package.json` carries
-`"publishConfig": { "access": "public" }`, and the workflow also passes
-`--access public`, which is what a *scoped* package needs on its first publish
-to avoid defaulting to private. And the workflow publishes the **four platform
-packages before the root package**, because the root package declares them as
-`optionalDependencies` at the exact same version — publishing the root first
-would leave a window where `npm install @stephen-golban/brigadier` resolves no
-binary.
+All credentials go to **GitHub → the `brigadier` repository → Settings →
+Secrets and variables → Actions → the `Secrets` tab → Repository secrets → New
+repository secret**. Names are case-sensitive. Values are never echoed back, so
+a typo appears only as a skipped or failed release step.
 
 ### `RELEASE_PUBLISH_ENABLED` — enables the GitHub release
 
-Value: the literal five characters `true` — lowercase, unquoted, no surrounding
-whitespace. It is compared as a string against `'true'`; `True`, `TRUE`, `1`,
-and `yes` all leave publication disabled. There is nothing to obtain from
-anywhere: you type it. GitHub supplies the `GITHUB_TOKEN` the release step uses,
-so no personal access token is involved.
+Value: the literal five characters `true`—lowercase, unquoted, with no
+surrounding whitespace. It is compared as a string against `'true'`; `True`,
+`TRUE`, `1`, and `yes` all leave publication disabled. GitHub's default token
+creates the release but cannot push to the separate tap repository.
+
+### `HOMEBREW_TAP_TOKEN` — enables the tap formula update
+
+Configure this repository secret before the first release. It is a fine-grained
+personal access token with **Contents: write** access to only
+`stephen-golban/homebrew-tap`. The workflow uses it to check out that repository
+and to authenticate the formula commit push. Never use or rename the default
+`GITHUB_TOKEN` for this purpose; its permissions do not cross repositories.
+
+If the secret is absent, GitHub release publication still succeeds. The tap
+checkout and formula update skip, the workflow prints the disabled message
+shown above, and the formula must be recovered manually after the release.
 
 ### The seven Apple secrets — enable Developer ID signing and notarization
 
-All seven must be present. If even one is empty, all four Apple steps skip
-and you get the ad-hoc-signed binary described above.
+All seven must be present. If even one is empty, all four guarded Apple steps
+skip and no DMG is produced.
 
-**You very likely already have the certificate. Do not create a new one.**
-Check first:
+**You very likely already have the certificate. Do not create a new one.** Check
+first:
 
 ```sh
 security find-identity -v -p codesigning
 ```
 
-Read the output for a line whose quoted identity begins with
-`Developer ID Application:`. The list commonly contains several valid identities
-— an `Apple Development:` one, an `Apple Distribution:` or mobile-distribution
-one, and so on. **Only `Developer ID Application` can sign software distributed
-outside the App Store**, which is what a downloadable CLI is. Signing with any
-of the others produces a binary Apple will refuse to notarize. This is the single
-most common mistake in this whole document; the certificate types are genuinely
-distinct, not interchangeable labels.
+Read the output for an identity beginning `Developer ID Application:`. The list
+commonly contains several valid identities—`Apple Development:`, Apple or mobile
+distribution identities, and others. Only `Developer ID Application` can sign
+software distributed outside the App Store. Signing with a different identity
+produces an artifact Apple will refuse to notarize.
 
-If, and only if, no `Developer ID Application:` line appears, create one at
+If, and only if, no `Developer ID Application:` identity appears, create one at
 <https://developer.apple.com/account/resources/certificates/list> → **+** →
-**Developer ID** → **Developer ID Application**. Otherwise skip straight to the
-export.
+**Developer ID** → **Developer ID Application**. Otherwise use the existing
+identity.
 
 **Exporting the certificate you already have:**
 
 1. Open **Keychain Access**.
-2. Select the **login** keychain, then the **My Certificates** category.
+2. Select the **login** keychain and **My Certificates**.
 3. Find the row beginning `Developer ID Application:`.
-4. Click its disclosure triangle and confirm a **private key** is nested
-   underneath. Without the private key the export produces a certificate-only
-   `.p12` and signing on the runner fails with a misleading error.
-5. Right-click the certificate row → **Export "Developer ID Application: …"**.
-6. Set **File Format** to **Personal Information Exchange (.p12)** and save it,
-   for example to `~/Desktop/DeveloperIDApplication.p12`.
-7. Choose an export password when prompted. **That password is
-   `APPLE_CERTIFICATE_PASSWORD`.** macOS then asks for your login keychain
-   password to release the key; that one is not a secret you record anywhere.
-8. Delete the `.p12` from disk once both secrets below are saved in GitHub.
+4. Expand it and confirm a private key is nested underneath. Without the private
+   key, the export produces a certificate-only file and runner signing fails.
+5. Right-click the certificate row and choose **Export**.
+6. Select **Personal Information Exchange (`.p12`)** and save it temporarily.
+7. Choose an export password. That password is
+   `APPLE_CERTIFICATE_PASSWORD`. The later prompt for the login keychain
+   password is not a repository secret.
+8. Delete the exported file after its encoded contents and password are safely
+   stored in GitHub.
 
-Now the seven values:
+The seven values are:
 
-- **`DEVELOPER_ID_IDENTITY`** — the full identity string exactly as
-  `security find-identity -v -p codesigning` prints it *between the quotes*, with
-  no quotes of your own. It has the shape
-  `Developer ID Application: <Your Name> (<TEAM_ID>)`. Copy it verbatim,
-  including the spaces and the parentheses.
-- **`APPLE_TEAM_ID`** — the 10-character alphanumeric code inside the
-  parentheses at the end of that identity string. It is the same value shown at
-  <https://developer.apple.com/account> → **Membership details** → **Team ID**.
-  Ten characters, nothing else — no parentheses, no name.
-- **`APPLE_ID`** — the email address of the Apple Account that holds the
-  Developer Program membership. A plain email address.
-- **`APPLE_APP_PASSWORD`** — an **app-specific password**, not your Apple
-  Account password and not your Mac's password. Create it at
+- **`DEVELOPER_ID_IDENTITY`** — the complete identity string between the quotes
+  printed by `security find-identity`, without adding quotes. It has the form
+  `Developer ID Application: Name (TEAM_ID)`.
+- **`APPLE_TEAM_ID`** — the 10-character code inside the final parentheses of
+  that identity, with no parentheses or name. It is also shown under Apple
+  Developer account membership details.
+- **`APPLE_ID`** — the email address of the Apple Account holding the Developer
+  Program membership.
+- **`APPLE_APP_PASSWORD`** — an app-specific password from
   <https://account.apple.com> → **Sign-In and Security** → **App-Specific
-  Passwords** → **Generate an app-specific password**. The account must have
-  two-factor authentication enabled or the option does not appear. The value has
-  the shape `xxxx-xxxx-xxxx-xxxx`; paste it with the hyphens, as shown.
-  `xcrun notarytool` authenticates with this and will reject the account
-  password.
-- **`APPLE_CERTIFICATE_P12`** — the base64 encoding of the `.p12` you exported:
+  Passwords**. Keep the hyphens. This is neither the Apple Account password nor
+  the Mac login password. The account needs two-factor authentication before
+  Apple offers app-specific passwords.
+- **`APPLE_CERTIFICATE_P12`** — the base64 encoding of the exported file:
 
   ```sh
-  base64 -i ~/Desktop/DeveloperIDApplication.p12 | pbcopy
+  base64 -i /path/to/DeveloperIDApplication.p12 | pbcopy
   ```
 
-  On macOS this produces one long unwrapped line, already on the clipboard;
-  paste it straight into the secret. (Verified: `base64 -i` emits a single line
-  and round-trips cleanly through the `base64 --decode` the workflow runs.)
-- **`APPLE_CERTIFICATE_PASSWORD`** — the export password from step 7 above.
-- **`KEYCHAIN_PASSWORD`** — a fresh random string with no other purpose. It only
-  unlocks a throwaway keychain created and discarded inside the runner. Generate
-  one with `openssl rand -base64 24` and paste it.
+  On macOS this produces one unwrapped line. The workflow reverses it with
+  `base64 --decode`.
+- **`APPLE_CERTIFICATE_PASSWORD`** — the export password chosen above.
+- **`KEYCHAIN_PASSWORD`** — a fresh random string used only for the runner's
+  throwaway keychain. Generate one with:
 
-What the workflow then does with them: decodes the `.p12`, imports it into a
-temporary keychain, signs the executable with the Developer ID identity using a
-hardened runtime and a secure timestamp, wraps it in a disk image, signs the disk
-image with the Developer ID identity and a secure timestamp, submits it with
-`xcrun notarytool submit --wait`, and staples the ticket to the disk image. A
-bare Mach-O command-line executable cannot itself carry a stapled ticket, which
-is why the DMG exists at all: the release tarball gets the signed executable,
-and the notarized DMG rides along as evidence.
+  ```sh
+  openssl rand -base64 24
+  ```
 
-The disk image must be signed before it is submitted for notarization, not
-just the executable inside it. An unsigned disk image fails
-`spctl -a -t open --context context:primary-signature` with
-`source=no usable signature` even after `xcrun stapler staple` and
-`xcrun stapler validate` both report success — a stapled ticket does not by
-itself prove the disk image will pass Gatekeeper.
+Before the first public tag, use `gh secret list` and confirm all nine names—the
+publication switch, `HOMEBREW_TAP_TOKEN`, and all seven Apple secrets—are
+present. Presence does not prove the values are correct; the first workflow
+execution remains the decisive test.
 
 ---
 
-## Moving the version, everywhere it lives
+## Moving the version everywhere it lives
 
-The current version appears in more places than `package.json`, and several are
-enforced by `bun test` — deliberately. Move every version reference in items
-1–8 from the current version to the next version. Items 9 and 10 are status
-passages: review them during each release and update them only when the state
-they describe has changed.
-
-This list was first verified by the `0.0.0` → `0.1.0` bump and a full-suite run.
-The `0.1.0` → `0.1.1` bump then ran the full list and all four gates: `bun test`
-(817 pass, 2 skip, 0 fail), `bun run typecheck`, `bun run check`, and
-`bun run build`, all with rc 0. That second pass exposed the item 9 defect: the
-deferred-reword rule would have published a README saying the package was not on
-npm.
-
-**Enforced — the release or the test suite fails if you skip these:**
-
-1. `package.json` → `version`. Move it from the current version to the next
-   version. It is checked against the tag by `scripts/verify-tag-version.sh`.
-2. `package.json` → all four `optionalDependencies` entries. Also checked by
-   `scripts/verify-tag-version.sh`: move each pin from the current version to
-   the next version. A pin that drifts names a platform package version that
-   will never be published, and `npm install` would then quietly fall back to
-   the slower JavaScript launcher instead of failing.
-3. `test/mcp.test.ts` → `const VERSION` and the four golden JSON-RPC frames
-   that embed the current version. Move both the constant and every frame to
-   the next version. In the past `0.0.0` → `0.1.0` bump, applying items 1 and 2
-   while leaving this file untouched made two tests fail; changing that constant
-   alone does not update the golden frames.
-4. `test/mcp-repository-path.test.ts` → its golden `initialize` response
-   frame, which embeds the current version. Move it to the next version. This
-   file was added in `4d0dd97` and was missed when this list was revised.
-5. `test/mcp-entry.test.ts` → the golden `initialize` response string, which
-   embeds the current version. Move it to the next version; one test fails until
-   it matches.
-
-**Not enforced — nothing will tell you, so do them by hand:**
-
-6. `bun.lock` → the four `optionalDependencies` entries. Regenerate with
-   `bun install` after moving the pins in `package.json` to the next version and
-   commit the result.
-   (`bun install --frozen-lockfile` tolerates the mismatch, because the platform
-   packages are optional and currently unresolvable, so CI will *not* catch a
-   stale lockfile here.)
-7. `src/surfaces/templates.ts` → the `claude-desktop/manifest.json` template
-   string. Move its version from the current version to the next version.
-8. `surfaces/claude-desktop/manifest.json` → the staged copy of the same
-   value. Move it from the current version to the next version too.
-9. `README.md` → the two publication-status passages. Review them during each
-   release and update them in the release commit only when the publication state
-   they describe will change. The tagged commit is the published npm artifact,
-   and npm serves that README for that version; correcting it after the release
-   requires publishing another version.
-10. `src/config/contracts.ts` → the comment describing what `init` does when
-    config validation fails. Review it during each release and update it only if
-    that behaviour has changed.
-
-> **Items 7 and 8 are unenforced only if you skip them. Doing them turns
-> `bun test` red until you also move a pin.**
->
-> `test/surfaces.test.ts` pins every installable surface file by absolute
-> SHA-256 *and* byte length, in the `PINNED` map near the top of that file, and
-> checks the compiled template and the staged file against the same entry. Look
-> up the `"claude-desktop/manifest.json"` entry before changing it. For example,
-> after the past `0.0.0` → `0.1.0` bump it contains SHA-256
-> `ca12f56795d0800bdd9e1cc55826e76168ff01a3c92a1a05dbfd1ba0cbb77beb` and
-> `1597` bytes. Changing the version inside the manifest makes both halves wrong
-> and fails two tests — *every compiled template matches its pinned hash and
-> size*, and *every file on disk matches the same pinned hash and size* —
-> neither of which mentions the version, so the reason is not obvious from the
-> failure.
->
-> Edit item 7 and item 8 together, keeping them byte-identical, then recompute:
->
-> ```sh
-> shasum -a 256 surfaces/claude-desktop/manifest.json
-> wc -c surfaces/claude-desktop/manifest.json
-> ```
->
-> Paste the hash into `sha256` and the byte count into `bytes` in the
-> `"claude-desktop/manifest.json"` entry of `PINNED`. The pin is deliberate — it
-> is what stops a regeneration script from corrupting a template and the
-> constant describing it in the same pass — so update it, never delete it.
-
-**Deliberately left behind:**
-
-11. `Formula/brigadier.rb` keeps `version "0.0.0"` and its four placeholder
-   digests until *after* the release exists. The real archives must be built and
-   hashed before the formula can name them, so this file is updated at the end,
-   by `scripts/update-homebrew-formula.ts`, never by hand.
-
----
-
-## Shipping
-
-### Step 1 — prepare the release commit, locally
-
-Run from a clean checkout on macOS, on a branch, with `VERSION` set to the
-version you intend to ship. Nothing here is public and every line is
-reversible.
-Set `VERSION` to the version being released.
+The release guard compares only `package.json` with the tag. Other version
+copies are enforced by tests or are human-maintained release records. Search
+the tree before each release instead of trusting a frozen list:
 
 ```sh
-export VERSION=REPLACE_WITH_RELEASE_VERSION
-
-npm pkg set "version=${VERSION}" \
-  "optionalDependencies[@stephen-golban/brigadier-darwin-arm64]=${VERSION}" \
-  "optionalDependencies[@stephen-golban/brigadier-darwin-x64]=${VERSION}" \
-  "optionalDependencies[@stephen-golban/brigadier-linux-arm64]=${VERSION}" \
-  "optionalDependencies[@stephen-golban/brigadier-linux-x64]=${VERSION}"
-bun install
+rg -n '0\.1\.1' \
+  package.json src test surfaces docs CHANGELOG.md SECURITY.md
 ```
 
-Then edit items 3, 4, 5, 7, and 8 from the list above by hand. Review items 9
-and 10, and update them only when the state they describe has changed.
+Replace `0.1.1` with the version currently in `package.json` when running that
+search. Classify every hit before changing it: examples and historical evidence
+may deliberately retain an older version.
 
-Items 7 and 8 change a pinned file, so recompute the pin before you run the gate:
+These current-version copies move together:
+
+1. `package.json` → `version`. This is the value guarded against the tag.
+2. `test/mcp.test.ts` → `const VERSION` and the golden JSON-RPC responses that
+   embed the current server version.
+3. `test/mcp-repository-path.test.ts` → the golden `initialize` response.
+4. `test/mcp-entry.test.ts` → the golden `initialize` response produced by the
+   real built Desktop entry.
+5. `src/surfaces/templates.ts` → the Claude Desktop manifest template version.
+6. `surfaces/claude-desktop/manifest.json` → the staged copy of that version.
+7. `CHANGELOG.md` and `SECURITY.md` → the release record and supported-version
+   statement, when the release state they describe actually changes.
+
+Items 5 and 6 must remain byte-identical in meaning. They also change the pinned
+surface bytes. Recompute:
 
 ```sh
 shasum -a 256 surfaces/claude-desktop/manifest.json
 wc -c surfaces/claude-desktop/manifest.json
 ```
 
-and put those two values into `sha256` and `bytes` of the
-`"claude-desktop/manifest.json"` entry in the `PINNED` map in
-`test/surfaces.test.ts`. Skip this and the `bun test` below fails on two surface
-assertions that say nothing about versions.
+and update the `sha256` and `bytes` values for
+`"claude-desktop/manifest.json"` in the `PINNED` map in
+`test/surfaces.test.ts`. The pin is deliberate: update it; never delete it.
 
-Now run the full gate:
+Do **not** move the tap formula's `0.0.0` or placeholder digests in the release
+commit. The workflow updates the separate tap only after it has created the
+release from real artifacts.
+
+---
+
+## Shipping
+
+### Step 1 — prepare the release commit locally
+
+Start from a clean macOS checkout on a branch. Set `VERSION` to the version you
+intend to ship, update the version copies above, and review all public status
+language for truth at the moment the tag will be pushed.
 
 ```sh
-bun test
-bun run typecheck
+export VERSION=REPLACE_WITH_RELEASE_VERSION
+bun install --frozen-lockfile
+bun run format
 bun run check
+bun run typecheck
+bun test
 bun run build
-npm pack --dry-run
 ```
 
-`bun test` covers the tag guard against the version you just set, and covers the
-`brigadier-mcp` launcher against the real built bundle with a real MCP
-`initialize` exchange. `bun run build` produces `dist/`, `dist/mcp/server.js`,
-and the ad-hoc-signed `./brigadier`; all three are ignored by git.
+`bun run build` produces the Node distribution, the runnable Desktop MCP entry
+at `dist/mcp/server.js`, and one compiled executable for the local machine. The
+release workflow—not this local build—produces the four release executables.
 
-Commit and push the branch, get it onto `main` the usual way, and check out the
-commit you intend to tag.
+Commit and push the branch, get it onto the default branch through the usual
+review, then check out the exact commit you intend to tag. Confirm the worktree
+is clean.
 
-### Step 2 — tag it
+### Step 2 — arm and verify the release gates
+
+Run:
+
+```sh
+gh secret list
+```
+
+Confirm `RELEASE_PUBLISH_ENABLED`, `HOMEBREW_TAP_TOKEN`, and all seven Apple
+secret names above are present. Secret values cannot be read back; if the
+publication switch was not recorded as the literal `true` or there is any doubt,
+set it again before tagging. If the tap token is missing, set it before the first
+release; otherwise the release will publish while the formula bump skips. If any
+Apple secret is missing, stop: the workflow would still be able to create a
+public release, but its Darwin archives would contain only ad-hoc-signed
+executables and it would upload no DMGs.
+
+### Step 3 — create the tag locally
 
 ```sh
 git tag -a "v${VERSION}" -m "v${VERSION}"
 ```
 
-Signing is optional and requires a configured signing key; use `-s` if that is
-already set up. Without a signing key, `git tag -s` fails instead of creating the
-tag.
+Signing is optional and requires an already configured signing key; use `-s`
+instead of `-a` only when that setup is known to work. A local tag is still
+private and can be deleted with `git tag -d "v${VERSION}"`.
 
-A local tag is still private and still deletable (`git tag -d`).
-
-### Step 3 — the command that ships
-
-**This is the one irreversible command. Everything before it is local;
-everything after it is a consequence of it.**
+### Step 4 — push the tag
 
 ```sh
 git push origin "v${VERSION}"
 ```
 
-That push, and nothing else, starts `.github/workflows/release.yml`. What
-actually goes public is decided entirely by which secrets are present at that
-moment:
+That push starts `.github/workflows/release.yml`. With publication enabled, a
+successful run creates the GitHub release and, when the tap token is present,
+commits and pushes the Homebrew formula update to
+`stephen-golban/homebrew-tap`. Treat the push as the publication boundary.
 
-| Secrets present | Result |
-| --- | --- |
-| none | four platform builds + five packed tarballs, all as workflow artifacts only |
-| `NPM_TOKEN` | the above, plus all five packages published to npm |
-| `RELEASE_PUBLISH_ENABLED=true` | the above, plus a GitHub release carrying the `.tar.gz`, `.sha256`, and any `.dmg` files |
-| all seven Apple secrets | the Darwin binaries are Developer ID signed and notarized rather than ad-hoc signed |
-
-An npm version, once published, cannot be republished. Deleting it is possible
-for 72 hours and leaves the version permanently unusable afterwards. Treat the
-push as final.
-
-### Step 4 — verify what actually happened
+### Step 5 — watch every workflow step
 
 ```sh
 gh run list --workflow release.yml --limit 1
-gh run view --log-failed
+gh run watch RUN_ID --exit-status
+```
 
+Inspect the run as well as its final status. Confirm:
+
+- all four `Verify tag matches package version` steps passed;
+- both ad-hoc negative-control steps ran and rejected their inputs;
+- both certificate installation and both notarization steps ran rather than
+  appearing grey and skipped;
+- both `=notarized` positive gates passed before archive assembly;
+- all four `release-PLATFORM` artifacts were uploaded;
+- `Assemble combined checksums` ran after all four downloads;
+- `Create GitHub release` ran rather than `Publication disabled`;
+- `Check out Homebrew tap` ran; and
+- `Update Homebrew formula from release artifacts` committed and pushed to the
+  tap.
+
+Any failed `build-platform` job blocks the publish job entirely. A failure after
+`Create GitHub release` but during the formula update is different: the release
+already exists and the formula needs the manual recovery below. A missing tap
+token produces the same recovery need but deliberately does not fail the job.
+
+### Step 6 — verify the public release assets
+
+```sh
 gh release view "v${VERSION}"
-npm view "@stephen-golban/brigadier@${VERSION}" version
-npm view "@stephen-golban/brigadier@${VERSION}" optionalDependencies
-```
-
-Confirm by eye that the run's Apple steps ran rather than skipped, if you meant
-them to, and that the `Publication disabled` steps did *not* appear.
-
-### Step 5 — fill in the Homebrew formula
-
-Only now do the placeholder digests become fillable.
-
-```sh
 mkdir -p "release-assets-${VERSION}"
-gh release download "v${VERSION}" \
-  --pattern "brigadier-${VERSION}-*.tar.gz" \
-  --pattern "brigadier-${VERSION}-*.tar.gz.sha256" \
-  --dir "release-assets-${VERSION}"
-
-(cd "release-assets-${VERSION}" && shasum -a 256 -c ./*.sha256)
-
-bun scripts/update-homebrew-formula.ts "${VERSION}" "release-assets-${VERSION}"
-git add Formula/brigadier.rb
-git commit -m "Update Homebrew formula to v${VERSION}"
+gh release download "v${VERSION}" --dir "release-assets-${VERSION}"
+(
+  cd "release-assets-${VERSION}"
+  shasum -a 256 -c ./*.tar.gz.sha256
+  shasum -a 256 -c checksums.txt
+  for archive in ./*.tar.gz; do
+    tar -tzf "${archive}"
+  done
+)
 ```
 
-The script rewrites the formula's `version`, all four download URLs, and all
-four `sha256` lines, and refuses to touch the file unless it finds exactly one
-of each block. It will also refuse a version that is already in the formula: the
-replacement would be a no-op and the script reports
-`failed to replace formula version block`. That is what you will see if you run
-it twice for the same version, or run it for `0.0.0`.
+There must be four archives, four per-archive checksum files, two DMGs, and one
+`checksums.txt`. Every checksum must pass, and every archive listing must be the
+single path `brigadier`.
 
-Then prove the tap before pushing it:
+Extract the two Darwin archives separately and verify their executables with the
+same requirement the workflow uses:
 
 ```sh
-brew untap stephen-golban/brigadier 2>/dev/null || true
-brew tap stephen-golban/brigadier "file://$(pwd)"
-brew audit --strict stephen-golban/brigadier/brigadier
-brew style stephen-golban/brigadier/brigadier
-brew uninstall brigadier 2>/dev/null || true
-brew install stephen-golban/brigadier/brigadier
-brigadier --version
-brew test stephen-golban/brigadier/brigadier
-
-git push origin HEAD
+codesign --verify -R "=notarized" PATH_TO_EXTRACTED_BRIGADIER
 ```
 
-### Step 6 — install from both public paths, from scratch
+Verify both downloaded disk images with Gatekeeper:
 
 ```sh
-scratch="$(mktemp -d /tmp/brigadier-release-check.XXXXXX)"
-npm install --prefix "${scratch}" "@stephen-golban/brigadier@${VERSION}"
-"${scratch}/node_modules/.bin/brigadier" --version
-
-brew uninstall brigadier
-brew install stephen-golban/brigadier/brigadier
-brigadier --version
+spctl -a -t open --context context:primary-signature PATH_TO_DMG
 ```
 
-The npm check is the one that proves the platform-package plumbing: if the
-`optionalDependencies` pins are wrong, this still prints a version — it just
-silently used the JavaScript fallback instead of the native binary. Confirm the
-native package landed:
+### Step 7 — verify or recover the Homebrew formula update
+
+Confirm the default branch of `stephen-golban/homebrew-tap` now contains
+`Formula/brigadier.rb` at `VERSION`, with four `vVERSION` release URLs and four
+non-placeholder digests matching the downloaded `.sha256` files.
+
+If the GitHub release exists but the workflow failed before pushing the formula
+commit, recover from the downloaded release artifacts:
 
 ```sh
-ls "${scratch}/node_modules/@stephen-golban/"
+gh repo clone stephen-golban/homebrew-tap ./homebrew-tap
+bun ./scripts/update-homebrew-formula.ts \
+  "${VERSION}" "release-assets-${VERSION}" \
+  ./homebrew-tap/Formula/brigadier.rb
+git -C ./homebrew-tap add Formula/brigadier.rb
+git -C ./homebrew-tap commit -m "Update Homebrew formula to v${VERSION}"
+git -C ./homebrew-tap push origin HEAD
 ```
+
+The third argument deliberately names the formula in the separate tap checkout.
+
+### Step 8 — verify both public installation paths
+
+**Not operational today:** no GitHub release exists yet, so this command has no
+tarball to download. It is the primary install path and will work only after the
+first release is cut:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
+```
+
+`install.sh` is POSIX `sh`. It detects the platform with `uname`, downloads the
+matching GitHub release archive and its `.sha256`, verifies SHA-256, and installs
+to `~/.local/bin` unless `BRIGADIER_INSTALL_DIR` overrides it. It never uses
+`sudo`. It stages in a `mktemp -d` directory inside the install directory,
+marks the staged binary executable, unlinks a destination symlink instead of
+following it, then renames the staged file over the destination. It refuses with
+a named error when the destination is a real directory and warns when the
+install directory is absent from `PATH`. Finally, it hands `brigadier init` to
+`/dev/tty`, so the host-selection prompt still works through `curl | sh`.
+
+**Not operational today:** the formula intentionally contains placeholder
+digests because no release exists. This is the second install path and will work
+only after the first release workflow fills the formula from real artifacts:
+
+```sh
+brew tap stephen-golban/tap
+brew install brigadier
+```
+
+After the release and formula commit both exist, run both commands on clean
+machines for every supported operating-system and architecture pair. Confirm
+`brigadier --version` prints `VERSION`, then run `brigadier init` and exercise a
+real host installation.
+
+---
+
+## The Claude Desktop `.mcpb` bundle
+
+The Desktop bundle is not a GitHub release asset and Brigadier never installs it
+into Desktop. Desktop installs it only after an explicit user action.
+
+To build it from a checkout:
+
+1. Run `bun run build:mcp`. This emits the runnable program
+   `dist/mcp/server.js`.
+2. In the staged bundle directory beside `manifest.json`, create `server/` and
+   copy that output to `server/brigadier-mcp.js`, the manifest's entry point.
+3. Zip the staged directory with `manifest.json` at the archive root.
+4. Rename the archive to `brigadier.mcpb` and open it with Claude Desktop.
+
+The emitted entry is a real program: when Desktop launches it, it starts the
+JSON-RPC server and answers requests over standard input and output. Keep the
+manifest at the archive root and the copied program at the exact nested path it
+names.
 
 ---
 
 ## What has been exercised
 
-These release-path measurements have been made, and their limits are recorded
-here:
+These release-path measurements have been made, and their limits matter:
 
-- **The tag guard has been exercised in both directions.** Against the bumped
-  `0.1.1` tree, the guard returned rc `0` for
-  `GITHUB_REF_NAME="v0.1.1" bash scripts/verify-tag-version.sh` and rc `1` for
-  `GITHUB_REF_NAME="v0.1.0" bash scripts/verify-tag-version.sh`.
-- **Owner-reported manual exercise, with no retained repository evidence:** the
-  formula rewrite against real digests was reproduced by hand on a developer
-  Mac.
-- **The secret-less tag path has executed.** Run `31513095322`, triggered by
-  pushing `v0.1.0` with `gh secret list` empty, completed all seven jobs green
-  and produced five artifacts: `release-darwin-arm64` (48 MB),
-  `release-darwin-x64` (54 MB), `release-linux-arm64` (74 MB),
-  `release-linux-x64` (74 MB), and `release-root-npm` (1 MB). Both publication
-  jobs went green by skipping: `Create GitHub release: skipped` →
-  `Publication disabled`, and `Publish platform packages: skipped` →
-  `Publication disabled`. Afterwards, `gh release list` returned zero releases
-  and `npm view @stephen-golban/brigadier` returned `E404`. This measures the
-  secret-less-tag behaviour; it does not prove either publication path.
-- **Notarization rehearsal 1 ran locally on 2026-08-11, mirroring the workflow's
-  steps.** `xcrun notarytool submit --wait` returned **Accepted** for submission
-  `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` on the first attempt, with no warnings,
-  in roughly four minutes. This proved that Apple accepts a bare Mach-O
-  command-line executable inside a DMG. It also proved that the three
-  `notarytool` credentials authenticate, that the `.p12` base64 round-trips
-  byte-identically through the workflow's `base64 --decode`, and that the
-  `.p12` → throwaway-keychain import path works. The import was checked by
-  asking the throwaway keychain by name with
-  `security find-identity -v -p codesigning <throwaway>`, so the machine's own
-  copy of the same certificate could not mask a silently failed import. This
-  rehearsal also found the unsigned-DMG defect: `xcrun stapler staple` and
-  `xcrun stapler validate` both succeeded, but
-  `spctl -a -t open --context context:primary-signature` rejected the disk image
-  with `source=no usable signature`, and `codesign -dv` confirmed that the DMG
-  carried no signature of its own.
-- **Notarization rehearsal 2 ran on 2026-08-12 at commit `bb8305e`.** It invoked
-  the real, unmodified `scripts/notarize.sh` against a real build, not a
-  reimplementation. The working-tree and `HEAD` copies of that script are
-  byte-identical, with SHA-256
-  `d452cdc1d1ae68618f8c3f172f84007c05b6685d72732ef3b034e5337e46f3da`, and
-  rehearsal 2 invoked that file at `bb8305e`, the same commit that would be
-  tagged. `xcrun notarytool submit --wait` returned **Accepted** for submission
-  `3b415bcb-3068-48a2-8f9e-4a884797a6c6`. The first decisive check,
-  `spctl -a -t open --context context:primary-signature`, accepted the disk
-  image with rc `0`; before the signing fix it rejected the image. The binary
-  notarized inside the DMG is the same file that the copy-back at the end of
-  `scripts/notarize.sh` writes to `ARTIFACT_PATH`, so the cdhash Apple notarized
-  is the cdhash that ships. Losing that copy-back destroys this identity, which
-  is why the workflow gates on it. Both decisive checks were then reproduced
-  as fresh invocations against the produced artifacts, outside the rehearsal
-  harness:
-  `spctl -a -t open --context context:primary-signature` returned rc `0` for the
-  disk image, and `codesign --verify -R "=notarized"` returned rc `0` for the
-  binary. The binary is not ad-hoc. An ad-hoc baseline was checked first and
-  rejected with rc `3`, so none of these passes are vacuous. Rehearsal 2 ran in
-  reduced mode, which disabled both the `.p12` → throwaway-keychain import and
-  the by-name keychain isolation check; signing deliberately used an ambient
-  certificate already in the login keychain. It therefore proves neither the
-  `.p12` import nor that signing consumed an imported artifact rather than an
-  ambient one. It mirrored only the signing and notarization path once a
-  certificate is present. Rehearsal 1 alone proves the runner-mirroring
-  credential path.
-- **Apple retains both submissions, but the history is not the discriminating
-  evidence.** On the release owner's machine,
-  `xcrun notarytool history --keychain-profile "brigadier-local-proof"` returns
-  both as **Accepted**:
-  `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` for
-  `brigadier-v0.1.1-darwin-arm64.dmg` at `2026-08-11T17:38:33.469Z`
-  (rehearsal 1), and `3b415bcb-3068-48a2-8f9e-4a884797a6c6` for the same filename
-  at `2026-08-12T14:23:57.957Z` (rehearsal 2). The `brigadier-local-proof`
-  keychain profile exists only on that machine, so an arbitrary reader on other
-  hardware cannot retrieve this history. Apple records that a submission with
-  that filename was Accepted on that date; the history does not establish which
-  bytes were submitted and says nothing about whether the disk image was
-  signed. Rehearsal 1 was also **Accepted**, yet its DMG failed `spctl`.
-  **Accepted** was never the property in doubt. The discriminating evidence is
-  the rehearsal 2 disk image's rc `0` from `spctl` against rehearsal 1's
-  rejection. The rehearsal artifacts were deliberately not preserved, so this
-  document is now the record of that evidence; the history remains available to
-  the release owner without spending another Apple submission or re-entering an
-  app-specific password.
-- **The `=notarized` gate has been measured against the kind of bare executable
-  Brigadier ships.** Without making another Apple submission,
-  `codesign --verify -R "=notarized"` returned rc `0` for a third-party
-  notarized command-line executable already on the machine, even though
-  `xcrun stapler validate` reported that it had no stapled ticket. The same
-  command returned rc `3` for Brigadier's own ad-hoc-signed binary. A bare
-  executable cannot carry a stapled ticket, so this proves that the workflow's
-  `=notarized` gate is valid for the release artifact itself, not only for the
-  DMG.
-- **Whether the `=notarized` check requires network access remains unsettled.**
-  The rehearsal script's check 4 produced the invalid probes
-  `0.163 / 0.161 / 0.165s` (all invalid): an earlier check in the same run had
-  already executed `codesign --verify -R "=notarized"` against that same binary
-  moments before, so every probe was warm and the cold case was never sampled.
-  The cold first call of a clean re-measurement on a notarized binary that
-  nothing had previously queried measured `0.3152s`. Its four warm repeats on
-  the same file measured `0.3362 / 0.3222 / 0.3093 / 0.3272s`, and a second cold
-  call on a different never-queried notarized binary measured `0.2779s`. The
-  repeats were flat, with no cold/warm signature. That argues against a cached
-  network result but is not conclusive without an offline test. The workflow
-  comment therefore remains deliberately hedged: the check *may* consult Apple.
-- **The workflow's wiring remains unexercised with the publication secrets
-  present.** `gh run list --workflow release.yml` returns exactly one run ever:
-  `31513095322`, for tag `v0.1.0`, with no secrets set. On a real runner, the
-  seven-secret `if:` conditions have therefore never evaluated true, and the
-  `.p12` `security import`, `scripts/notarize.sh`, and the two verification steps
-  added in `bb8305e` have never run. Their first workflow execution will be the
-  real release. Rehearsal 2 proved the script's behaviour. The workflow's wiring
-  is a separate thing and remains unexercised. This is an acceptable risk rather
-  than a blocker: `publish-npm` declares
-  `needs: [build-platform, package-root]`, and `publish-github` declares
-  `needs: build-platform`, so any `build-platform` failure blocks both publish
-  jobs. Nothing reaches npm or Releases, the version stays free on the registry,
-  and the git tag can be deleted and re-pushed. The unrecoverable act is an npm
-  publish, and it cannot happen if the build gate fires.
+- **The tag guard is covered in both directions.**
+  `test/release-guard.test.ts` runs the workflow's guard against the real
+  package version, a mismatched version, and an absent tag name. The script now
+  compares only the tag with `package.json`'s version.
+- **The release asset helpers are exercised without network access.**
+  `test/installer.test.ts` checks all four deterministic asset names and URLs
+  and rejects a checksum naming the wrong archive. The repository no longer
+  tests against a local formula because the tap owns that file.
+- **The tap delivery wiring is pinned by the workflow test.**
+  `test/release-guard.test.ts` requires the PAT-authenticated tap checkout, the
+  explicit third formula-path argument, the tap-local commit and push, and the
+  successful skip when `HOMEBREW_TAP_TOKEN` is absent.
+- **Notarization rehearsal 1 ran locally on 2026-08-11, mirroring the credential
+  path.** `xcrun notarytool submit --wait` returned **Accepted** for submission
+  `b5bd2889-2a7e-4f2d-b99a-a172d5ac5d7d` in roughly four minutes. It proved the
+  three notary credentials authenticate, the exported certificate round-trips
+  through the workflow's base64 decode, and the certificate plus private key
+  import into a throwaway keychain works. Querying that keychain by name kept an
+  ambient certificate from masking a failed import. This rehearsal exposed the
+  unsigned-DMG defect: stapling and staple validation both succeeded, but
+  `spctl -a -t open --context context:primary-signature` rejected the image with
+  `source=no usable signature`.
+- **Notarization rehearsal 2 ran on 2026-08-12 at commit `bb8305e` against the
+  real `scripts/notarize.sh`.** Submission
+  `3b415bcb-3068-48a2-8f9e-4a884797a6c6` returned **Accepted**.
+  Gatekeeper accepted the signed disk image with exit code `0`, and
+  `codesign --verify -R "=notarized"` accepted the copied-back executable with
+  exit code `0`. The ad-hoc baseline was rejected with exit code `3`. This
+  rehearsal used an ambient certificate, so it proves the signing and
+  notarization path once an identity is present; rehearsal 1 is the evidence for
+  the runner-style certificate import.
+- **Apple still retains both accepted submissions, but history is not the
+  discriminating evidence.** The first accepted submission's unsigned disk
+  image still failed Gatekeeper. The decisive evidence is rehearsal 2's
+  Gatekeeper acceptance after signing the DMG, plus the positive `=notarized`
+  result for the exact executable copied back for shipping.
+- **The `=notarized` gate has been measured against a bare command-line
+  executable.** It returned `0` for an existing notarized command-line tool with
+  no stapled ticket and `3` for Brigadier's ad-hoc-signed baseline. This is why
+  the workflow checks the executable directly instead of trying to staple it.
+- **Whether the executable gate needs network access remains unsettled.** Cold
+  and warm measurements showed no useful timing distinction. The workflow
+  therefore deliberately says the check *may* consult Apple and treats an
+  outage as a release failure.
+- **No release has been cut.** The current four-binary publication workflow,
+  its live seven-secret Apple runner path, GitHub release creation, tap formula
+  push, and both public installation paths have never completed together. This
+  runbook is the procedure for that first end-to-end execution, not a report
+  that it has already succeeded.
 
----
-
-## What had never been proven before 0.1.1
-
-This is a baseline scoped to before the release. Its statements were true when
-written; they do not describe the current state. Later evidence is recorded in
-[What has been exercised](#what-has-been-exercised).
-
-These were unproven when the `0.1.1` release began:
-
-- **Notarization had never run.** `scripts/notarize.sh` had only ever been
-  executed with its credentials absent, where it exited `1` naming the first
-  missing variable. Every line past that check — the Developer ID `codesign`,
-  `hdiutil create`, `xcrun notarytool submit --wait`, `xcrun stapler staple` —
-  was unexecuted code. Apple's notary service could also reject a bare
-  command-line executable in a DMG for reasons this repository could not
-  anticipate.
-- **The certificate import on a runner had never run.** The
-  `security import ... -t cert -f pkcs12` sequence in the workflow had not been
-  tested against a real `.p12`.
-- **Nothing had ever been published to npm**, so the scope permissions, the
-  first-publish `--access public` behaviour, and the platform-before-root
-  ordering had all been reasoned about rather than observed.
-- **No GitHub release had ever been created** by this workflow.
-- **The Homebrew tap did not exist.** No `brew audit`, `brew install`, or
-  `brew test` had ever run against this formula, and the formula still carried
-  placeholder digests.
-
-The accountable release owner reviews the workflow run, the npm package file
-lists, the notarization result, the release-asset checksums, and the Homebrew
-test before announcing anything.
+The accountable release owner reviews the workflow run, notarization gates,
+release-asset checksums, tap formula commit, and clean-machine installs before
+announcing the release.
