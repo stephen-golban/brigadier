@@ -15,7 +15,7 @@ no bug bounty. Reports will be read and acted on as time allows.
 
 ## Supported versions
 
-Only the latest released version is supported. The current version is 0.1.1.
+Only the latest released version is supported. The current version is 0.2.0.
 There is no backport policy for older versions.
 
 ## What brigadier does and does not do with your credentials

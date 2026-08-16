@@ -90,7 +90,7 @@ test("the notarization script copies the signed payload binary back after signin
 // would leave them green without guaranteeing that the negative control's input
 // was deliberately ad-hoc signed.
 // The conditions are correct as shipped, so this was adjudicated non-blocking
-// for `v0.1.1`. Closing the gap means asserting the `if:` conditions and the
+// for `v0.2.0`. Closing the gap means asserting the `if:` conditions and the
 // ad-hoc sign → rejection check → notarization → positive gate ordering.
 test("the release workflow proves the notarization requirement rejects the ad-hoc binary", () => {
   const workflow = readFileSync(workflowPath, "utf8");
