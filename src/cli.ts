@@ -15,10 +15,50 @@
  * test drives directly.
  */
 
+import { createReadStream } from "node:fs";
+import type { Readable } from "node:stream";
 import packageJson from "../package.json";
-import type { InterruptGate } from "./init/index.js";
+import type { InputStream, InterruptGate } from "./init/index.js";
 import { createInterruptGate, runCli } from "./init/index.js";
 import type { InterruptSignal } from "./supervisor/contracts.js";
+
+/**
+ * The descriptor-0 stream, opened on first read. Held here so `main` can
+ * release it, and so a command that never reads stdin never opens it at all.
+ */
+let stdinStream: Readable | null = null;
+
+/**
+ * stdin as an `InputStream`. NOT `process.stdin`, and the difference is a bug
+ * that shipped: under Bun, when descriptor 0 is a freshly opened `/dev/tty`,
+ * `process.stdin` never yields a line and never reaches end of input. It simply
+ * goes quiet. `install.sh` hands `brigadier init` exactly that descriptor —
+ * `init </dev/tty`, because in `curl … | sh` the script's own stdin is the
+ * pipe — so the compiled binary drained its event loop awaiting the first
+ * prompt and exited 0 having answered nothing, written no config, and reported
+ * no failure. The installer's own "setup did not finish" branch never fired,
+ * because 0 is success. A `node:fs` stream over that same descriptor reads it.
+ *
+ * The end-of-input contract in `prompt.ts` could not save it: that path answers
+ * every remaining prompt with its default, and this was never end of input. It
+ * was a read that never resolved.
+ *
+ * Lazy on purpose. Opening the descriptor references the event loop, so
+ * `--version` and `--help` must not open it just by starting.
+ *
+ * DECLARED ABOVE THE `main()` CALL BELOW, AND IT HAS TO STAY THERE. That call
+ * is not deferred: it runs the body synchronously as far as the first `await`,
+ * and the object it passes to `runCli` mentions this binding. Below the call,
+ * this is a temporal dead zone and every command dies in the `catch`.
+ */
+const stdin: InputStream = {
+  [Symbol.asyncIterator](): AsyncIterator<string | Uint8Array> {
+    // `autoClose: false`: descriptor 0 is the process's, not this stream's, and
+    // reaching end of input is not a reason to close it out from under anyone.
+    stdinStream ??= createReadStream("", { fd: 0, autoClose: false });
+    return stdinStream[Symbol.asyncIterator]();
+  },
+};
 
 // Not a top-level await: `bun build --compile --bytecode` cannot compile one.
 // The catch is the last resort: every command is supposed to resolve an exit
@@ -40,7 +80,7 @@ async function main(): Promise<void> {
     env: process.env,
     stdout: process.stdout,
     stderr: process.stderr,
-    stdin: process.stdin,
+    stdin,
     signal: gate.signal,
     // The command tells the gate when an interrupt acquires a duty. Until then
     // the first Ctrl-C kills brigadier outright, exactly as it did before any
@@ -50,8 +90,8 @@ async function main(): Promise<void> {
     },
   });
   // Release stdin so a finished interactive run does not hold the event loop.
-  if (!process.stdin.destroyed) {
-    process.stdin.destroy();
+  if (stdinStream !== null && !stdinStream.destroyed) {
+    stdinStream.destroy();
   }
   process.exitCode = code;
 }
