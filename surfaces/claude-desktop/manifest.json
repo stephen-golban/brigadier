@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "brigadier",
   "display_name": "brigadier",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Hand coding work to the brigadier CLI running locally on this machine.",
   "long_description": "Claude Desktop Skills execute server-side and cannot invoke a binary on your laptop. Desktop MCP servers run locally with full user privileges and can spawn `claude -p`. That is why brigadier reaches Desktop as an MCP server rather than as a skill: it is the only surface that can actually start a run.",
   "author": {

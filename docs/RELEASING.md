@@ -1,6 +1,6 @@
 # Releasing Brigadier
 
-`package.json` says `0.1.1`. No Brigadier release has been cut yet, so this
+`package.json` says `0.2.0`. No Brigadier release has been cut yet, so this
 runbook has not been executed end to end. GitHub Releases are the only
 distribution channel: the first release will publish four compiled binaries in
 per-platform archives, their checksums, and the notarized macOS disk images.
@@ -337,7 +337,7 @@ rg -n '0\.1\.1' \
   package.json src test surfaces docs CHANGELOG.md SECURITY.md
 ```
 
-Replace `0.1.1` with the version currently in `package.json` when running that
+Replace `0.2.0` with the version currently in `package.json` when running that
 search. Classify every hit before changing it: examples and historical evidence
 may deliberately retain an older version.
 
