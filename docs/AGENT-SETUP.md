@@ -12,10 +12,6 @@ The primary release command is:
 curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
 ```
 
-**This command cannot work today because no GitHub release exists yet.** The
-installer needs a platform archive and its `.sha256` file from a GitHub release,
-and there is no release to download.
-
 The Homebrew formula is in the separate public
 `stephen-golban/homebrew-tap` tap. Homebrew 6 hard-fails on an untrusted
 third-party tap, so the complete sequence is:
@@ -25,10 +21,6 @@ brew tap stephen-golban/tap
 brew trust stephen-golban/tap
 brew install brigadier
 ```
-
-**These commands cannot produce a working install today because no GitHub
-release exists yet.** The formula cannot point at usable release artifacts and
-checksums until the first release is published.
 
 The release installer itself is the component that refuses unsupported
 operating systems. It accepts `Darwin` and `Linux` from `uname -s`. For

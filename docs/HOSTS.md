@@ -13,9 +13,6 @@ The release installer is the primary path:
 curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
 ```
 
-**This does not work today because no GitHub release exists yet.** The script
-needs a release archive and its checksum.
-
 The Homebrew formula is in the public `stephen-golban/homebrew-tap` tap.
 Homebrew 6 requires that third-party tap to be trusted explicitly, so use all
 three commands:
@@ -25,10 +22,6 @@ brew tap stephen-golban/tap
 brew trust stephen-golban/tap
 brew install brigadier
 ```
-
-**These commands do not produce a working install today because no GitHub
-release exists yet.** The tap cannot contain usable release URLs and checksums
-until the first release is published.
 
 After the binary is available, run the single host-setup command:
 
