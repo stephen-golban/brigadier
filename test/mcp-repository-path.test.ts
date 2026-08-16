@@ -254,7 +254,7 @@ test("brigadier_run refuses every relative repositoryPath and accepts every abso
     expect(lines[8]).toBe("");
 
     expect(lines[0]).toBe(
-      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.2.0"}}}',
+      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.2.1"}}}',
     );
 
     // ABSOLUTE: accepted by the validator, then the real lazy-config path

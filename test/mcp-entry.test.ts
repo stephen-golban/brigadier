@@ -103,7 +103,7 @@ test("the shipped bundle answers initialize over its real stdio transport", asyn
 
     expect(session.timedOut).toBe(false);
     expect(session.stdout).toBe(
-      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.2.0"}}}\n',
+      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"brigadier","version":"0.2.1"}}}\n',
     );
     expect(session.stderr).toBe("");
     expect(session.exitCode).toBe(0);

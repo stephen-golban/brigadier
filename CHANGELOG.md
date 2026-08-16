@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.2.1] - 2026-08-16
+
+### Fixed
+
+- `brigadier init` no longer exits without asking anything when the installer
+  runs it. Under Bun, `process.stdin` on a freshly opened `/dev/tty` never
+  yields a line and never ends, and `install.sh` hands init exactly that
+  descriptor — so a `curl | sh` install printed the first question, exited 0,
+  and left no config behind while looking like it had succeeded. stdin is now
+  read from descriptor 0 directly.
+
 ## [0.2.0] - 2026-08-16
 
 ### Changed
@@ -49,7 +60,8 @@ Initial release.
   their dependencies, and the competence floor each requires, validated for
   shape and schedulability before any ref or worktree is created.
 
-[unreleased]: https://github.com/stephen-golban/brigadier/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/stephen-golban/brigadier/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/stephen-golban/brigadier/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/stephen-golban/brigadier/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/stephen-golban/brigadier/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/stephen-golban/brigadier/releases/tag/v0.1.0
