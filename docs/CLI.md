@@ -23,11 +23,9 @@ The release installer is the primary path:
 curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
 ```
 
-**This command does not work yet: no GitHub release has been cut.** It is the
-path for the first release and will work once that release exists. The POSIX
-`sh` installer detects its platform with `uname`, downloads the matching GitHub
-release archive, verifies its SHA-256 checksum, and installs to `~/.local/bin`
-or `$BRIGADIER_INSTALL_DIR`. It never requires `sudo`.
+The POSIX `sh` installer detects its platform with `uname`, downloads the
+matching GitHub release archive, verifies its SHA-256 checksum, and installs to
+`~/.local/bin` or `$BRIGADIER_INSTALL_DIR`. It never requires `sudo`.
 
 Installation is atomic and symlink-safe. The script stages the binary in a
 `mktemp -d` directory inside the install directory, applies its executable
@@ -46,10 +44,6 @@ brew tap stephen-golban/tap
 brew trust stephen-golban/tap
 brew install brigadier
 ```
-
-**This command does not work yet: no GitHub release has been cut, and the
-formula intentionally contains placeholder SHA-256 digests.** It will work once
-the first release publishes the real archives and updates the formula.
 
 ## `brigadier init`
 
@@ -290,12 +284,14 @@ not turn a task description into a plan.
 
 GitHub releases are brigadier's only distribution channel. A `v*` tag push
 first verifies that the tag matches the package version, then builds compiled
-binaries for `darwin-arm64`, `darwin-x64`, `linux-arm64`, and `linux-x64`.
-The macOS binaries are signed and notarized. The release contains one `.tar.gz`
-archive and one `.sha256` file per platform, a combined `checksums.txt`, and a
-`.dmg` for macOS. After the release is created, the workflow checks out
-`stephen-golban/homebrew-tap`, updates its `Formula/brigadier.rb` with the real
-artifacts, then pushes that change using `HOMEBREW_TAP_TOKEN`.
+binaries for `darwin-arm64`, `darwin-x64`, `linux-arm64`, and `linux-x64`. The
+Apple signing, notarization, and DMG steps run only on macOS when all seven Apple
+secrets are present; without them, a release can still publish with ad-hoc-signed
+Darwin binaries and no DMGs.
 
-Until the first release exists, the release installer has no archive to
-download and the Homebrew formula's digests must remain placeholders.
+Release `v0.2.0` contains one `.tar.gz` archive and one `.sha256` file per
+platform, a combined `checksums.txt`, and two DMGs. Its published
+`darwin-arm64` binary passes
+`codesign --verify --strict -R "=notarized"`. The workflow also updated
+`stephen-golban/homebrew-tap/Formula/brigadier.rb` to `0.2.0`; its four digests
+match the published archives.

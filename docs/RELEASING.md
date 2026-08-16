@@ -1,17 +1,17 @@
 # Releasing Brigadier
 
-`package.json` says `0.2.0`. No Brigadier release has been cut yet, so this
-runbook has not been executed end to end. GitHub Releases are the only
-distribution channel: the first release will publish four compiled binaries in
-per-platform archives, their checksums, and the notarized macOS disk images.
-The package manifest is private and is not itself a distribution artifact.
+`package.json` says `0.2.0`. Brigadier's first release was cut on 2026-08-16 as
+`v0.2.0`, so this runbook has now been executed end to end. Its workflow tag
+guard, notarization path, asset upload, and tap bump all ran for real. GitHub
+Releases are the only distribution channel. The package manifest is private and
+is not itself a distribution artifact.
 
 The public `stephen-golban/homebrew-tap` repository owns
-`Formula/brigadier.rb`; this repository does not carry a formula. The seeded tap
-formula still has version `0.0.0` and deliberately fake placeholder digests. Do
-not "fix" them before the first release exists. The release workflow replaces
-them from the checksums of the artifacts it actually built, then pushes that
-formula update to the tap's default branch.
+`Formula/brigadier.rb`; this repository does not carry a formula. The tap
+formula is at version `0.2.0`, with four SHA-256 digests that match the published
+archives. For each release, the workflow derives the formula update from the
+checksums of the artifacts it actually built, then pushes it to the tap's
+default branch.
 
 A complete release contains:
 
@@ -240,7 +240,7 @@ creates the release but cannot push to the separate tap repository.
 
 ### `HOMEBREW_TAP_TOKEN` — enables the tap formula update
 
-Configure this repository secret before the first release. It is a fine-grained
+This repository secret is already configured. Keep it as a fine-grained
 personal access token with **Contents: write** access to only
 `stephen-golban/homebrew-tap`. The workflow uses it to check out that repository
 and to authenticate the formula commit push. Never use or rename the default
@@ -319,10 +319,10 @@ The seven values are:
   openssl rand -base64 24
   ```
 
-Before the first public tag, use `gh secret list` and confirm all nine names—the
+Before every public tag, use `gh secret list` and confirm all nine names—the
 publication switch, `HOMEBREW_TAP_TOKEN`, and all seven Apple secrets—are
-present. Presence does not prove the values are correct; the first workflow
-execution remains the decisive test.
+present. Presence does not prove the values are correct; the workflow execution
+for that tag remains the decisive test.
 
 ---
 
@@ -366,9 +366,9 @@ and update the `sha256` and `bytes` values for
 `"claude-desktop/manifest.json"` in the `PINNED` map in
 `test/surfaces.test.ts`. The pin is deliberate: update it; never delete it.
 
-Do **not** move the tap formula's `0.0.0` or placeholder digests in the release
-commit. The workflow updates the separate tap only after it has created the
-release from real artifacts.
+Do **not** copy or edit the tap formula in the release commit; this repository
+does not carry it. The workflow updates the separate tap only after it has
+created the release from real artifacts.
 
 ---
 
@@ -409,8 +409,8 @@ gh secret list
 Confirm `RELEASE_PUBLISH_ENABLED`, `HOMEBREW_TAP_TOKEN`, and all seven Apple
 secret names above are present. Secret values cannot be read back; if the
 publication switch was not recorded as the literal `true` or there is any doubt,
-set it again before tagging. If the tap token is missing, set it before the first
-release; otherwise the release will publish while the formula bump skips. If any
+set it again before tagging. If the tap token is missing, set it before tagging;
+otherwise the release will publish while the formula bump skips. If any
 Apple secret is missing, stop: the workflow would still be able to create a
 public release, but its Darwin archives would contain only ad-hoc-signed
 executables and it would upload no DMGs.
@@ -499,7 +499,7 @@ spctl -a -t open --context context:primary-signature PATH_TO_DMG
 
 Confirm the default branch of `stephen-golban/homebrew-tap` now contains
 `Formula/brigadier.rb` at `VERSION`, with four `vVERSION` release URLs and four
-non-placeholder digests matching the downloaded `.sha256` files.
+SHA-256 digests matching the downloaded `.sha256` files.
 
 If the GitHub release exists but the workflow failed before pushing the formula
 commit, recover from the downloaded release artifacts:
@@ -518,9 +518,7 @@ The third argument deliberately names the formula in the separate tap checkout.
 
 ### Step 8 — verify both public installation paths
 
-**Not operational today:** no GitHub release exists yet, so this command has no
-tarball to download. It is the primary install path and will work only after the
-first release is cut:
+Run the primary install path:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
@@ -536,10 +534,6 @@ a named error when the destination is a real directory and warns when the
 install directory is absent from `PATH`. Finally, it hands `brigadier init` to
 `/dev/tty`, so the host-selection prompt still works through `curl | sh`.
 
-**Not operational today:** the formula intentionally contains placeholder
-digests because no release exists. This is the second install path and will work
-only after the first release workflow fills the formula from real artifacts:
-
 Homebrew 6 requires third-party taps to be trusted before it will load their
 formulae.
 
@@ -549,10 +543,9 @@ brew trust stephen-golban/tap
 brew install brigadier
 ```
 
-After the release and formula commit both exist, run all three commands on clean
-machines for every supported operating-system and architecture pair. Confirm
-`brigadier --version` prints `VERSION`, then run `brigadier init` and exercise a
-real host installation.
+For each release, run all three commands on clean machines for every supported
+operating-system and architecture pair. Confirm `brigadier --version` prints
+`VERSION`, then run `brigadier init` and exercise a real host installation.
 
 ---
 
@@ -625,12 +618,25 @@ These release-path measurements have been made, and their limits matter:
   and warm measurements showed no useful timing distinction. The workflow
   therefore deliberately says the check *may* consult Apple and treats an
   outage as a release failure.
-- **No release has been cut.** The current four-binary publication workflow,
-  its live seven-secret Apple runner path, GitHub release creation, tap formula
-  push, and both public installation paths have never completed together. This
-  runbook is the procedure for that first end-to-end execution, not a report
-  that it has already succeeded.
+- **The first public release ran on 2026-08-16 as `v0.2.0`.** The workflow's tag
+  guard, Apple notarization path, asset upload, GitHub release creation, and tap
+  formula bump ran for real. The release has four platform archives, one
+  `.sha256` beside each, a combined `checksums.txt`, and two DMGs. Its published
+  `darwin-arm64` binary passes
+  `codesign --verify --strict -R "=notarized"`.
+- **The `v0.2.0` release installer was verified end to end on
+  `darwin-arm64`.** It printed
+  `Downloading brigadier 0.2.0 for darwin-arm64...`, verified the checksum with
+  `brigadier-0.2.0-darwin-arm64.tar.gz: OK`, installed to `<dir>/brigadier`, and
+  the installed binary reported `0.2.0`.
+- **The `v0.2.0` Homebrew formula was verified through fetch.**
+  `brew tap stephen-golban/tap` reported `Tapped 1 formula`, the tap was trusted,
+  `brew info brigadier` resolved `stephen-golban/tap/brigadier: stable 0.2.0`,
+  and `brew fetch --formula brigadier` reported
+  `✔︎ Formula brigadier (0.2.0)` after downloading the archive and verifying its
+  SHA-256 against the formula. `brew install` was deliberately not run, to avoid
+  installing over an existing binary.
 
-The accountable release owner reviews the workflow run, notarization gates,
-release-asset checksums, tap formula commit, and clean-machine installs before
-announcing the release.
+For each future release, the accountable release owner reviews the workflow run,
+notarization gates, release-asset checksums, tap formula commit, and installation
+checks above before announcing it.

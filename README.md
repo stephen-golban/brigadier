@@ -29,9 +29,7 @@ The primary install path is the release installer:
 curl -fsSL https://raw.githubusercontent.com/stephen-golban/brigadier/main/install.sh | sh
 ```
 
-**This command does not work yet: no GitHub release has been cut.** It is the
-install path for the first release and will work once that release exists. The
-POSIX `sh` script detects macOS or Linux and its architecture, downloads the
+The POSIX `sh` script detects macOS or Linux and its architecture, downloads the
 matching GitHub-release archive, verifies its SHA-256 checksum, and installs
 `brigadier` to `~/.local/bin` (or `$BRIGADIER_INSTALL_DIR`). It never uses
 `sudo`. It stages the executable in a temporary directory inside the install
@@ -41,7 +39,7 @@ directory, and warns when the install directory is absent from `$PATH`.
 The script gives `brigadier init` access to `/dev/tty`, so the setup questions
 still work when the script is piped from `curl`.
 
-Homebrew will also be available from the first release:
+Homebrew is also available:
 
 Homebrew 6 requires third-party taps to be trusted before it will load their
 formulae.
@@ -51,10 +49,6 @@ brew tap stephen-golban/tap
 brew trust stephen-golban/tap
 brew install brigadier
 ```
-
-**This command does not work yet: no GitHub release has been cut, and the
-formula intentionally has placeholder checksums.** It will work once the first
-release publishes real archives and updates the formula.
 
 ## Set up once
 
