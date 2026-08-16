@@ -20,7 +20,9 @@ const NOTARIZED_BINARY_GATE_STEP_NAME =
 const ASSEMBLY_STEP_NAME = "Assemble release archive";
 const CHECKSUMS_STEP_NAME = "Assemble combined checksums";
 const CREATE_RELEASE_STEP_NAME = "Create GitHub release";
+const TAP_CHECKOUT_STEP_NAME = "Check out Homebrew tap";
 const FORMULA_STEP_NAME = "Update Homebrew formula from release artifacts";
+const FORMULA_DISABLED_STEP_NAME = "Homebrew formula update disabled";
 
 /**
  * The guard's whole output is one line of a few dozen bytes, so this is three
@@ -207,23 +209,72 @@ test("the release workflow creates and uploads a checksum manifest for every art
   );
 });
 
-test("the release workflow bumps the Homebrew formula from real artifact checksums", () => {
+test("the release workflow bumps the tap formula from real artifact checksums", () => {
   const workflow = readFileSync(workflowPath, "utf8");
   const releaseIndex = workflow.indexOf(`- name: ${CREATE_RELEASE_STEP_NAME}`);
+  const tapCheckoutIndex = workflow.indexOf(
+    `- name: ${TAP_CHECKOUT_STEP_NAME}`,
+  );
   const formulaIndex = workflow.indexOf(`- name: ${FORMULA_STEP_NAME}`);
 
   expect(releaseIndex).toBeGreaterThan(-1);
-  expect(formulaIndex).toBeGreaterThan(releaseIndex);
+  expect(tapCheckoutIndex).toBeGreaterThan(releaseIndex);
+  expect(formulaIndex).toBeGreaterThan(tapCheckoutIndex);
+  expect(workflow).toContain(
+    [
+      `      - name: ${TAP_CHECKOUT_STEP_NAME}`,
+      "        if: >-",
+      "          env.RELEASE_PUBLISH_ENABLED == 'true' &&",
+      "          env.HOMEBREW_TAP_TOKEN != ''",
+      "        uses: actions/checkout@v7.0.1",
+      "        with:",
+      "          repository: stephen-golban/homebrew-tap",
+      `          token: \${{ secrets.HOMEBREW_TAP_TOKEN }}`,
+      "          path: homebrew-tap",
+    ].join("\n"),
+  );
+  expect(workflow).toContain(
+    [
+      `      - name: ${FORMULA_STEP_NAME}`,
+      "        if: >-",
+      "          env.RELEASE_PUBLISH_ENABLED == 'true' &&",
+      "          env.HOMEBREW_TAP_TOKEN != ''",
+      "        shell: bash",
+    ].join("\n"),
+  );
   expect(extractStepRun(workflow, FORMULA_STEP_NAME)).toBe(
     [
       `version="\${GITHUB_REF_NAME#v}"`,
-      `bun ./scripts/update-homebrew-formula.ts "\${version}" ./release-packages`,
-      'git config user.name "github-actions[bot]"',
-      'git config user.email "41898282+github-actions[bot]@users.noreply.github.com"',
-      "git add Formula/brigadier.rb",
-      `git commit -m "Update Homebrew formula to \${GITHUB_REF_NAME}"`,
-      `git push origin "HEAD:\${{ github.event.repository.default_branch }}"`,
+      `bun ./scripts/update-homebrew-formula.ts "\${version}" ./release-packages ./homebrew-tap/Formula/brigadier.rb`,
+      'git -C ./homebrew-tap config user.name "github-actions[bot]"',
+      'git -C ./homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"',
+      "git -C ./homebrew-tap add Formula/brigadier.rb",
+      `git -C ./homebrew-tap commit -m "Update Homebrew formula to \${GITHUB_REF_NAME}"`,
+      "git -C ./homebrew-tap push origin HEAD",
     ].join("\n"),
+  );
+});
+
+test("a missing tap token skips the formula bump without failing the release", () => {
+  const workflow = readFileSync(workflowPath, "utf8");
+  const formulaIndex = workflow.indexOf(`- name: ${FORMULA_STEP_NAME}`);
+  const disabledIndex = workflow.indexOf(
+    `- name: ${FORMULA_DISABLED_STEP_NAME}`,
+  );
+
+  expect(workflow).toContain(
+    `HOMEBREW_TAP_TOKEN: \${{ secrets.HOMEBREW_TAP_TOKEN }}`,
+  );
+  expect(formulaIndex).toBeGreaterThan(-1);
+  expect(disabledIndex).toBeGreaterThan(formulaIndex);
+  expect(workflow).toContain(
+    [
+      `      - name: ${FORMULA_DISABLED_STEP_NAME}`,
+      "        if: env.HOMEBREW_TAP_TOKEN == ''",
+    ].join("\n"),
+  );
+  expect(extractStepRun(workflow, FORMULA_DISABLED_STEP_NAME)).toBe(
+    'echo "HOMEBREW_TAP_TOKEN is unset; Homebrew formula update is disabled"',
   );
 });
 

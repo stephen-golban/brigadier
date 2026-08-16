@@ -145,6 +145,7 @@ jobs:
       contents: write
     env:
       RELEASE_PUBLISH_ENABLED: ${{ secrets.RELEASE_PUBLISH_ENABLED }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -175,17 +176,31 @@ jobs:
           assets=(release-packages/*.tar.gz release-packages/*.tar.gz.sha256 release-packages/*.dmg release-packages/checksums.txt)
           gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
             --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+      - name: Check out Homebrew tap
+        if: >-
+          env.RELEASE_PUBLISH_ENABLED == 'true' &&
+          env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stephen-golban/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
       - name: Update Homebrew formula from release artifacts
-        if: env.RELEASE_PUBLISH_ENABLED == 'true'
+        if: >-
+          env.RELEASE_PUBLISH_ENABLED == 'true' &&
+          env.HOMEBREW_TAP_TOKEN != ''
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          bun ./scripts/update-homebrew-formula.ts "${version}" ./release-packages
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/brigadier.rb
-          git commit -m "Update Homebrew formula to ${GITHUB_REF_NAME}"
-          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          bun ./scripts/update-homebrew-formula.ts "${version}" ./release-packages ./homebrew-tap/Formula/brigadier.rb
+          git -C ./homebrew-tap config user.name "github-actions[bot]"
+          git -C ./homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C ./homebrew-tap add Formula/brigadier.rb
+          git -C ./homebrew-tap commit -m "Update Homebrew formula to ${GITHUB_REF_NAME}"
+          git -C ./homebrew-tap push origin HEAD
+      - name: Homebrew formula update disabled
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: echo "HOMEBREW_TAP_TOKEN is unset; Homebrew formula update is disabled"
       - name: Publication disabled
         if: env.RELEASE_PUBLISH_ENABLED != 'true'
         run: echo "RELEASE_PUBLISH_ENABLED is not true; GitHub release publication is disabled"

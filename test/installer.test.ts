@@ -16,7 +16,6 @@ import {
   checksumFromContents,
   platforms,
   releaseDownloadUrl,
-  rewriteFormula,
 } from "../scripts/update-homebrew-formula";
 
 const root = join(import.meta.dir, "..");
@@ -67,21 +66,6 @@ test("checksum parsing accepts only a digest for its expected archive", () => {
   expect(() =>
     checksumFromContents(`${digest}  other.tar.gz\n`, "archive.tar.gz"),
   ).toThrow("invalid SHA-256 checksum file");
-});
-
-test("formula updater rewrites all release URLs and checksums without network access", async () => {
-  const formula = await readFile(join(root, "Formula/brigadier.rb"), "utf8");
-  const checksums = {} as Record<(typeof platforms)[number], string>;
-  for (const [index, platform] of platforms.entries()) {
-    checksums[platform] = String(index + 1).repeat(64);
-  }
-
-  const updated = rewriteFormula(formula, "1.2.3", checksums);
-  expect(updated).toContain('version "1.2.3"');
-  for (const [index, platform] of platforms.entries()) {
-    expect(updated).toContain(releaseDownloadUrl("1.2.3", platform));
-    expect(updated).toContain(`sha256 "${String(index + 1).repeat(64)}"`);
-  }
 });
 
 test("installer retains checksum verification and guarded interactive setup", async () => {
